@@ -1322,7 +1322,7 @@ func listen() error {
 					target := tmuxTargetByID(windowID, tmuxName)
 					listenLog("sendToTmux: target=%s window=%s", target, tmuxName)
 
-					// Record in ledger before sending
+					// Record in DB before sending
 					ledgerID := fmt.Sprintf("tg:%d", update.UpdateID)
 					appendMessage(&MessageRecord{
 						ID:                ledgerID,
@@ -1338,7 +1338,15 @@ func listen() error {
 						listenLog("sendToTmux FAILED: target=%s err=%v", target, err)
 						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to send: %v", err))
 					} else {
-						updateDelivery(sessName, ledgerID, "terminal_delivered", true)
+						// Delayed confirmation: check after 10s if Claude received it
+						go func(sid, lid, tgt, wn, txt string, cid, tid int64) {
+							time.Sleep(10 * time.Second)
+							if hasUnconfirmedPrompt(sid, lid) {
+								listenLog("delivery unconfirmed after 10s, resending: session=%s id=%s", sid, lid)
+								sendToTmuxFromTelegram(tgt, wn, txt)
+								sendMessage(config, cid, tid, "⚠️ 消息未确认，已重发")
+							}
+						}(sessName, ledgerID, target, tmuxName, text, chatID, threadID)
 					}
 				} else {
 					sendMessage(config, chatID, threadID, "⚠️ No session linked to this topic. Use /new <name> to create one.")

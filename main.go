@@ -328,6 +328,7 @@ func main() {
 		}
 
 	case "listen":
+		defer closeDB()
 		if err := listen(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)

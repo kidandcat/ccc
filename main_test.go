@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -629,12 +630,15 @@ func TestReplyToMessage(t *testing.T) {
 	}
 }
 
-// TestLedgerAppendAndRead tests basic ledger operations
-func TestLedgerAppendAndRead(t *testing.T) {
-	// Use a unique session name with temp suffix so the ledger file doesn't collide
-	session := "test-ledger-" + filepath.Base(t.TempDir())
-	// Clean up after test
-	defer os.Remove(ledgerPath(session))
+// TestDBAppendAndQuery tests basic SQLite DB operations
+func TestDBAppendAndQuery(t *testing.T) {
+	// Use temp DB for testing
+	tmpDir := t.TempDir()
+	origPath := dbPath
+	dbPath = func() string { return filepath.Join(tmpDir, "test.db") }
+	defer func() { dbPath = origPath; closeDB(); dbOnce = sync.Once{} }()
+
+	session := "test-session"
 
 	// Append a message
 	rec := &MessageRecord{
@@ -650,41 +654,38 @@ func TestLedgerAppendAndRead(t *testing.T) {
 		t.Fatalf("appendMessage failed: %v", err)
 	}
 
-	// Read back
-	records := readLedger(session)
-	if len(records) != 1 {
-		t.Fatalf("readLedger returned %d records, want 1", len(records))
+	// isDelivered checks
+	if isDelivered(session, "test:1", "terminal") {
+		t.Error("terminal should not be delivered yet")
 	}
-	if records[0].ID != "test:1" {
-		t.Errorf("ID = %q, want test:1", records[0].ID)
-	}
-	if records[0].TerminalDelivered {
-		t.Error("TerminalDelivered should be false")
+	if !isDelivered(session, "test:1", "telegram") {
+		t.Error("telegram should be delivered")
 	}
 
 	// Update delivery
-	if err := updateDelivery(session, "test:1", "terminal_delivered", true); err != nil {
+	if err := updateDelivery(session, "test:1", "terminal_delivered", 1); err != nil {
 		t.Fatalf("updateDelivery failed: %v", err)
 	}
-
-	// Read again — should be merged
-	records = readLedger(session)
-	if len(records) != 1 {
-		t.Fatalf("readLedger returned %d records after update, want 1", len(records))
-	}
-	if !records[0].TerminalDelivered {
-		t.Error("TerminalDelivered should be true after update")
-	}
-
-	// Test isDelivered
 	if !isDelivered(session, "test:1", "terminal") {
-		t.Error("isDelivered(terminal) should be true")
-	}
-	if !isDelivered(session, "test:1", "telegram") {
-		t.Error("isDelivered(telegram) should be true")
+		t.Error("terminal should be delivered after update")
 	}
 
-	// Test findUndelivered
+	// Dedup: INSERT OR IGNORE should not overwrite
+	appendMessage(&MessageRecord{
+		ID:                "test:1",
+		Session:           session,
+		Type:              "user_prompt",
+		Text:              "different text",
+		Origin:            "telegram",
+		TerminalDelivered: false,
+		TelegramDelivered: false,
+	})
+	// Should still show original delivery status
+	if !isDelivered(session, "test:1", "terminal") {
+		t.Error("dedup failed: terminal delivery was overwritten")
+	}
+
+	// findUndelivered
 	appendMessage(&MessageRecord{
 		ID:                "test:2",
 		Session:           session,

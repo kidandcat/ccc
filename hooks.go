@@ -60,44 +60,6 @@ func waitPromptAck(sessionName string, timeout time.Duration) bool {
 	return false
 }
 
-// toolStatePath returns the path for tool call display state
-func toolStatePath(sessionName string) string {
-	return filepath.Join(cacheDir(), "tools-"+sessionName+".json")
-}
-
-// ToolState tracks tool calls and the Telegram message ID for live updates
-type ToolState struct {
-	MsgID int64      `json:"msg_id"`
-	Tools []ToolCall `json:"tools"`
-}
-
-type ToolCall struct {
-	Name   string `json:"name"`
-	Input  string `json:"input"`
-	IsText bool   `json:"is_text,omitempty"` // true for assistant text
-	Time   int64  `json:"time,omitempty"`    // unix ms for ordering
-}
-
-func loadToolState(sessionName string) *ToolState {
-	data, err := os.ReadFile(toolStatePath(sessionName))
-	if err != nil {
-		return &ToolState{}
-	}
-	var state ToolState
-	if json.Unmarshal(data, &state) != nil {
-		return &ToolState{}
-	}
-	return &state
-}
-
-func saveToolState(sessionName string, state *ToolState) {
-	data, _ := json.Marshal(state)
-	os.WriteFile(toolStatePath(sessionName), data, 0600)
-}
-
-func clearToolState(sessionName string) {
-	os.Remove(toolStatePath(sessionName))
-}
 
 // addTextToToolState adds an assistant text block to the tool state, ordered by timestamp.
 func addTextToToolState(sessName string, text string, ts int64) {
@@ -761,6 +723,8 @@ func handleUserPromptHook() error {
 			os.Remove(telegramActiveFlag(tmuxName))
 			writePromptAck(sessName)
 			setThinking(sessName)
+			// Confirm terminal delivery for the Telegram message
+			confirmTerminalDelivery(sessName, hookData.Prompt)
 			// Record: came from Telegram, both sides have it
 			appendMessage(&MessageRecord{
 				ID:                fmt.Sprintf("prompt:%s:%d", hookData.SessionID, time.Now().UnixNano()),
