@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -164,7 +165,7 @@ func createTmuxWindow(windowName string, workDir string, continueSession bool) (
 
 	// Send the command to the window via send-keys using window ID
 	time.Sleep(200 * time.Millisecond)
-	exec.Command(tmuxPath, "send-keys", "-t", windowID, cccCmd, "C-m").Run()
+	tmuxSendKeys(windowID, cccCmd, "C-m")
 
 	return windowID, nil
 }
@@ -185,6 +186,10 @@ func runClaudeRaw(continueSession bool) error {
 	}
 
 	var args []string
+	// Auto-approve mode: skip permissions when no OTP is configured
+	if config, err := loadConfig(); err == nil && config.OTPSecret == "" {
+		args = append(args, "--dangerously-skip-permissions")
+	}
 	if continueSession {
 		args = append(args, "-c")
 	}
@@ -247,32 +252,49 @@ func sendToTmuxFromTelegramWithDelay(target string, windowName string, text stri
 	return sendToTmuxWithDelay(target, text, delay)
 }
 
-func sendToTmux(target string, text string) error {
-	// Calculate delay based on text length
-	// Base: 50ms + 0.5ms per character, capped at 5 seconds
-	baseDelay := 50 * time.Millisecond
-	charDelay := time.Duration(len(text)) * 500 * time.Microsecond // 0.5ms per char
-	delay := baseDelay + charDelay
-	if delay > 5*time.Second {
-		delay = 5 * time.Second
+// tmuxSendKeys sends control keys to a tmux target with timeout protection.
+// Use for all send-keys calls to prevent indefinite hangs (tmux/tmux#1185).
+func tmuxSendKeys(target string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmdArgs := append([]string{"send-keys", "-t", target}, args...)
+	return exec.CommandContext(ctx, tmuxPath, cmdArgs...).Run()
+}
+
+// tmuxPasteText sends text to a tmux target using set-buffer + paste-buffer -p.
+// Bracketed paste mode avoids the send-keys -l hang when the PTY buffer is full.
+func tmuxPasteText(target string, text string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := exec.CommandContext(ctx, tmuxPath, "set-buffer", "-b", "ccc-input", text).Run(); err != nil {
+		return fmt.Errorf("set-buffer: %w", err)
 	}
-	return sendToTmuxWithDelay(target, text, delay)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	if err := exec.CommandContext(ctx2, tmuxPath, "paste-buffer", "-b", "ccc-input", "-p", "-t", target).Run(); err != nil {
+		return fmt.Errorf("paste-buffer: %w", err)
+	}
+	return nil
+}
+
+func sendToTmux(target string, text string) error {
+	return sendToTmuxWithDelay(target, text, 0)
 }
 
 func sendToTmuxWithDelay(target string, text string, delay time.Duration) error {
-	// Send text literally
-	cmd := exec.Command(tmuxPath, "send-keys", "-t", target, "-l", text)
-	if err := cmd.Run(); err != nil {
+	if err := tmuxPasteText(target, text); err != nil {
 		return err
 	}
 
-	// Brief pause for TUI to process pasted text
+	// Dismiss autocomplete popup that bracketed paste may trigger
 	time.Sleep(100 * time.Millisecond)
+	tmuxSendKeys(target, "Escape")
 
-	// Send Enter twice (Claude Code needs double Enter)
-	exec.Command(tmuxPath, "send-keys", "-t", target, "C-m").Run()
+	// Submit with double Enter (Claude Code needs double Enter)
 	time.Sleep(50 * time.Millisecond)
-	exec.Command(tmuxPath, "send-keys", "-t", target, "C-m").Run()
+	tmuxSendKeys(target, "Enter")
+	time.Sleep(50 * time.Millisecond)
+	tmuxSendKeys(target, "Enter")
 
 	return nil
 }

@@ -845,16 +845,16 @@ func listen() error {
 						target := tmuxTargetByID(windowID, tmuxName)
 						// Send arrow down keys to select option, then Enter
 						for i := 0; i < optionIndex; i++ {
-							exec.Command(tmuxPath, "send-keys", "-t", target, "Down").Run()
+							tmuxSendKeys(target, "Down")
 							time.Sleep(50 * time.Millisecond)
 						}
-						exec.Command(tmuxPath, "send-keys", "-t", target, "Enter").Run()
+						tmuxSendKeys(target, "Enter")
 						listenLog("[callback] Selected option %d for %s (question %d/%d)", optionIndex, sessionName, questionIndex+1, totalQuestions)
 
 						// After the last question, send Enter to confirm "Submit answers"
 						if totalQuestions > 0 && questionIndex == totalQuestions-1 {
 							time.Sleep(300 * time.Millisecond)
-							exec.Command(tmuxPath, "send-keys", "-t", target, "Enter").Run()
+							tmuxSendKeys(target, "Enter")
 							listenLog("[callback] Auto-submitted answers for %s", sessionName)
 						}
 					}
@@ -1450,7 +1450,7 @@ func handleAuth(config *Config, chatID, threadID int64) {
 	}
 
 	time.Sleep(500 * time.Millisecond)
-	exec.Command(tmuxPath, "send-keys", "-t", authTmuxSession, claudePath+" --dangerously-skip-permissions", "C-m").Run()
+	tmuxSendKeys(authTmuxSession, claudePath+" --dangerously-skip-permissions", "C-m")
 
 	var oauthURL string
 	for i := 0; i < 30; i++ {
@@ -1503,9 +1503,9 @@ func handleAuthCode(config *Config, chatID, threadID int64, code string) {
 
 	sendMessage(config, chatID, threadID, "🔄 Sending code to Claude...")
 
-	exec.Command(tmuxPath, "send-keys", "-t", authTmuxSession, "-l", code).Run()
+	tmuxPasteText(authTmuxSession, code)
 	time.Sleep(200 * time.Millisecond)
-	exec.Command(tmuxPath, "send-keys", "-t", authTmuxSession, "C-m").Run()
+	tmuxSendKeys(authTmuxSession, "C-m")
 
 	for i := 0; i < 10; i++ {
 		time.Sleep(2 * time.Second)
@@ -1513,14 +1513,14 @@ func handleAuthCode(config *Config, chatID, threadID int64, code string) {
 		pane := string(out)
 
 		if strings.Contains(pane, "Yes, I accept") {
-			exec.Command(tmuxPath, "send-keys", "-t", authTmuxSession, "Down").Run()
+			tmuxSendKeys(authTmuxSession, "Down")
 			time.Sleep(200 * time.Millisecond)
-			exec.Command(tmuxPath, "send-keys", "-t", authTmuxSession, "C-m").Run()
+			tmuxSendKeys(authTmuxSession, "C-m")
 			continue
 		}
 
 		if strings.Contains(pane, "Press Enter") || strings.Contains(pane, "Enter to confirm") {
-			exec.Command(tmuxPath, "send-keys", "-t", authTmuxSession, "C-m").Run()
+			tmuxSendKeys(authTmuxSession, "C-m")
 			continue
 		}
 
