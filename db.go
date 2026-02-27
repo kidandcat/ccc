@@ -85,7 +85,8 @@ func closeDB() {
 	}
 }
 
-// appendMessage inserts a message record. Duplicate IDs are silently ignored.
+// appendMessage inserts a message record. If the ID already exists,
+// delivery flags are upgraded (false→true) but never downgraded (true→false).
 func appendMessage(rec *MessageRecord) error {
 	db := openDB()
 	if db == nil {
@@ -95,8 +96,12 @@ func appendMessage(rec *MessageRecord) error {
 		rec.Timestamp = time.Now().UnixMilli()
 	}
 	_, err := db.Exec(
-		`INSERT OR IGNORE INTO messages (id, session, type, text, origin, terminal_delivered, telegram_delivered, telegram_msg_id, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO messages (id, session, type, text, origin, terminal_delivered, telegram_delivered, telegram_msg_id, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET
+		   terminal_delivered = MAX(terminal_delivered, excluded.terminal_delivered),
+		   telegram_delivered = MAX(telegram_delivered, excluded.telegram_delivered),
+		   telegram_msg_id = CASE WHEN excluded.telegram_msg_id > 0 THEN excluded.telegram_msg_id ELSE telegram_msg_id END`,
 		rec.ID, rec.Session, rec.Type, rec.Text, rec.Origin,
 		boolToInt(rec.TerminalDelivered), boolToInt(rec.TelegramDelivered),
 		rec.TelegramMsgID, rec.Timestamp,
