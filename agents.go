@@ -165,20 +165,24 @@ func dispatchAgent(name, workDir, prompt string) (string, error) {
 }
 
 // resumeAgent sends a follow-up message to an existing conversation. Because
-// background agents cannot be injected live, this stops the current session
-// and relaunches it with --resume carrying the new user message. Returns the
-// NEW short daemon id (the id changes on every resume).
+// background agents cannot be injected live, this stops the current bg job (a
+// still-resident idle agent still counts as "running") and relaunches with
+// --resume carrying the new user message. Returns the NEW short daemon id.
+//
+// stopShortID is the current live bg job to stop (empty if already settled).
+// resumeID MUST be the stable conversation UUID, not the short id: after the bg
+// job is stopped, `--resume <shortId>` fails with "source session not found",
+// whereas `--resume <uuid>` reloads the conversation from disk.
 //
 // It waits for the previous session to fully stop before resuming: dispatching
 // --resume while the old worker is still alive makes claude report "<id> is
-// currently running as a background agent" and the worker crashes/respawns
-// (visible as a transient error in the agents view). Waiting avoids that race.
-func resumeAgent(currentShortID, name, workDir, prompt string) (string, error) {
-	if currentShortID != "" {
-		stopAgent(currentShortID)
-		waitAgentStopped(currentShortID, 8*time.Second)
+// currently running as a background agent" and the worker crashes/respawns.
+func resumeAgent(stopShortID, resumeID, name, workDir, prompt string) (string, error) {
+	if stopShortID != "" {
+		stopAgent(stopShortID)
+		waitAgentStopped(stopShortID, 8*time.Second)
 	}
-	return runDispatch(name, workDir, currentShortID, prompt)
+	return runDispatch(name, workDir, resumeID, prompt)
 }
 
 // waitAgentStopped blocks until the given short id is no longer actively

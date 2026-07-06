@@ -332,6 +332,23 @@ func sendTypingAction(config *Config, chatID int64, threadID int64) {
 	telegramAPI(config, "sendChatAction", params)
 }
 
+// topicDeleted probes whether a forum topic still exists. It calls
+// reopenForumTopic, which is a no-op on an already-open topic (returns
+// TOPIC_NOT_MODIFIED) but returns TOPIC_ID_INVALID once the topic is deleted —
+// so it detects deletion with no visible side effect. Used to retire the
+// session behind a deleted topic.
+func topicDeleted(config *Config, topicID int64) bool {
+	params := url.Values{
+		"chat_id":           {fmt.Sprintf("%d", config.GroupID)},
+		"message_thread_id": {fmt.Sprintf("%d", topicID)},
+	}
+	resp, err := telegramAPI(config, "reopenForumTopic", params)
+	if err != nil || resp == nil || resp.OK {
+		return false
+	}
+	return strings.Contains(resp.Description, "TOPIC_ID_INVALID")
+}
+
 func splitMessage(text string, maxLen int) []string {
 	if len(text) <= maxLen {
 		return []string{text}

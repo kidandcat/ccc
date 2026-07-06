@@ -104,26 +104,24 @@ func sendToSession(config *Config, sessName, text string) error {
 		os.MkdirAll(workDir, 0755)
 	}
 
-	agents, _ := listAgents(true)
-	shortID := liveShortID(config, sessName, agents)
-
-	// If we have no record of an agent at all, start fresh.
-	if shortID == "" && info.SessionID == "" {
-		shortID, err := dispatchAgent(sessName, workDir, text)
+	// No prior conversation → dispatch a fresh agent with this message.
+	if info.SessionID == "" {
+		short, err := dispatchAgent(sessName, workDir, text)
 		if err != nil {
 			return err
 		}
-		persistAgentIDs(sessName, shortID)
+		persistAgentIDs(sessName, short)
 		return nil
 	}
 
-	// Resume the existing conversation. Prefer the live short id; fall back to
-	// the stored conversation UUID (works even if the daemon forgot the job).
-	resumeTarget := shortID
-	if resumeTarget == "" {
-		resumeTarget = info.SessionID
+	// Resume the existing conversation by its stable UUID. A still-resident bg
+	// agent (even idle) counts as "running", so stop it first before resuming.
+	agents, _ := listAgents(true)
+	stopShort := ""
+	if a, ok := agentBySessionID(agents, info.SessionID); ok {
+		stopShort = a.ID
 	}
-	newShort, err := resumeAgent(resumeTarget, sessName, workDir, text)
+	newShort, err := resumeAgent(stopShort, info.SessionID, sessName, workDir, text)
 	if err != nil {
 		return err
 	}

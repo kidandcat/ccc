@@ -52,7 +52,7 @@ func TestLiveQuestionFlow(t *testing.T) {
 	t.Logf("delivered %d assistant text block(s), last=%q", len(texts), truncate(texts[len(texts)-1].text, 60))
 
 	// 4. Resume the conversation and confirm a new short id (id changes on resume).
-	newShort, err := resumeAgent(short, "ccc-live-test", dir, "Thanks, now stop.")
+	newShort, err := resumeAgent(short, uuid, "ccc-live-test", dir, "Thanks, now stop.")
 	if err != nil {
 		t.Fatalf("resumeAgent: %v", err)
 	}
