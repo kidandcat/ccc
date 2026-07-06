@@ -113,15 +113,26 @@ func dedupSessions(config *Config) bool {
 // if it created any topic (config was saved).
 func discoverFleet(config *Config, live []AgentInfo) bool {
 	mapped := map[string]bool{}
+	pendingCwd := map[string]bool{} // cwd of /new sessions awaiting their agent
 	for _, info := range config.Sessions {
-		if info != nil && info.SessionID != "" {
+		if info == nil {
+			continue
+		}
+		if info.SessionID != "" {
 			mapped[info.SessionID] = true
+		} else if info.Path != "" {
+			pendingCwd[info.Path] = true
 		}
 	}
 	changed := false
 	for i := range live {
 		a := live[i]
 		if a.SessionID == "" || mapped[a.SessionID] {
+			continue
+		}
+		// A pending /new session in this cwd will claim this agent — don't
+		// race it with a duplicate discovery topic.
+		if pendingCwd[a.Cwd] {
 			continue
 		}
 		// Skip killed sessions (stopped/failed) — the agents view drops them.
