@@ -21,10 +21,16 @@ const mirrorInterval = 3 * time.Second
 
 const probeInterval = 15 * time.Second
 
+// reapAfterTicks is how many consecutive polls a started session must be absent
+// from the fleet before its topic is deleted (grace to ride out resume/respawn
+// transients). At mirrorInterval=3s this is ~9s.
+const reapAfterTicks = 3
+
 var (
-	mirrorMu   sync.Mutex
-	lastStatus = map[int64]string{}    // topicID -> last posted status
-	lastProbe  = map[int64]time.Time{} // topicID -> last deletion probe
+	mirrorMu     sync.Mutex
+	lastStatus   = map[int64]string{}    // topicID -> last posted status
+	lastProbe    = map[int64]time.Time{} // topicID -> last deletion probe
+	missingTicks = map[int64]int{}       // topicID -> consecutive polls absent from fleet
 )
 
 // runMirror is the poller loop, launched as a goroutine from listen().
@@ -98,6 +104,21 @@ func discoverFleet(config *Config, live []AgentInfo) bool {
 		saveConfig(config)
 	}
 	return changed
+}
+
+// reapSession deletes the Telegram topic for a session that has disappeared
+// from the fleet (dismissed in the agents view or ended), and drops it from the
+// map — the mirror image of retireSession.
+func reapSession(config *Config, sessName string, info *SessionInfo) {
+	deleteForumTopic(config, info.TopicID)
+	mirrorMu.Lock()
+	delete(lastStatus, info.TopicID)
+	delete(lastProbe, info.TopicID)
+	delete(missingTicks, info.TopicID)
+	mirrorMu.Unlock()
+	delete(config.Sessions, sessName)
+	saveConfig(config)
+	hookLog("reaped session %s (gone from fleet) — deleted topic %d", sessName, info.TopicID)
 }
 
 // retireSession stops a session's agent and removes it from the map, in
@@ -181,6 +202,25 @@ func mirrorSession(config *Config, agents []AgentInfo, sessName string, info *Se
 	}
 
 	a, live := agentBySessionID(agents, info.SessionID)
+
+	// Reap: a session that was started (has a UUID) but has vanished from the
+	// fleet was dismissed in the agents view (Ctrl+X) or ended — delete its
+	// topic so ccc mirrors the agents view. Grace period avoids reaping during
+	// a resume/respawn (when the agent briefly disappears).
+	if info.SessionID != "" && !live {
+		mirrorMu.Lock()
+		missingTicks[info.TopicID]++
+		gone := missingTicks[info.TopicID] >= reapAfterTicks
+		mirrorMu.Unlock()
+		if gone {
+			reapSession(config, sessName, info)
+		}
+		return
+	}
+	mirrorMu.Lock()
+	delete(missingTicks, info.TopicID)
+	mirrorMu.Unlock()
+
 	short := info.ShortID
 	if live {
 		short = a.ID
