@@ -41,18 +41,15 @@ func runMirror() {
 		if err != nil || config == nil || config.GroupID == 0 {
 			continue
 		}
-		// Discover new fleet sessions from the default agents view (active /
-		// resident agents — excludes settled leftovers) and auto-create topics.
-		if live, err := listAgents(false); err == nil {
-			if discoverFleet(config, live) {
-				config, _ = loadConfig()
-			}
-		}
-		// Mirror every mapped session using the full snapshot (includes done
-		// state so we can deliver a session's final output).
+		// Full snapshot: includes done/idle-resident sessions (what the agents
+		// view shows), excludes only killed ones — used for both discovery and
+		// mirroring.
 		agents, err := listAgents(true)
 		if err != nil {
 			continue
+		}
+		if discoverFleet(config, agents) {
+			config, _ = loadConfig()
 		}
 		for sessName, info := range config.Sessions {
 			if info == nil || info.TopicID == 0 {
@@ -79,6 +76,12 @@ func discoverFleet(config *Config, live []AgentInfo) bool {
 	for i := range live {
 		a := live[i]
 		if a.SessionID == "" || mapped[a.SessionID] {
+			continue
+		}
+		// Skip killed sessions (stopped/failed) — the agents view drops them.
+		// Active and done/idle-resident sessions are what we mirror.
+		st := strings.ToLower(a.State)
+		if st == "stopped" || st == "failed" || st == "error" {
 			continue
 		}
 		topicID, err := createForumTopic(config, topicTitleFor(&a))
