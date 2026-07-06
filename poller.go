@@ -48,6 +48,9 @@ func runMirror() {
 		if err != nil {
 			continue
 		}
+		if dedupSessions(config) {
+			config, _ = loadConfig()
+		}
 		if discoverFleet(config, agents) {
 			config, _ = loadConfig()
 		}
@@ -58,6 +61,49 @@ func runMirror() {
 			mirrorSession(config, agents, sessName, info)
 		}
 	}
+}
+
+// dedupSessions removes duplicate topics that map to the same conversation
+// (e.g. a /new session and a discovery topic racing for the same agent),
+// keeping the earliest-created topic and reaping the rest.
+func dedupSessions(config *Config) bool {
+	bySid := map[string][]string{}
+	for name, info := range config.Sessions {
+		if info != nil && info.SessionID != "" {
+			bySid[info.SessionID] = append(bySid[info.SessionID], name)
+		}
+	}
+	changed := false
+	for _, names := range bySid {
+		if len(names) < 2 {
+			continue
+		}
+		keep := names[0]
+		for _, n := range names {
+			if config.Sessions[n].TopicID < config.Sessions[keep].TopicID {
+				keep = n
+			}
+		}
+		for _, n := range names {
+			if n == keep {
+				continue
+			}
+			info := config.Sessions[n]
+			deleteForumTopic(config, info.TopicID)
+			mirrorMu.Lock()
+			delete(lastStatus, info.TopicID)
+			delete(lastProbe, info.TopicID)
+			delete(missingTicks, info.TopicID)
+			mirrorMu.Unlock()
+			delete(config.Sessions, n)
+			changed = true
+			hookLog("deduped session %s (dup of %s) — deleted topic %d", n, keep, info.TopicID)
+		}
+	}
+	if changed {
+		saveConfig(config)
+	}
+	return changed
 }
 
 // discoverFleet auto-creates a Telegram topic for every active bg agent that

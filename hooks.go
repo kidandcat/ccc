@@ -85,7 +85,13 @@ func handleAskQuestionHook() error {
 		return nil
 	}
 
-	sessName, topicID := findSessionByCwd(config, hd.Cwd)
+	// Map the firing agent to its topic by session_id (exact), NOT by cwd:
+	// many sessions share the home directory, so cwd is ambiguous and would
+	// route a question to the wrong topic.
+	sessName, topicID := findSessionBySessionID(config, hd.SessionID)
+	if sessName == "" {
+		sessName, topicID = findSessionByCwd(config, hd.Cwd)
+	}
 	if sessName == "" || config.GroupID == 0 || topicID == 0 {
 		// Not a ccc-managed session — let Claude handle it normally.
 		outputPermissionDecision("allow", "not a ccc session")
@@ -223,6 +229,20 @@ func readHookStdin() ([]byte, error) {
 	case <-time.After(3 * time.Second):
 		return nil, nil
 	}
+}
+
+// findSessionBySessionID matches a hook's session_id (conversation UUID) to a
+// configured session — the reliable key, since cwd is shared across sessions.
+func findSessionBySessionID(config *Config, sessionID string) (string, int64) {
+	if sessionID == "" {
+		return "", 0
+	}
+	for name, info := range config.Sessions {
+		if info != nil && info.SessionID == sessionID {
+			return name, info.TopicID
+		}
+	}
+	return "", 0
 }
 
 // findSessionByCwd matches a hook's cwd to a configured session.
