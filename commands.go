@@ -109,13 +109,11 @@ func getSystemStats() string {
 		}
 	}
 
-	// Tmux sessions
-	if out, err := exec.Command("tmux", "list-sessions").Output(); err == nil {
-		sessions := strings.TrimSpace(string(out))
-		if sessions != "" {
-			count := len(strings.Split(sessions, "\n"))
-			sb.WriteString(fmt.Sprintf("\n📟 Tmux sessions: %d\n", count))
-			sb.WriteString(sessions)
+	// Background agents (the ccc fleet)
+	if agents, err := listAgents(false); err == nil && len(agents) > 0 {
+		sb.WriteString(fmt.Sprintf("\n🤖 Background agents: %d\n", len(agents)))
+		for _, a := range agents {
+			sb.WriteString(fmt.Sprintf("• %s (%s)\n", topicTitleFor(&a), a.State))
 		}
 	}
 

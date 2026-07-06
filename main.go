@@ -179,7 +179,7 @@ func main() {
 	}
 
 	if len(os.Args) < 2 {
-		// No args: start/attach tmux session with topic
+		// No args: attach to this directory's background session (or run claude)
 		if err := startSession(false); err != nil {
 			os.Exit(1)
 		}
@@ -344,7 +344,7 @@ func main() {
 
 	case "start":
 		// start <name> <work-dir> <prompt>
-		// Creates a Telegram topic, tmux session with Claude, and sends the prompt (detached)
+		// Creates a Telegram topic + background agent and sends the initial prompt (detached)
 		if len(os.Args) < 5 {
 			fmt.Fprintf(os.Stderr, "Usage: ccc start <session-name> <work-dir> <prompt>\n")
 			os.Exit(1)
