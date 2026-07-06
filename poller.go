@@ -218,11 +218,12 @@ func deliverText(config *Config, sessName string, topicID int64, transcript stri
 		if isDelivered(sessName, id, "telegram") {
 			continue
 		}
-		msg := fmt.Sprintf("*%s:*\n%s", sessName, b.text)
-		tgID, err := sendMessageGetID(config, config.GroupID, topicID, msg)
+		// No session-name prefix: each session has its own topic, so the label
+		// is redundant (and reads as if the message came from the user).
+		tgID, err := sendMessageGetID(config, config.GroupID, topicID, b.text)
 		if err != nil {
 			time.Sleep(400 * time.Millisecond)
-			tgID, _ = sendMessageGetID(config, config.GroupID, topicID, msg)
+			tgID, _ = sendMessageGetID(config, config.GroupID, topicID, b.text)
 		}
 		appendMessage(&MessageRecord{
 			ID: id, Session: sessName, Type: "assistant_text",

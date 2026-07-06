@@ -639,7 +639,7 @@ func listen() error {
 		undelivered := findUndelivered(sessName, "telegram")
 		for _, ur := range undelivered {
 			if ur.Type == "assistant_text" || ur.Type == "notification" {
-				sendMessage(config, config.GroupID, info.TopicID, fmt.Sprintf("*%s:*\n%s", sessName, ur.Text))
+				sendMessage(config, config.GroupID, info.TopicID, ur.Text)
 				updateDelivery(sessName, ur.ID, "telegram_delivered", true)
 			}
 		}
