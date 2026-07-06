@@ -500,15 +500,15 @@ func deleteForumTopic(config *Config, topicID int64) error {
 // setBotCommands sets the bot commands in Telegram
 func setBotCommands(botToken string) {
 	commands := []map[string]string{
-		{"command": "new", "description": "Create/restart session: /new <name>"},
+		{"command": "new", "description": "New session: /new <name> (or reset in a topic)"},
+		{"command": "stop", "description": "Stop this session's agent (keeps conversation)"},
 		{"command": "delete", "description": "Delete current session and thread"},
-		{"command": "cleanup", "description": "Delete ALL sessions, folders and threads"},
+		{"command": "cleanup", "description": "Delete ALL sessions and threads"},
+		{"command": "list", "description": "List sessions and their status"},
 		{"command": "c", "description": "Execute shell command: /c <cmd>"},
-		{"command": "continue", "description": "Restart session with history"},
 		{"command": "update", "description": "Update ccc binary from GitHub"},
 		{"command": "version", "description": "Show ccc version"},
 		{"command": "stats", "description": "Show system stats (RAM, disk, etc)"},
-		{"command": "auth", "description": "Re-authenticate Claude OAuth"},
 	}
 
 	// Set for default scope

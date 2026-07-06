@@ -7,14 +7,17 @@ import (
 	"strings"
 )
 
-const version = "1.7.0"
+const version = "2.0.0"
 
-// SessionInfo stores information about a session
+// SessionInfo stores information about a session. Each session is a dedicated
+// Claude Code background agent (visible in `claude agents`). The stable key is
+// TopicID; SessionID/ShortID track the CURRENT bg agent and are refreshed on
+// every dispatch/resume (the short id changes each time a session is resumed).
 type SessionInfo struct {
-	TopicID         int64  `json:"topic_id"`
-	Path            string `json:"path"`
-	ClaudeSessionID string `json:"claude_session_id,omitempty"`
-	WindowID        string `json:"window_id,omitempty"` // tmux window ID (@N)
+	TopicID   int64  `json:"topic_id"`
+	Path      string `json:"path"`
+	SessionID string `json:"session_id,omitempty"` // current conversation UUID
+	ShortID   string `json:"short_id,omitempty"`   // current bg daemon short id
 }
 
 // Config stores bot configuration and session mappings
@@ -192,13 +195,6 @@ func main() {
 	}
 
 	switch os.Args[1] {
-	case "run":
-		// Run claude directly (used inside tmux sessions)
-		continueSession := len(os.Args) > 2 && os.Args[2] == "-c"
-		if err := runClaudeRaw(continueSession); err != nil {
-			os.Exit(1)
-		}
-		return
 	case "setup":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: ccc setup <bot_token>")
@@ -231,11 +227,6 @@ func main() {
 			} else {
 				fmt.Println("transcription_lang: not set (auto-detect)")
 			}
-			if isOTPEnabled(config) {
-				fmt.Println("otp: enabled")
-			} else {
-				fmt.Println("otp: disabled (enable with: ccc setup <bot_token>)")
-			}
 			fmt.Println("\nUsage: ccc config <key> <value>")
 			fmt.Println("  ccc config projects-dir ~/Projects")
 			fmt.Println("  ccc config oauth-token <token>")
@@ -265,12 +256,6 @@ func main() {
 					fmt.Println(config.TranscriptionLang)
 				} else {
 					fmt.Println("not set (auto-detect)")
-				}
-			case "otp":
-				if isOTPEnabled(config) {
-					fmt.Println("enabled")
-				} else {
-					fmt.Println("disabled")
 				}
 			default:
 				fmt.Fprintf(os.Stderr, "Unknown config key: %s\n", key)
@@ -308,9 +293,6 @@ func main() {
 				os.Exit(1)
 			}
 			fmt.Printf("✅ Transcription language set to: %s\n", value)
-		case "otp":
-			fmt.Fprintf(os.Stderr, "Permission mode can only be changed via: ccc setup <bot_token>\n")
-			os.Exit(1)
 		default:
 			fmt.Fprintf(os.Stderr, "Unknown config key: %s\n", key)
 			os.Exit(1)
@@ -333,58 +315,10 @@ func main() {
 			os.Exit(1)
 		}
 
-	case "hook-permission":
-		if err := handlePermissionHook(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
 	case "hook-question":
-		// Legacy: redirect to permission hook
-		if err := handlePermissionHook(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-	case "hook-stop":
-		if err := handleStopHook(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-	case "hook-stop-retry":
-		// Background process: retry transcript read 3x at 2s intervals
-		// Args: sessName topicID transcriptPath
-		if len(os.Args) < 5 {
-			os.Exit(1)
-		}
-		var tid int64
-		fmt.Sscan(os.Args[3], &tid)
-		handleStopRetry(os.Args[2], tid, os.Args[4])
-
-	case "hook-post-tool":
-		if err := handlePostToolHook(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-	case "hook-user-prompt":
-		if err := handleUserPromptHook(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-	case "hook-notification":
-		if err := handleNotificationHook(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
+		handleAskQuestionHook()
 
 	case "install":
-		if err := installHook(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
 		if err := installSkill(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -395,9 +329,6 @@ func main() {
 		}
 
 	case "uninstall":
-		if err := uninstallHook(); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: Could not uninstall hooks: %v\n", err)
-		}
 		uninstallSkill()
 		fmt.Println("✅ CCC uninstalled")
 

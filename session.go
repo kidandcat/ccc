@@ -5,81 +5,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
-// tmuxSafeName converts a session name to a tmux-safe window name
-// (dots are interpreted as window/pane separators in tmux)
-func tmuxSafeName(name string) string {
-	return strings.ReplaceAll(name, ".", "_")
-}
+// Session backend built on Claude Code background agents (see agents.go).
+// A ccc session == one Telegram topic == one dedicated bg Claude agent.
+//
+// Sessions are lazy: `/new <name>` just registers the topic + config entry;
+// the FIRST message sent to the topic dispatches the bg agent with that
+// message as the initial prompt. Subsequent messages resume the conversation.
 
-// getWindowID safely looks up the tmux WindowID from config for a session name.
-// Returns empty string if the session or WindowID is not set.
-func getWindowID(config *Config, sessionName string) string {
-	if config == nil || config.Sessions == nil {
-		return ""
-	}
-	info, exists := config.Sessions[sessionName]
-	if !exists || info == nil {
-		return ""
-	}
-	return info.WindowID
-}
-
-func createSession(config *Config, name string) error {
-	// Check if session already exists
-	if _, exists := config.Sessions[name]; exists {
-		return fmt.Errorf("session '%s' already exists", name)
-	}
-
-	// Create Telegram topic
-	topicID, err := createForumTopic(config, name)
-	if err != nil {
-		return fmt.Errorf("failed to create topic: %w", err)
-	}
-
-	// Create tmux window
-	workDir := resolveProjectPath(config, name)
-	if _, err := os.Stat(workDir); os.IsNotExist(err) {
-		// Create project directory
-		os.MkdirAll(workDir, 0755)
-	}
-
-	windowID, err := createTmuxWindow(tmuxSafeName(name), workDir, false)
-	if err != nil {
-		return fmt.Errorf("failed to create tmux window: %w", err)
-	}
-
-	// Save mapping with full path
-	config.Sessions[name] = &SessionInfo{
-		TopicID:  topicID,
-		Path:     workDir,
-		WindowID: windowID,
-	}
-	if err := saveConfig(config); err != nil {
-		return fmt.Errorf("failed to save config: %w", err)
-	}
-
-	return nil
-}
-
-func killSession(config *Config, name string) error {
-	if _, exists := config.Sessions[name]; !exists {
-		return fmt.Errorf("session '%s' not found", name)
-	}
-
-	// Kill tmux window
-	killTmuxWindow(getWindowID(config, name), tmuxSafeName(name))
-
-	// Remove from config
-	delete(config.Sessions, name)
-	saveConfig(config)
-
-	return nil
-}
-
+// getSessionByTopic returns the session name mapped to a Telegram topic id.
 func getSessionByTopic(config *Config, topicID int64) string {
 	for name, info := range config.Sessions {
 		if info != nil && info.TopicID == topicID {
@@ -89,141 +25,190 @@ func getSessionByTopic(config *Config, topicID int64) string {
 	return ""
 }
 
-// startSession creates/attaches to a tmux window with Telegram topic
+// getSessionByPath returns the session name whose working dir matches path.
+func getSessionByPath(config *Config, path string) string {
+	for name, info := range config.Sessions {
+		if info != nil && info.Path == path {
+			return name
+		}
+	}
+	return ""
+}
+
+// liveShortID returns the current live/known short id for a session, preferring
+// the fleet snapshot (authoritative) and falling back to the stored id.
+func liveShortID(config *Config, sessName string, agents []AgentInfo) string {
+	info := config.Sessions[sessName]
+	if info == nil {
+		return ""
+	}
+	if a, ok := agentBySessionID(agents, info.SessionID); ok {
+		return a.ID
+	}
+	return info.ShortID
+}
+
+// persistAgentIDs stores the current short id (and resolved conversation UUID)
+// for a session after a dispatch or resume.
+func persistAgentIDs(sessName, shortID string) {
+	config, err := loadConfig()
+	if err != nil || config == nil {
+		return
+	}
+	info := config.Sessions[sessName]
+	if info == nil {
+		return
+	}
+	info.ShortID = shortID
+	if uuid := resolveSessionUUID(shortID, 8*time.Second); uuid != "" {
+		info.SessionID = uuid
+	}
+	saveConfig(config)
+}
+
+// launchSessionAgent dispatches a brand-new bg agent for a session with an
+// initial prompt, then persists its ids. workDir is created if missing.
+func launchSessionAgent(config *Config, sessName, prompt string) error {
+	info := config.Sessions[sessName]
+	if info == nil {
+		return fmt.Errorf("session '%s' not found", sessName)
+	}
+	workDir := info.Path
+	if workDir == "" {
+		workDir = resolveProjectPath(config, sessName)
+	}
+	if _, err := os.Stat(workDir); os.IsNotExist(err) {
+		os.MkdirAll(workDir, 0755)
+	}
+	shortID, err := dispatchAgent(sessName, workDir, prompt)
+	if err != nil {
+		return err
+	}
+	persistAgentIDs(sessName, shortID)
+	return nil
+}
+
+// sendToSession delivers a follow-up user message to a session's bg agent.
+// If no agent is running yet (lazy session, or it settled), it dispatches a
+// fresh one using the message as the initial prompt.
+func sendToSession(config *Config, sessName, text string) error {
+	info := config.Sessions[sessName]
+	if info == nil {
+		return fmt.Errorf("session '%s' not found", sessName)
+	}
+	workDir := info.Path
+	if workDir == "" {
+		workDir = resolveProjectPath(config, sessName)
+	}
+	if _, err := os.Stat(workDir); os.IsNotExist(err) {
+		os.MkdirAll(workDir, 0755)
+	}
+
+	agents, _ := listAgents(true)
+	shortID := liveShortID(config, sessName, agents)
+
+	// If we have no record of an agent at all, start fresh.
+	if shortID == "" && info.SessionID == "" {
+		shortID, err := dispatchAgent(sessName, workDir, text)
+		if err != nil {
+			return err
+		}
+		persistAgentIDs(sessName, shortID)
+		return nil
+	}
+
+	// Resume the existing conversation. Prefer the live short id; fall back to
+	// the stored conversation UUID (works even if the daemon forgot the job).
+	resumeTarget := shortID
+	if resumeTarget == "" {
+		resumeTarget = info.SessionID
+	}
+	newShort, err := resumeAgent(resumeTarget, sessName, workDir, text)
+	if err != nil {
+		return err
+	}
+	persistAgentIDs(sessName, newShort)
+	return nil
+}
+
+// startSession handles the local `ccc` command: attach to this directory's bg
+// session if one is live, otherwise fall back to a normal interactive claude.
 func startSession(continueSession bool) error {
-	// Get current directory name as session name
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
 	}
 	name := filepath.Base(cwd)
-	winName := tmuxSafeName(name)
 
-	// Load config to check/create topic
-	config, err := loadConfig()
-	if err != nil {
-		// No config, just run claude directly
-		return runClaudeRaw(continueSession)
-	}
-
-	// Create topic if it doesn't exist and we have a group configured
-	if config.GroupID != 0 {
-		if _, exists := config.Sessions[name]; !exists {
-			topicID, err := createForumTopic(config, name)
-			if err == nil {
-				config.Sessions[name] = &SessionInfo{
-					TopicID: topicID,
-					Path:    cwd,
-				}
-				saveConfig(config)
-				fmt.Printf("📱 Created Telegram topic: %s\n", name)
+	config, cfgErr := loadConfig()
+	if cfgErr == nil && config != nil {
+		sessName := getSessionByPath(config, cwd)
+		if sessName == "" {
+			if _, ok := config.Sessions[name]; ok {
+				sessName = name
+			}
+		}
+		if sessName != "" {
+			agents, _ := listAgents(true)
+			if short := liveShortID(config, sessName, agents); short != "" {
+				fmt.Printf("Attaching to background session '%s' (%s)...\n", sessName, short)
+				return runClaude2("attach", short)
 			}
 		}
 	}
 
-	// Check if window already exists
-	windowID := getWindowID(config, name)
-	if tmuxWindowExistsByID(windowID, winName) {
-		target := tmuxTargetByID(windowID, winName)
-		// Extract session name from target "session:window" (only for name-based targets)
-		sessName := strings.SplitN(target, ":", 2)[0]
-		if os.Getenv("TMUX") != "" {
-			cmd := exec.Command(tmuxPath, "select-window", "-t", target)
-			cmd.Stdin = os.Stdin
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			return cmd.Run()
-		}
-		exec.Command(tmuxPath, "select-window", "-t", target).Run()
-		cmd := exec.Command(tmuxPath, "attach-session", "-t", sessName)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		return cmd.Run()
+	// No live bg session for this dir → normal interactive claude.
+	if continueSession {
+		return runClaude2("--continue")
 	}
-
-	// Create new window
-	windowID, err = createTmuxWindow(winName, cwd, continueSession)
-	if err != nil {
-		return err
-	}
-
-	// Store window ID back to config
-	if config.Sessions[name] != nil {
-		config.Sessions[name].WindowID = windowID
-		saveConfig(config)
-	}
-
-	target := tmuxTargetByID(windowID, winName)
-	sessName := strings.SplitN(target, ":", 2)[0]
-	if os.Getenv("TMUX") != "" {
-		cmd := exec.Command(tmuxPath, "select-window", "-t", target)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		return cmd.Run()
-	}
-	cmd := exec.Command(tmuxPath, "attach-session", "-t", sessName)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return runClaude2()
 }
 
-// startDetached creates a Telegram topic, tmux window with Claude, and sends a prompt (no attach)
+// startDetached creates a Telegram topic + bg agent for a session and sends an
+// initial prompt, without attaching. Used by `ccc start <name> <dir> <prompt>`.
 func startDetached(name string, workDir string, prompt string) error {
 	config, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
-
 	if config.Sessions == nil {
 		config.Sessions = make(map[string]*SessionInfo)
 	}
 
-	// Create Telegram topic
-	topicID, err := createForumTopic(config, name)
+	topicID, err := ensureTopic(config, name)
 	if err != nil {
 		return fmt.Errorf("failed to create topic: %w", err)
 	}
 
-	winName := tmuxSafeName(name)
-
-	// Kill existing window if any
-	oldWindowID := getWindowID(config, name)
-	if tmuxWindowExistsByID(oldWindowID, winName) {
-		killTmuxWindow(oldWindowID, winName)
-		time.Sleep(300 * time.Millisecond)
-	}
-
-	// Create tmux window (detached)
-	windowID, err := createTmuxWindow(winName, workDir, false)
-	if err != nil {
-		return fmt.Errorf("failed to create tmux window: %w", err)
-	}
-
-	// Save session info
-	config.Sessions[name] = &SessionInfo{
-		TopicID:  topicID,
-		Path:     workDir,
-		WindowID: windowID,
-	}
+	config.Sessions[name] = &SessionInfo{TopicID: topicID, Path: workDir}
 	if err := saveConfig(config); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
-	target := tmuxTargetByID(windowID, winName)
-
-	// Wait for Claude to be ready before sending prompt
-	if err := waitForClaude(target, 30*time.Second); err != nil {
-		return fmt.Errorf("claude did not start in time: %w", err)
+	if err := launchSessionAgent(config, name, prompt); err != nil {
+		return fmt.Errorf("failed to start agent: %w", err)
 	}
 
-	// Send the prompt to the tmux window
-	if err := sendToTmux(target, prompt); err != nil {
-		return fmt.Errorf("failed to send prompt: %w", err)
-	}
-
-	fmt.Printf("Session '%s' started in window '%s' with topic %d\n", name, winName, topicID)
+	fmt.Printf("Session '%s' started (topic %d)\n", name, topicID)
 	return nil
+}
+
+// ensureTopic returns the topic id for a session, creating it if needed.
+func ensureTopic(config *Config, name string) (int64, error) {
+	if info, ok := config.Sessions[name]; ok && info != nil && info.TopicID != 0 {
+		return info.TopicID, nil
+	}
+	if config.GroupID == 0 {
+		return 0, fmt.Errorf("no group configured (run: ccc setgroup)")
+	}
+	return createForumTopic(config, name)
+}
+
+// runClaude2 execs the claude binary interactively, inheriting stdio.
+func runClaude2(args ...string) error {
+	cmd := exec.Command(claudeBin(), args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
