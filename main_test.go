@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -741,5 +742,47 @@ func TestSessionWorkDir(t *testing.T) {
 	}
 	if got := sessionWorkDir(&SessionInfo{}); got != home {
 		t.Errorf("sessionWorkDir default = %q, want %q", got, home)
+	}
+}
+
+// TestCCCMarker verifies the stable per-session marker encoding and that
+// tagPrompt embeds it without dropping the original prompt.
+func TestCCCMarker(t *testing.T) {
+	if got := cccMarker(1224); got != "ccc-session:t1224" {
+		t.Errorf("cccMarker = %q", got)
+	}
+	tagged := tagPrompt("fix the decoder", 42)
+	if !strings.Contains(tagged, "fix the decoder") {
+		t.Errorf("tagPrompt dropped the prompt: %q", tagged)
+	}
+	if !strings.Contains(tagged, cccMarker(42)) {
+		t.Errorf("tagPrompt missing marker: %q", tagged)
+	}
+}
+
+// TestTranscriptTopicMarker verifies the marker is recovered from a transcript
+// (so a resumed agent re-links to its topic) and that noise/absence yields 0.
+func TestTranscriptTopicMarker(t *testing.T) {
+	dir := t.TempDir()
+	// A transcript whose message history carries the marker for topic 777.
+	withMarker := filepath.Join(dir, "with.jsonl")
+	os.WriteFile(withMarker, []byte(
+		`{"type":"user","message":{"content":"do a thing\n\n<!-- ccc-session:t777 -->"}}`+"\n"+
+			`{"type":"assistant","message":{"content":"ok"}}`+"\n"), 0644)
+	if got := transcriptTopicMarker(withMarker); got != 777 {
+		t.Errorf("transcriptTopicMarker with marker = %d, want 777", got)
+	}
+	// No marker.
+	without := filepath.Join(dir, "without.jsonl")
+	os.WriteFile(without, []byte(`{"type":"user","message":{"content":"hello"}}`+"\n"), 0644)
+	if got := transcriptTopicMarker(without); got != 0 {
+		t.Errorf("transcriptTopicMarker without marker = %d, want 0", got)
+	}
+	// Missing / empty path.
+	if got := transcriptTopicMarker(filepath.Join(dir, "nope.jsonl")); got != 0 {
+		t.Errorf("transcriptTopicMarker missing file = %d, want 0", got)
+	}
+	if got := transcriptTopicMarker(""); got != 0 {
+		t.Errorf("transcriptTopicMarker empty path = %d, want 0", got)
 	}
 }

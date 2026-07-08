@@ -32,6 +32,25 @@ func titleFromPrompt(prompt string) string {
 	return title
 }
 
+// cccMarker is the stable per-session tag ccc embeds in a conversation so it
+// can re-identify the session after a resume. `claude --bg --resume` mints a
+// brand-new conversation UUID (and short id, and bridge id) and records no link
+// back to the parent, so neither the fleet snapshot nor the job state can tie a
+// resumed agent to the session it continues. The marker rides inside the
+// conversation itself — copied into every resumed transcript — so it survives
+// any resume, whether ccc or the PC agents view triggered it, and unlike the
+// title (which Claude renames freely) it never changes. The stable id is the
+// Telegram TopicID, which ccc owns and never reuses.
+func cccMarker(topicID int64) string {
+	return fmt.Sprintf("ccc-session:t%d", topicID)
+}
+
+// tagPrompt appends the hidden ccc marker to a prompt as an HTML comment, so it
+// lands in the transcript with minimal noise to the model.
+func tagPrompt(prompt string, topicID int64) string {
+	return prompt + "\n\n<!-- " + cccMarker(topicID) + " -->"
+}
+
 // uniqueSessionName returns a config-map key based on title that doesn't
 // collide with an existing session.
 func uniqueSessionName(config *Config, title string) string {
@@ -99,6 +118,15 @@ func liveShortID(config *Config, sessName string, agents []AgentInfo) string {
 
 // persistAgentIDs stores the current short id (and resolved conversation UUID)
 // for a session after a dispatch or resume.
+//
+// The short id is persisted *immediately*, before the (up to 8s) UUID resolve:
+// this is the short-id handoff that stops the mirror poller from racing a
+// resume. A resume mints a new short id + UUID; until this returns, the tracked
+// entry still holds the OLD UUID, so the poller would see the session "gone"
+// (reap its topic) and the new agent "unknown" (spawn a duplicate topic).
+// Recording the new short id up front lets the poller match the session by
+// short id (liveShortID / discovery) and adopt the fresh UUID before either
+// mis-fires.
 func persistAgentIDs(sessName, shortID string) {
 	config, err := loadConfig()
 	if err != nil || config == nil {
@@ -109,10 +137,38 @@ func persistAgentIDs(sessName, shortID string) {
 		return
 	}
 	info.ShortID = shortID
-	if uuid := resolveSessionUUID(shortID, 8*time.Second); uuid != "" {
-		info.SessionID = uuid
+	saveConfig(config) // safe-ignore: best-effort; the UUID resolve below re-persists
+
+	uuid := resolveSessionUUID(shortID, 8*time.Second)
+	if uuid == "" {
+		return
 	}
+	// Reload: the poller may have mutated config (adopted the UUID, renamed the
+	// topic) while we were resolving. Re-apply our ids on the fresh copy.
+	config, err = loadConfig()
+	if err != nil || config == nil {
+		return
+	}
+	info = config.Sessions[sessName]
+	if info == nil {
+		return
+	}
+	info.ShortID = shortID
+	info.SessionID = uuid
 	saveConfig(config)
+}
+
+// markSession records that ccc has embedded its stable marker in a session's
+// conversation, so we don't re-tag every subsequent message.
+func markSession(sessName string) {
+	config, err := loadConfig()
+	if err != nil || config == nil {
+		return
+	}
+	if info := config.Sessions[sessName]; info != nil && !info.Marked {
+		info.Marked = true
+		saveConfig(config)
+	}
 }
 
 // launchSessionAgent dispatches a brand-new bg agent for a session with an
@@ -126,11 +182,15 @@ func launchSessionAgent(config *Config, sessName, prompt string) error {
 	if _, err := os.Stat(workDir); os.IsNotExist(err) {
 		os.MkdirAll(workDir, 0755)
 	}
+	// Embed the stable ccc marker in the opening prompt so the session stays
+	// re-identifiable across resumes (see cccMarker).
+	prompt = tagPrompt(prompt, info.TopicID)
 	shortID, err := dispatchAgent(agentDisplayName(info, sessName), workDir, prompt)
 	if err != nil {
 		return err
 	}
 	persistAgentIDs(sessName, shortID)
+	markSession(sessName)
 	return nil
 }
 
@@ -147,13 +207,22 @@ func sendToSession(config *Config, sessName, text string) error {
 		os.MkdirAll(workDir, 0755)
 	}
 
+	// Tag the outgoing message with the stable ccc marker until the conversation
+	// carries one — for sessions discovered from the fleet (ccc didn't write the
+	// opening prompt), the first follow-up is where the marker gets embedded.
+	prompt := text
+	if !info.Marked {
+		prompt = tagPrompt(text, info.TopicID)
+	}
+
 	// No prior conversation → dispatch a fresh agent with this message.
 	if info.SessionID == "" {
-		short, err := dispatchAgent(agentDisplayName(info, sessName), workDir, text)
+		short, err := dispatchAgent(agentDisplayName(info, sessName), workDir, prompt)
 		if err != nil {
 			return err
 		}
 		persistAgentIDs(sessName, short)
+		markSession(sessName)
 		return nil
 	}
 
@@ -164,11 +233,12 @@ func sendToSession(config *Config, sessName, text string) error {
 	if a, ok := agentBySessionID(agents, info.SessionID); ok {
 		stopShort = a.ID
 	}
-	newShort, err := resumeAgent(stopShort, info.SessionID, agentDisplayName(info, sessName), workDir, text)
+	newShort, err := resumeAgent(stopShort, info.SessionID, agentDisplayName(info, sessName), workDir, prompt)
 	if err != nil {
 		return err
 	}
 	persistAgentIDs(sessName, newShort)
+	markSession(sessName)
 	return nil
 }
 

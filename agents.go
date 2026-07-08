@@ -286,6 +286,31 @@ func transcriptPathForUUID(uuid string) string {
 	return ""
 }
 
+var cccMarkerRe = regexp.MustCompile(`ccc-session:t(\d+)`)
+
+// transcriptTopicMarker scans a conversation transcript for the ccc marker
+// (see cccMarker) and returns the Telegram TopicID it encodes, or 0 if none.
+// The marker survives resume because it lives in the conversation's message
+// history, so this re-links a resumed agent (new UUID/short) to its session.
+func transcriptTopicMarker(transcriptPath string) int64 {
+	if transcriptPath == "" {
+		return 0
+	}
+	data, err := os.ReadFile(transcriptPath)
+	if err != nil {
+		return 0
+	}
+	// Use the LAST marker: if a topic was deleted and the conversation later
+	// re-tagged with a new topic id, the most recent one is authoritative.
+	ms := cccMarkerRe.FindAllSubmatch(data, -1)
+	if len(ms) == 0 {
+		return 0
+	}
+	var id int64
+	fmt.Sscanf(string(ms[len(ms)-1][1]), "%d", &id)
+	return id
+}
+
 // classifyState maps daemon state/status fields to a coarse ccc status.
 // Returns one of: "working", "needs_input", "done", "failed".
 func classifyState(state, status string) string {

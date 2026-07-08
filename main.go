@@ -19,6 +19,7 @@ type SessionInfo struct {
 	SessionID string `json:"session_id,omitempty"` // current conversation UUID
 	ShortID   string `json:"short_id,omitempty"`   // current bg daemon short id
 	Title     string `json:"title,omitempty"`      // current Telegram topic title (mirrors the agent's name)
+	Marked    bool   `json:"marked,omitempty"`     // ccc has embedded its stable marker (cccMarker) in this conversation
 }
 
 // Config stores bot configuration and session mappings

@@ -112,22 +112,28 @@ func dedupSessions(config *Config) bool {
 // the UUID stable, and ccc updates the mapping on its own resumes. Returns true
 // if it created any topic (config was saved).
 func discoverFleet(config *Config, live []AgentInfo) bool {
-	mapped := map[string]bool{}
-	pendingCwd := map[string]bool{} // cwd of /new sessions awaiting their agent
-	for _, info := range config.Sessions {
+	mapped := map[string]bool{}      // conversation UUID -> tracked
+	mappedShort := map[string]bool{} // short id -> tracked (short-id handoff)
+	pendingCwd := map[string]bool{}  // cwd of /new sessions awaiting their agent
+	byTopic := map[int64]string{}    // TopicID -> session name (for marker adoption)
+	for name, info := range config.Sessions {
 		if info == nil {
 			continue
 		}
+		byTopic[info.TopicID] = name
 		if info.SessionID != "" {
 			mapped[info.SessionID] = true
 		} else if info.Path != "" {
 			pendingCwd[info.Path] = true
 		}
+		if info.ShortID != "" {
+			mappedShort[info.ShortID] = true
+		}
 	}
 	changed := false
 	for i := range live {
 		a := live[i]
-		if a.SessionID == "" || mapped[a.SessionID] {
+		if a.SessionID == "" || mapped[a.SessionID] || mappedShort[a.ID] {
 			continue
 		}
 		// A pending /new session in this cwd will claim this agent — don't
@@ -140,6 +146,23 @@ func discoverFleet(config *Config, live []AgentInfo) bool {
 		st := strings.ToLower(a.State)
 		if st == "stopped" || st == "failed" || st == "error" {
 			continue
+		}
+		// A resume (by ccc OR the PC agents view) mints a new UUID/short with no
+		// server-side link to the parent. If this agent's conversation carries a
+		// ccc marker for a topic we already track, it's that session resumed —
+		// adopt it into the existing topic instead of spawning a duplicate.
+		if topicID := transcriptTopicMarker(transcriptPathForUUID(a.SessionID)); topicID != 0 {
+			if name, ok := byTopic[topicID]; ok {
+				info := config.Sessions[name]
+				info.SessionID = a.SessionID
+				info.ShortID = a.ID
+				info.Marked = true
+				mapped[a.SessionID] = true
+				mappedShort[a.ID] = true
+				changed = true
+				hookLog("adopted resumed agent %s into session %s (marker t%d)", a.ID, name, topicID)
+				continue
+			}
 		}
 		topicID, err := createForumTopic(config, topicTitleFor(&a))
 		if err != nil {
@@ -280,6 +303,20 @@ func mirrorSession(config *Config, agents []AgentInfo, sessName string, info *Se
 	}
 
 	a, live := agentBySessionID(agents, info.SessionID)
+	// Short-id handoff: right after a resume the tracked UUID is stale (the new
+	// agent has a fresh UUID), but its short id is already persisted. Match by
+	// short id and adopt the fresh UUID so we neither reap the topic nor let
+	// discovery spawn a duplicate for the same session.
+	if !live && info.ShortID != "" {
+		if a2, ok := agentByID(agents, info.ShortID); ok {
+			a, live = a2, true
+		}
+	}
+	if live && a.SessionID != "" && a.SessionID != info.SessionID {
+		info.SessionID = a.SessionID
+		info.ShortID = a.ID
+		saveConfig(config) // safe-ignore: best-effort adopt; re-adopted next tick if it fails
+	}
 
 	// Reap: a session that was started (has a UUID) but has vanished from the
 	// fleet was dismissed in the agents view (Ctrl+X) or ended — delete its
