@@ -685,3 +685,61 @@ func findSubstring(s, substr string) bool {
 	}
 	return false
 }
+
+// TestTitleFromPrompt tests the topic title derived from a /new prompt
+func TestTitleFromPrompt(t *testing.T) {
+	tests := []struct {
+		prompt string
+		want   string
+	}{
+		{"fix the swipe decoder", "fix the swipe decoder"},
+		{"  fix   the\nswipe  decoder ", "fix the swipe decoder"},
+		{"", "session"},
+		{"   ", "session"},
+		{"arregla el bug del parser de fechas en el backend", "arregla el bug del parser de fechas en e…"},
+		{"añade soporte para emojis 🎉 en el título de la sesión", "añade soporte para emojis 🎉 en el título…"},
+	}
+	for _, tt := range tests {
+		if got := titleFromPrompt(tt.prompt); got != tt.want {
+			t.Errorf("titleFromPrompt(%q) = %q, want %q", tt.prompt, got, tt.want)
+		}
+	}
+}
+
+// TestUniqueSessionName tests collision handling for session names
+func TestUniqueSessionName(t *testing.T) {
+	config := &Config{Sessions: map[string]*SessionInfo{
+		"deploy":     {TopicID: 1},
+		"deploy (2)": {TopicID: 2},
+	}}
+	if got := uniqueSessionName(config, "build"); got != "build" {
+		t.Errorf("uniqueSessionName free name = %q, want %q", got, "build")
+	}
+	if got := uniqueSessionName(config, "deploy"); got != "deploy (3)" {
+		t.Errorf("uniqueSessionName collision = %q, want %q", got, "deploy (3)")
+	}
+}
+
+// TestAgentDisplayName tests that the fleet name follows the topic title
+func TestAgentDisplayName(t *testing.T) {
+	if got := agentDisplayName(&SessionInfo{Title: "~/ccc: fix decoder"}, "fix decoder"); got != "~/ccc: fix decoder" {
+		t.Errorf("agentDisplayName with title = %q", got)
+	}
+	if got := agentDisplayName(&SessionInfo{}, "fix decoder"); got != "fix decoder" {
+		t.Errorf("agentDisplayName without title = %q", got)
+	}
+	if got := agentDisplayName(nil, "fix decoder"); got != "fix decoder" {
+		t.Errorf("agentDisplayName nil = %q", got)
+	}
+}
+
+// TestSessionWorkDir tests the $HOME default for /new sessions
+func TestSessionWorkDir(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	if got := sessionWorkDir(&SessionInfo{Path: "/tmp/x"}); got != "/tmp/x" {
+		t.Errorf("sessionWorkDir explicit = %q", got)
+	}
+	if got := sessionWorkDir(&SessionInfo{}); got != home {
+		t.Errorf("sessionWorkDir default = %q, want %q", got, home)
+	}
+}

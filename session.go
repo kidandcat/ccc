@@ -5,15 +5,64 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
 // Session backend built on Claude Code background agents (see agents.go).
 // A ccc session == one Telegram topic == one dedicated bg Claude agent.
 //
-// Sessions are lazy: `/new <name>` just registers the topic + config entry;
-// the FIRST message sent to the topic dispatches the bg agent with that
-// message as the initial prompt. Subsequent messages resume the conversation.
+// `/new <prompt>` creates the topic and immediately dispatches a bg agent in
+// $HOME with that prompt. Subsequent messages to the topic resume the
+// conversation. Sessions created another way (discovery, `ccc start`) keep
+// their own working dir.
+
+// titleFromPrompt derives a topic title from a session's initial prompt: one
+// line, collapsed whitespace, clipped to a Telegram-friendly length. It's only
+// the starting title — the poller renames the topic once the agent names itself.
+func titleFromPrompt(prompt string) string {
+	title := strings.Join(strings.Fields(prompt), " ")
+	const maxRunes = 40
+	if r := []rune(title); len(r) > maxRunes {
+		title = strings.TrimRight(string(r[:maxRunes]), " ") + "…"
+	}
+	if title == "" {
+		title = "session"
+	}
+	return title
+}
+
+// uniqueSessionName returns a config-map key based on title that doesn't
+// collide with an existing session.
+func uniqueSessionName(config *Config, title string) string {
+	name := title
+	for i := 2; ; i++ {
+		if _, exists := config.Sessions[name]; !exists {
+			return name
+		}
+		name = fmt.Sprintf("%s (%d)", title, i)
+	}
+}
+
+// sessionWorkDir returns the working dir for a session. Sessions always run in
+// $HOME unless they carry an explicit path (discovered agents, `ccc start`).
+func sessionWorkDir(info *SessionInfo) string {
+	if info != nil && info.Path != "" {
+		return info.Path
+	}
+	home, _ := os.UserHomeDir() // safe-ignore: $HOME is always resolvable; "" would just mean "inherit cwd"
+	return home
+}
+
+// agentDisplayName is the name a session's bg agent shows in the fleet view.
+// It tracks the topic title (which itself mirrors whatever Claude renamed the
+// session to), so resuming never resets the name back to the initial prompt.
+func agentDisplayName(info *SessionInfo, sessName string) string {
+	if info != nil && info.Title != "" {
+		return info.Title
+	}
+	return sessName
+}
 
 // getSessionByTopic returns the session name mapped to a Telegram topic id.
 func getSessionByTopic(config *Config, topicID int64) string {
@@ -73,14 +122,11 @@ func launchSessionAgent(config *Config, sessName, prompt string) error {
 	if info == nil {
 		return fmt.Errorf("session '%s' not found", sessName)
 	}
-	workDir := info.Path
-	if workDir == "" {
-		workDir = resolveProjectPath(config, sessName)
-	}
+	workDir := sessionWorkDir(info)
 	if _, err := os.Stat(workDir); os.IsNotExist(err) {
 		os.MkdirAll(workDir, 0755)
 	}
-	shortID, err := dispatchAgent(sessName, workDir, prompt)
+	shortID, err := dispatchAgent(agentDisplayName(info, sessName), workDir, prompt)
 	if err != nil {
 		return err
 	}
@@ -96,17 +142,14 @@ func sendToSession(config *Config, sessName, text string) error {
 	if info == nil {
 		return fmt.Errorf("session '%s' not found", sessName)
 	}
-	workDir := info.Path
-	if workDir == "" {
-		workDir = resolveProjectPath(config, sessName)
-	}
+	workDir := sessionWorkDir(info)
 	if _, err := os.Stat(workDir); os.IsNotExist(err) {
 		os.MkdirAll(workDir, 0755)
 	}
 
 	// No prior conversation → dispatch a fresh agent with this message.
 	if info.SessionID == "" {
-		short, err := dispatchAgent(sessName, workDir, text)
+		short, err := dispatchAgent(agentDisplayName(info, sessName), workDir, text)
 		if err != nil {
 			return err
 		}
@@ -121,7 +164,7 @@ func sendToSession(config *Config, sessName, text string) error {
 	if a, ok := agentBySessionID(agents, info.SessionID); ok {
 		stopShort = a.ID
 	}
-	newShort, err := resumeAgent(stopShort, info.SessionID, sessName, workDir, text)
+	newShort, err := resumeAgent(stopShort, info.SessionID, agentDisplayName(info, sessName), workDir, text)
 	if err != nil {
 		return err
 	}
@@ -178,7 +221,7 @@ func startDetached(name string, workDir string, prompt string) error {
 		return fmt.Errorf("failed to create topic: %w", err)
 	}
 
-	config.Sessions[name] = &SessionInfo{TopicID: topicID, Path: workDir}
+	config.Sessions[name] = &SessionInfo{TopicID: topicID, Path: workDir, Title: name}
 	if err := saveConfig(config); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}

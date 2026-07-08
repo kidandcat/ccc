@@ -86,7 +86,7 @@ For session topics: create a Telegram group with **Topics enabled**, add your bo
 
 | Command | Description |
 |---------|-------------|
-| `/new <name>` | Create a new session + topic |
+| `/new <prompt>` | Start a new session (topic + agent) on that prompt |
 | `/new` | Reset the conversation in this topic (fresh context) |
 | `/stop` | Stop this session's agent (conversation is kept) |
 | `/delete` | Delete this session + topic |
@@ -123,7 +123,7 @@ Background agents run unattended with `--dangerously-skip-permissions` (auto-app
 
 ## Notes
 
-- Sessions are **lazy**: `/new <name>` registers the topic; the first message starts the agent.
+- `/new <prompt>` creates the topic and starts the agent in `$HOME` right away; the topic is titled after the prompt and renamed once the agent names itself.
 - The bg-agent short id changes on every resume; ccc tracks the current one automatically.
 - Live end-to-end validation of the primitives lives in `live_test.go` (gated behind `CCC_LIVE_TEST=1`).
 

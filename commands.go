@@ -363,7 +363,7 @@ step3:
 	fmt.Println()
 	if config.GroupID != 0 {
 		fmt.Println("Telegram commands (in your group):")
-		fmt.Println("  /new <name>   Create new session")
+		fmt.Println("  /new <prompt> Start a new session on that prompt")
 		fmt.Println("  /list         List sessions")
 	} else {
 		fmt.Println("To enable Telegram session topics:")
@@ -411,7 +411,7 @@ func setGroup(config *Config) error {
 					return err
 				}
 				fmt.Printf("Group set: %d\n", chat.ID)
-				fmt.Println("You can now create sessions with: /new <name>")
+				fmt.Println("You can now create sessions with: /new <prompt>")
 				return nil
 			}
 		}
@@ -834,40 +834,44 @@ func listen() error {
 				continue
 			}
 
-			// /new <name> — create a new lazy session + topic
+			// /new <prompt> — create a topic and start an agent on that prompt
 			// /new (in topic) — reset the conversation (fresh context next message)
 			if strings.HasPrefix(text, "/new") && isGroup {
 				config, _ = loadConfig()
-				arg := strings.TrimSpace(strings.TrimPrefix(text, "/new"))
-				if arg != "" {
-					if existing, ok := config.Sessions[arg]; ok && existing != nil && existing.TopicID != 0 {
-						sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ Session '%s' already exists.", arg))
-						continue
-					}
-					topicID, err := createForumTopic(config, arg)
+				prompt := strings.TrimSpace(strings.TrimPrefix(text, "/new"))
+				if prompt != "" {
+					title := titleFromPrompt(prompt)
+					sessName := uniqueSessionName(config, title)
+					topicID, err := createForumTopic(config, title)
 					if err != nil {
 						sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Failed to create topic: %v", err))
 						continue
 					}
-					workDir := resolveProjectPath(config, arg)
-					if existing, ok := config.Sessions[arg]; ok && existing != nil && existing.Path != "" {
-						workDir = existing.Path
-					}
-					config.Sessions[arg] = &SessionInfo{TopicID: topicID, Path: workDir}
+					// Agents always start in $HOME — they cd into the right project themselves.
+					workDir, _ := os.UserHomeDir() // safe-ignore: $HOME is always resolvable here; "" would just mean "inherit cwd"
+					config.Sessions[sessName] = &SessionInfo{TopicID: topicID, Path: workDir, Title: title}
 					saveConfig(config)
-					sendMessage(config, config.GroupID, topicID, fmt.Sprintf("🆕 Session '%s' ready (%s).\n\nSend a message here to start Claude working.", arg, workDir))
+					sendMessage(config, config.GroupID, topicID, fmt.Sprintf("🆕 Starting Claude in %s:\n\n%s", workDir, prompt))
+					ledgerID := fmt.Sprintf("tg:%d", update.UpdateID)
+					appendMessage(&MessageRecord{ // safe-ignore: the ledger is an audit trail; a write failure must not block the session
+						ID: ledgerID, Session: sessName, Type: "user_prompt",
+						Text: prompt, Origin: "telegram",
+						TerminalDelivered: false, TelegramDelivered: true,
+					})
+					deliverToSession(config, sessName, config.GroupID, topicID, prompt)
+					updateDelivery(sessName, ledgerID, "terminal_delivered", true) // safe-ignore: ledger bookkeeping, same as above
 					continue
 				}
 				if threadID > 0 {
 					sessName := getSessionByTopic(config, threadID)
 					if sessName == "" {
-						sendMessage(config, chatID, threadID, "❌ No session mapped to this topic. Use /new <name>.")
+						sendMessage(config, chatID, threadID, "❌ No session mapped to this topic. Use /new <prompt>.")
 						continue
 					}
 					resetSession(config, sessName)
 					sendMessage(config, chatID, threadID, fmt.Sprintf("🔄 Session '%s' reset — next message starts a fresh conversation.", sessName))
 				} else {
-					sendMessage(config, chatID, threadID, "Usage: /new <name> to create a new session")
+					sendMessage(config, chatID, threadID, "Usage: /new <prompt> to start a new session")
 				}
 				continue
 			}
@@ -940,7 +944,7 @@ func listen() error {
 				config, _ = loadConfig()
 				sessName := getSessionByTopic(config, threadID)
 				if sessName == "" {
-					sendMessage(config, chatID, threadID, "⚠️ No session linked to this topic. Use /new <name>.")
+					sendMessage(config, chatID, threadID, "⚠️ No session linked to this topic. Use /new <prompt>.")
 					continue
 				}
 				ledgerID := fmt.Sprintf("tg:%d", update.UpdateID)
@@ -1045,7 +1049,7 @@ func handleCallback(config *Config, cb *CallbackQuery) {
 // formatSessionList renders the current sessions and their live status.
 func formatSessionList(config *Config) string {
 	if len(config.Sessions) == 0 {
-		return "No sessions. Create one with /new <name>."
+		return "No sessions. Create one with /new <prompt>."
 	}
 	agents, _ := listAgents(true)
 	var sb strings.Builder
@@ -1082,7 +1086,7 @@ COMMANDS:
     relay [port]            Start relay server for large files (default: 8080)
 
 TELEGRAM COMMANDS:
-    /new <name>             Create a new session + topic
+    /new <prompt>           Start a new session (topic + agent) on that prompt
     /new                    Reset the conversation in this topic
     /stop                   Stop this session's agent (keeps conversation)
     /delete                 Delete this session + topic

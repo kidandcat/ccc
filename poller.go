@@ -151,6 +151,7 @@ func discoverFleet(config *Config, live []AgentInfo) bool {
 			Path:      a.Cwd,
 			SessionID: a.SessionID,
 			ShortID:   a.ID,
+			Title:     topicTitleFor(&a),
 		}
 		// Mark the session's existing transcript as already delivered so we
 		// don't back-spam its history — only new text after discovery is sent.
@@ -231,6 +232,23 @@ func topicTitleFor(a *AgentInfo) string {
 	return name
 }
 
+// syncTopicTitle renames the Telegram topic when the agent renames itself in
+// the fleet view. `/new` topics are born titled after their initial prompt;
+// once Claude picks a proper session name, the topic follows it.
+func syncTopicTitle(config *Config, info *SessionInfo, a *AgentInfo) {
+	name := topicTitleFor(a)
+	if name == "" || name == info.Title {
+		return
+	}
+	// TOPIC_NOT_MODIFIED = the topic already carries this name (e.g. it was
+	// created from it): record it so we stop re-issuing the edit every tick.
+	if err := editForumTopic(config, info.TopicID, name); err != nil && !strings.Contains(err.Error(), "TOPIC_NOT_MODIFIED") {
+		return
+	}
+	info.Title = name
+	saveConfig(config) // safe-ignore: best-effort persist; a failed write just re-renames on the next tick
+}
+
 // uniqueSessionKey returns a config-map key that doesn't collide with an
 // existing session name.
 func uniqueSessionKey(config *Config, a *AgentInfo) string {
@@ -280,6 +298,10 @@ func mirrorSession(config *Config, agents []AgentInfo, sessName string, info *Se
 	mirrorMu.Lock()
 	delete(missingTicks, info.TopicID)
 	mirrorMu.Unlock()
+
+	if live {
+		syncTopicTitle(config, info, a)
+	}
 
 	short := info.ShortID
 	if live {

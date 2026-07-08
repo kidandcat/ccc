@@ -493,6 +493,29 @@ func createForumTopic(config *Config, name string) (int64, error) {
 	return topic.MessageThreadID, nil
 }
 
+// editForumTopic renames an existing forum topic.
+func editForumTopic(config *Config, topicID int64, name string) error {
+	if config.GroupID == 0 {
+		return fmt.Errorf("no group configured")
+	}
+
+	params := url.Values{
+		"chat_id":           {fmt.Sprintf("%d", config.GroupID)},
+		"message_thread_id": {fmt.Sprintf("%d", topicID)},
+		"name":              {name},
+	}
+
+	result, err := telegramAPI(config, "editForumTopic", params)
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		return fmt.Errorf("failed to rename topic: %s", result.Description)
+	}
+
+	return nil
+}
+
 func deleteForumTopic(config *Config, topicID int64) error {
 	if config.GroupID == 0 {
 		return fmt.Errorf("no group configured")
@@ -517,7 +540,7 @@ func deleteForumTopic(config *Config, topicID int64) error {
 // setBotCommands sets the bot commands in Telegram
 func setBotCommands(botToken string) {
 	commands := []map[string]string{
-		{"command": "new", "description": "New session: /new <name> (or reset in a topic)"},
+		{"command": "new", "description": "New session: /new <prompt> (or reset in a topic)"},
 		{"command": "stop", "description": "Stop this session's agent (keeps conversation)"},
 		{"command": "delete", "description": "Delete current session and thread"},
 		{"command": "cleanup", "description": "Delete ALL sessions and threads"},

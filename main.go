@@ -18,6 +18,7 @@ type SessionInfo struct {
 	Path      string `json:"path"`
 	SessionID string `json:"session_id,omitempty"` // current conversation UUID
 	ShortID   string `json:"short_id,omitempty"`   // current bg daemon short id
+	Title     string `json:"title,omitempty"`      // current Telegram topic title (mirrors the agent's name)
 }
 
 // Config stores bot configuration and session mappings
