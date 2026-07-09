@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,12 @@ const probeInterval = 15 * time.Second
 // transients). At mirrorInterval=3s this is ~9s.
 const reapAfterTicks = 3
 
+// resumeGraceSeconds is how long a session's ResumingAt is treated as "still
+// resuming" (agent legitimately absent from the fleet). A resume (stop + up to
+// 8s wait + dispatch) outlasts reapAfterTicks, so without this the reaper could
+// delete a live topic mid-resume. A stale marker (crashed resume) expires here.
+const resumeGraceSeconds = 45
+
 var (
 	mirrorMu     sync.Mutex
 	lastStatus   = map[int64]string{}    // topicID -> last posted status
@@ -48,11 +55,11 @@ func runMirror() {
 		if err != nil {
 			continue
 		}
-		if dedupSessions(config) {
-			config, _ = loadConfig()
+		if c := dedupSessions(); c != nil {
+			config = c
 		}
-		if discoverFleet(config, agents) {
-			config, _ = loadConfig()
+		if c := discoverFleet(agents); c != nil {
+			config = c
 		}
 		for sessName, info := range config.Sessions {
 			if info == nil || info.TopicID == 0 {
@@ -66,44 +73,43 @@ func runMirror() {
 // dedupSessions removes duplicate topics that map to the same conversation
 // (e.g. a /new session and a discovery topic racing for the same agent),
 // keeping the earliest-created topic and reaping the rest.
-func dedupSessions(config *Config) bool {
-	bySid := map[string][]string{}
-	for name, info := range config.Sessions {
-		if info != nil && info.SessionID != "" {
-			bySid[info.SessionID] = append(bySid[info.SessionID], name)
-		}
-	}
-	changed := false
-	for _, names := range bySid {
-		if len(names) < 2 {
-			continue
-		}
-		keep := names[0]
-		for _, n := range names {
-			if config.Sessions[n].TopicID < config.Sessions[keep].TopicID {
-				keep = n
+func dedupSessions() *Config {
+	return updateConfig(func(config *Config) bool {
+		bySid := map[string][]string{}
+		for name, info := range config.Sessions {
+			if info != nil && info.SessionID != "" {
+				bySid[info.SessionID] = append(bySid[info.SessionID], name)
 			}
 		}
-		for _, n := range names {
-			if n == keep {
+		changed := false
+		for _, names := range bySid {
+			if len(names) < 2 {
 				continue
 			}
-			info := config.Sessions[n]
-			deleteForumTopic(config, info.TopicID)
-			mirrorMu.Lock()
-			delete(lastStatus, info.TopicID)
-			delete(lastProbe, info.TopicID)
-			delete(missingTicks, info.TopicID)
-			mirrorMu.Unlock()
-			delete(config.Sessions, n)
-			changed = true
-			hookLog("deduped session %s (dup of %s) — deleted topic %d", n, keep, info.TopicID)
+			keep := names[0]
+			for _, n := range names {
+				if config.Sessions[n].TopicID < config.Sessions[keep].TopicID {
+					keep = n
+				}
+			}
+			for _, n := range names {
+				if n == keep {
+					continue
+				}
+				info := config.Sessions[n]
+				deleteForumTopic(config, info.TopicID)
+				mirrorMu.Lock()
+				delete(lastStatus, info.TopicID)
+				delete(lastProbe, info.TopicID)
+				delete(missingTicks, info.TopicID)
+				mirrorMu.Unlock()
+				delete(config.Sessions, n)
+				changed = true
+				hookLog("deduped session %s (dup of %s) — deleted topic %d", n, keep, info.TopicID)
+			}
 		}
-	}
-	if changed {
-		saveConfig(config)
-	}
-	return changed
+		return changed
+	})
 }
 
 // discoverFleet auto-creates a Telegram topic for every active bg agent that
@@ -111,98 +117,126 @@ func dedupSessions(config *Config) bool {
 // view) show up in ccc. Keyed by the conversation UUID; `claude attach` keeps
 // the UUID stable, and ccc updates the mapping on its own resumes. Returns true
 // if it created any topic (config was saved).
-func discoverFleet(config *Config, live []AgentInfo) bool {
-	mapped := map[string]bool{}      // conversation UUID -> tracked
-	mappedShort := map[string]bool{} // short id -> tracked (short-id handoff)
-	pendingCwd := map[string]bool{}  // cwd of /new sessions awaiting their agent
-	byTopic := map[int64]string{}    // TopicID -> session name (for marker adoption)
-	for name, info := range config.Sessions {
-		if info == nil {
-			continue
-		}
-		byTopic[info.TopicID] = name
-		if info.SessionID != "" {
-			mapped[info.SessionID] = true
-		} else if info.Path != "" {
-			pendingCwd[info.Path] = true
-		}
-		if info.ShortID != "" {
-			mappedShort[info.ShortID] = true
-		}
-	}
-	changed := false
-	for i := range live {
-		a := live[i]
-		if a.SessionID == "" || mapped[a.SessionID] || mappedShort[a.ID] {
-			continue
-		}
-		// A pending /new session in this cwd will claim this agent — don't
-		// race it with a duplicate discovery topic.
-		if pendingCwd[a.Cwd] {
-			continue
-		}
-		// Skip killed sessions (stopped/failed) — the agents view drops them.
-		// Active and done/idle-resident sessions are what we mirror.
-		st := strings.ToLower(a.State)
-		if st == "stopped" || st == "failed" || st == "error" {
-			continue
-		}
-		// A resume (by ccc OR the PC agents view) mints a new UUID/short with no
-		// server-side link to the parent. If this agent's conversation carries a
-		// ccc marker for a topic we already track, it's that session resumed —
-		// adopt it into the existing topic instead of spawning a duplicate.
-		if topicID := transcriptTopicMarker(transcriptPathForUUID(a.SessionID)); topicID != 0 {
-			if name, ok := byTopic[topicID]; ok {
-				info := config.Sessions[name]
-				info.SessionID = a.SessionID
-				info.ShortID = a.ID
-				info.Marked = true
-				mapped[a.SessionID] = true
-				mappedShort[a.ID] = true
-				changed = true
-				hookLog("adopted resumed agent %s into session %s (marker t%d)", a.ID, name, topicID)
+func discoverFleet(live []AgentInfo) *Config {
+	return updateConfig(func(config *Config) bool {
+		mapped := map[string]bool{}      // conversation UUID -> tracked
+		mappedShort := map[string]bool{} // short id -> tracked (short-id handoff)
+		pendingCwd := map[string]bool{}  // cwd of /new sessions awaiting their agent
+		byTopic := map[int64]string{}    // TopicID -> session name (for marker adoption)
+		for name, info := range config.Sessions {
+			if info == nil {
 				continue
 			}
+			byTopic[info.TopicID] = name
+			if info.SessionID != "" {
+				mapped[info.SessionID] = true
+			} else if info.Path != "" {
+				pendingCwd[info.Path] = true
+			}
+			// A stopped parent conversation lingers as a pid-less "done" fleet
+			// entry after a resume; never let it earn its own discovery topic.
+			for _, old := range info.OldSessionIDs {
+				mapped[old] = true
+			}
+			if info.ShortID != "" {
+				mappedShort[info.ShortID] = true
+			}
 		}
-		topicID, err := createForumTopic(config, topicTitleFor(&a))
-		if err != nil {
-			continue
+		changed := false
+		for i := range live {
+			a := live[i]
+			if a.SessionID == "" || mapped[a.SessionID] || mappedShort[a.ID] {
+				continue
+			}
+			// A pending /new session in this cwd will claim this agent — don't
+			// race it with a duplicate discovery topic.
+			if pendingCwd[a.Cwd] {
+				continue
+			}
+			// Skip killed sessions (stopped/failed) — the agents view drops them.
+			// Active and done/idle-resident sessions are what we mirror.
+			st := strings.ToLower(a.State)
+			if st == "stopped" || st == "failed" || st == "error" {
+				continue
+			}
+			// A resume (by ccc OR the PC agents view) mints a new UUID/short with no
+			// server-side link to the parent. If this agent's conversation carries a
+			// ccc marker for a topic we already track, it's that session resumed —
+			// adopt it into the existing topic instead of spawning a duplicate.
+			if topicID := transcriptTopicMarker(transcriptPathForUUID(a.SessionID)); topicID != 0 {
+				if name, ok := byTopic[topicID]; ok {
+					info := config.Sessions[name]
+					carrySessionLabel(info.SessionID, a.SessionID)
+					appendOldSessionID(info, info.SessionID)
+					info.SessionID = a.SessionID
+					info.ShortID = a.ID
+					info.Marked = true
+					mapped[a.SessionID] = true
+					mappedShort[a.ID] = true
+					changed = true
+					hookLog("adopted resumed agent %s into session %s (marker t%d)", a.ID, name, topicID)
+					continue
+				}
+			}
+			title := topicTitleFor(&a)
+			topicID, err := createForumTopic(config, title)
+			if err != nil {
+				continue
+			}
+			key := uniqueSessionKey(config, &a)
+			config.Sessions[key] = &SessionInfo{
+				TopicID:   topicID,
+				Path:      a.Cwd,
+				SessionID: a.SessionID,
+				ShortID:   a.ID,
+				Title:     title,
+			}
+			// Mark the session's existing transcript as already delivered so we
+			// don't back-spam its history — only new text after discovery is sent.
+			seedDelivered(key, a.SessionID)
+			mapped[a.SessionID] = true
+			changed = true
+			hookLog("discovered agent %s (%s) → topic %d %q", a.ID, a.SessionID, topicID, title)
+			sendMessage(config, config.GroupID, topicID,
+				"🔭 Discovered from the agents view — send a message here to talk to this session.")
 		}
-		key := uniqueSessionKey(config, &a)
-		config.Sessions[key] = &SessionInfo{
-			TopicID:   topicID,
-			Path:      a.Cwd,
-			SessionID: a.SessionID,
-			ShortID:   a.ID,
-			Title:     topicTitleFor(&a),
-		}
-		// Mark the session's existing transcript as already delivered so we
-		// don't back-spam its history — only new text after discovery is sent.
-		seedDelivered(key, a.SessionID)
-		mapped[a.SessionID] = true
-		changed = true
-		sendMessage(config, config.GroupID, topicID,
-			"🔭 Discovered from the agents view — send a message here to talk to this session.")
-	}
-	if changed {
-		saveConfig(config)
-	}
-	return changed
+		return changed
+	})
 }
 
 // reapSession deletes the Telegram topic for a session that has disappeared
 // from the fleet (dismissed in the agents view or ended), and drops it from the
 // map — the mirror image of retireSession.
-func reapSession(config *Config, sessName string, info *SessionInfo) {
-	deleteForumTopic(config, info.TopicID)
+//
+// It is race-proof: the tick decided to reap off a stale snapshot, so we re-check
+// under the config lock that the entry still exists AND still carries the exact
+// SessionID/ShortID we decided to reap, and that a resume didn't start in the
+// meantime (fresh ResumingAt). If any of that changed the reap is aborted
+// silently. Only when the entry is actually removed do we delete the topic.
+func reapSession(sessName, expectSessionID, expectShortID string, topicID int64) {
+	removed := false
+	config := updateConfig(func(config *Config) bool {
+		info := config.Sessions[sessName]
+		if info == nil || info.SessionID != expectSessionID || info.ShortID != expectShortID {
+			return false
+		}
+		if info.ResumingAt != 0 && time.Now().Unix()-info.ResumingAt < resumeGraceSeconds {
+			return false
+		}
+		delete(config.Sessions, sessName)
+		removed = true
+		return true
+	})
+	if !removed || config == nil {
+		return
+	}
+	deleteForumTopic(config, topicID)
 	mirrorMu.Lock()
-	delete(lastStatus, info.TopicID)
-	delete(lastProbe, info.TopicID)
-	delete(missingTicks, info.TopicID)
+	delete(lastStatus, topicID)
+	delete(lastProbe, topicID)
+	delete(missingTicks, topicID)
 	mirrorMu.Unlock()
-	delete(config.Sessions, sessName)
-	saveConfig(config)
-	hookLog("reaped session %s (gone from fleet) — deleted topic %d", sessName, info.TopicID)
+	hookLog("reaped session %s (gone from fleet) — deleted topic %d", sessName, topicID)
 }
 
 // retireSession stops a session's agent and removes it from the map, in
@@ -211,12 +245,17 @@ func retireSession(config *Config, sessName string, info *SessionInfo, agents []
 	if short := liveShortID(config, sessName, agents); short != "" {
 		stopAgent(short)
 	}
+	updateConfig(func(c *Config) bool {
+		if _, ok := c.Sessions[sessName]; !ok {
+			return false
+		}
+		delete(c.Sessions, sessName)
+		return true
+	})
 	mirrorMu.Lock()
 	delete(lastStatus, info.TopicID)
 	delete(lastProbe, info.TopicID)
 	mirrorMu.Unlock()
-	delete(config.Sessions, sessName)
-	saveConfig(config)
 	hookLog("retired session %s (topic %d deleted)", sessName, info.TopicID)
 }
 
@@ -240,9 +279,29 @@ func seedDelivered(sessName, sessionID string) {
 	}
 }
 
-// topicTitleFor builds a human-readable Telegram topic title for an agent.
+// titlePathPrefixRe matches a leading "<path>: " prefix where the path is
+// shaped like a filesystem location (~, ~/…, /…, .../…). The user's fleet-view
+// hook prepends "<dir>: " to the display name to locate a session on a crowded
+// PC screen, but as a Telegram topic title (one session per topic) it's noise.
+// Only path-shaped prefixes are stripped, so plain names like "fix: swipe
+// decoder" pass through unchanged.
+var titlePathPrefixRe = regexp.MustCompile(`^(?:~|~/\S*|/\S*|\.\.\./\S*): `)
+
+// stripTitlePathPrefix removes a leading path-shaped "<dir>: " prefix (see
+// titlePathPrefixRe).
+func stripTitlePathPrefix(name string) string {
+	return titlePathPrefixRe.ReplaceAllString(name, "")
+}
+
+// topicTitleFor builds a human-readable Telegram topic title for an agent. It
+// prefers the user's session label (which survives resumes via carrySessionLabel);
+// otherwise the fleet display name with its "<dir>: " prefix stripped; otherwise
+// the cwd's basename; otherwise the short id.
 func topicTitleFor(a *AgentInfo) string {
-	name := strings.TrimSpace(a.Name)
+	name := sessionLabel(a.SessionID)
+	if name == "" {
+		name = stripTitlePathPrefix(strings.TrimSpace(a.Name))
+	}
 	if name == "" {
 		name = filepath.Base(a.Cwd)
 		if name == "" || name == "." {
@@ -268,8 +327,17 @@ func syncTopicTitle(config *Config, info *SessionInfo, a *AgentInfo) {
 	if err := editForumTopic(config, info.TopicID, name); err != nil && !strings.Contains(err.Error(), "TOPIC_NOT_MODIFIED") {
 		return
 	}
+	topicID := info.TopicID
+	updateConfig(func(c *Config) bool {
+		for _, si := range c.Sessions {
+			if si != nil && si.TopicID == topicID {
+				si.Title = name
+				return true
+			}
+		}
+		return false
+	})
 	info.Title = name
-	saveConfig(config) // safe-ignore: best-effort persist; a failed write just re-renames on the next tick
 }
 
 // uniqueSessionKey returns a config-map key that doesn't collide with an
@@ -313,9 +381,23 @@ func mirrorSession(config *Config, agents []AgentInfo, sessName string, info *Se
 		}
 	}
 	if live && a.SessionID != "" && a.SessionID != info.SessionID {
-		info.SessionID = a.SessionID
-		info.ShortID = a.ID
-		saveConfig(config) // safe-ignore: best-effort adopt; re-adopted next tick if it fails
+		newUUID := a.SessionID
+		newShort := a.ID
+		topicID := info.TopicID
+		carrySessionLabel(info.SessionID, newUUID)
+		updateConfig(func(c *Config) bool {
+			for _, si := range c.Sessions {
+				if si != nil && si.TopicID == topicID {
+					appendOldSessionID(si, si.SessionID)
+					si.SessionID = newUUID
+					si.ShortID = newShort
+					return true
+				}
+			}
+			return false
+		})
+		info.SessionID = newUUID
+		info.ShortID = newShort
 	}
 
 	// Reap: a session that was started (has a UUID) but has vanished from the
@@ -323,12 +405,21 @@ func mirrorSession(config *Config, agents []AgentInfo, sessName string, info *Se
 	// topic so ccc mirrors the agents view. Grace period avoids reaping during
 	// a resume/respawn (when the agent briefly disappears).
 	if info.SessionID != "" && !live {
+		// Mid-resume: the agent is legitimately absent while it stops+relaunches.
+		// Don't accrue missing ticks (and reset any accrued) until the resume
+		// marker goes stale.
+		if info.ResumingAt != 0 && time.Now().Unix()-info.ResumingAt < resumeGraceSeconds {
+			mirrorMu.Lock()
+			delete(missingTicks, info.TopicID)
+			mirrorMu.Unlock()
+			return
+		}
 		mirrorMu.Lock()
 		missingTicks[info.TopicID]++
 		gone := missingTicks[info.TopicID] >= reapAfterTicks
 		mirrorMu.Unlock()
 		if gone {
-			reapSession(config, sessName, info)
+			reapSession(sessName, info.SessionID, info.ShortID, info.TopicID)
 		}
 		return
 	}

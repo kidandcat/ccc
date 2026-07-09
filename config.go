@@ -5,7 +5,32 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
+
+// cfgMu serializes every load→mutate→save cycle on the shared config file (see
+// updateConfig). Whole-file saves are not composable, so concurrent writers must
+// funnel through it.
+var cfgMu sync.Mutex
+
+// updateConfig serializes a load→mutate→save cycle on the shared config file.
+// Every writer must go through it: the mirror poller and the Telegram update
+// handlers mutate the config concurrently, and racing whole-file saves silently
+// drop each other's changes (lost session entries → orphaned Telegram topics).
+// mutate runs on a freshly-loaded copy; return true to persist it. Returns the
+// fresh (possibly mutated) config, or nil if the config could not be loaded.
+func updateConfig(mutate func(*Config) bool) *Config {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	config, err := loadConfig()
+	if err != nil || config == nil {
+		return nil
+	}
+	if mutate(config) {
+		saveConfig(config) // safe-ignore: best-effort persist under the lock; caller keeps the fresh copy either way
+	}
+	return config
+}
 
 // configDir returns ~/.config/ccc (created if needed)
 func configDir() string {
@@ -128,12 +153,35 @@ func loadConfig() (*Config, error) {
 	return &config, nil
 }
 
+// saveConfig writes the config atomically: it marshals to a temp file in the
+// same directory and renames it over config.json, so hook processes (and other
+// readers) never observe a torn/partial write.
 func saveConfig(config *Config) error {
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(getConfigPath(), data, 0600)
+	path := getConfigPath()
+	tmp, err := os.CreateTemp(filepath.Dir(path), "config.json.tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // getProjectsDir returns the base directory for projects

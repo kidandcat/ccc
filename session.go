@@ -116,6 +116,24 @@ func liveShortID(config *Config, sessName string, agents []AgentInfo) string {
 	return info.ShortID
 }
 
+// appendOldSessionID records uuid in info.OldSessionIDs (dedup, most-recent-20
+// cap). The lineage lets discovery skip a resumed conversation's pid-less parent
+// so it never earns a duplicate discovery topic.
+func appendOldSessionID(info *SessionInfo, uuid string) {
+	if info == nil || uuid == "" {
+		return
+	}
+	for _, id := range info.OldSessionIDs {
+		if id == uuid {
+			return
+		}
+	}
+	info.OldSessionIDs = append(info.OldSessionIDs, uuid)
+	if len(info.OldSessionIDs) > 20 {
+		info.OldSessionIDs = info.OldSessionIDs[len(info.OldSessionIDs)-20:]
+	}
+}
+
 // persistAgentIDs stores the current short id (and resolved conversation UUID)
 // for a session after a dispatch or resume.
 //
@@ -128,47 +146,51 @@ func liveShortID(config *Config, sessName string, agents []AgentInfo) string {
 // short id (liveShortID / discovery) and adopt the fresh UUID before either
 // mis-fires.
 func persistAgentIDs(sessName, shortID string) {
-	config, err := loadConfig()
-	if err != nil || config == nil {
-		return
-	}
-	info := config.Sessions[sessName]
-	if info == nil {
-		return
-	}
-	info.ShortID = shortID
-	saveConfig(config) // safe-ignore: best-effort; the UUID resolve below re-persists
+	// Phase 1: persist the fresh short id up front (the short-id handoff).
+	updateConfig(func(config *Config) bool {
+		info := config.Sessions[sessName]
+		if info == nil {
+			return false
+		}
+		info.ShortID = shortID
+		return true
+	})
 
 	uuid := resolveSessionUUID(shortID, 8*time.Second)
 	if uuid == "" {
 		return
 	}
-	// Reload: the poller may have mutated config (adopted the UUID, renamed the
-	// topic) while we were resolving. Re-apply our ids on the fresh copy.
-	config, err = loadConfig()
-	if err != nil || config == nil {
-		return
-	}
-	info = config.Sessions[sessName]
-	if info == nil {
-		return
-	}
-	info.ShortID = shortID
-	info.SessionID = uuid
-	saveConfig(config)
+	// Phase 2: adopt the resolved UUID. Record the previous UUID as lineage,
+	// carry the human label across the new UUID, and clear the resume marker —
+	// all in one mutation so the poller never sees a half-updated entry.
+	var oldUUID string
+	updateConfig(func(config *Config) bool {
+		info := config.Sessions[sessName]
+		if info == nil {
+			return false
+		}
+		oldUUID = info.SessionID
+		if info.SessionID != "" && info.SessionID != uuid {
+			appendOldSessionID(info, info.SessionID)
+		}
+		info.ShortID = shortID
+		info.SessionID = uuid
+		info.ResumingAt = 0
+		return true
+	})
+	carrySessionLabel(oldUUID, uuid)
 }
 
 // markSession records that ccc has embedded its stable marker in a session's
 // conversation, so we don't re-tag every subsequent message.
 func markSession(sessName string) {
-	config, err := loadConfig()
-	if err != nil || config == nil {
-		return
-	}
-	if info := config.Sessions[sessName]; info != nil && !info.Marked {
-		info.Marked = true
-		saveConfig(config)
-	}
+	updateConfig(func(config *Config) bool {
+		if info := config.Sessions[sessName]; info != nil && !info.Marked {
+			info.Marked = true
+			return true
+		}
+		return false
+	})
 }
 
 // launchSessionAgent dispatches a brand-new bg agent for a session with an
@@ -233,8 +255,25 @@ func sendToSession(config *Config, sessName, text string) error {
 	if a, ok := agentBySessionID(agents, info.SessionID); ok {
 		stopShort = a.ID
 	}
+	// Mark the entry mid-resume so the reaper doesn't delete the live topic while
+	// the (slow) stop + wait + dispatch runs and the agent is briefly absent from
+	// the fleet. Cleared once the new UUID is adopted (persistAgentIDs phase 2).
+	updateConfig(func(c *Config) bool {
+		if si := c.Sessions[sessName]; si != nil {
+			si.ResumingAt = time.Now().Unix()
+			return true
+		}
+		return false
+	})
 	newShort, err := resumeAgent(stopShort, info.SessionID, agentDisplayName(info, sessName), workDir, prompt)
 	if err != nil {
+		updateConfig(func(c *Config) bool {
+			if si := c.Sessions[sessName]; si != nil {
+				si.ResumingAt = 0
+				return true
+			}
+			return false
+		})
 		return err
 	}
 	persistAgentIDs(sessName, newShort)

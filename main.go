@@ -20,6 +20,17 @@ type SessionInfo struct {
 	ShortID   string `json:"short_id,omitempty"`   // current bg daemon short id
 	Title     string `json:"title,omitempty"`      // current Telegram topic title (mirrors the agent's name)
 	Marked    bool   `json:"marked,omitempty"`     // ccc has embedded its stable marker (cccMarker) in this conversation
+
+	// OldSessionIDs are the conversation UUIDs this session used before its most
+	// recent resume(s). A resume mints a brand-new UUID with no server-side link
+	// to its parent, which lingers in `claude agents --all` as a pid-less "done"
+	// entry — tracking the lineage lets discovery skip it instead of spawning a
+	// duplicate topic for the parent conversation.
+	OldSessionIDs []string `json:"old_session_ids,omitempty"`
+	// ResumingAt is the unix time a resume started for this session (0 when not
+	// resuming). While fresh it tells the reaper the agent's brief absence from
+	// the fleet is an in-flight resume, not a dismissed session.
+	ResumingAt int64 `json:"resuming_at,omitempty"`
 }
 
 // Config stores bot configuration and session mappings

@@ -849,8 +849,12 @@ func listen() error {
 					}
 					// Agents always start in $HOME — they cd into the right project themselves.
 					workDir, _ := os.UserHomeDir() // safe-ignore: $HOME is always resolvable here; "" would just mean "inherit cwd"
-					config.Sessions[sessName] = &SessionInfo{TopicID: topicID, Path: workDir, Title: title}
-					saveConfig(config)
+					newInfo := &SessionInfo{TopicID: topicID, Path: workDir, Title: title}
+					config.Sessions[sessName] = newInfo
+					updateConfig(func(c *Config) bool {
+						c.Sessions[sessName] = newInfo
+						return true
+					})
 					sendMessage(config, config.GroupID, topicID, fmt.Sprintf("🆕 Starting Claude in %s:\n\n%s", workDir, prompt))
 					ledgerID := fmt.Sprintf("tg:%d", update.UpdateID)
 					appendMessage(&MessageRecord{ // safe-ignore: the ledger is an audit trail; a write failure must not block the session
@@ -906,9 +910,15 @@ func listen() error {
 				if short := liveShortID(config, sessName, agents); short != "" {
 					stopAgent(short)
 				}
-				topicID := config.Sessions[sessName].TopicID
-				delete(config.Sessions, sessName)
-				saveConfig(config)
+				var topicID int64
+				updateConfig(func(c *Config) bool {
+					if info := c.Sessions[sessName]; info != nil {
+						topicID = info.TopicID
+						delete(c.Sessions, sessName)
+						return true
+					}
+					return false
+				})
 				if err := deleteForumTopic(config, topicID); err != nil {
 					sendMessage(config, chatID, threadID, fmt.Sprintf("⚠️ Session deleted but failed to delete thread: %v", err))
 				}
@@ -933,8 +943,11 @@ func listen() error {
 					}
 					cleaned = append(cleaned, sessName)
 				}
+				updateConfig(func(c *Config) bool {
+					c.Sessions = make(map[string]*SessionInfo)
+					return true
+				})
 				config.Sessions = make(map[string]*SessionInfo)
-				saveConfig(config)
 				sendMessage(config, chatID, threadID, fmt.Sprintf("🧹 Cleaned %d sessions: %s", len(cleaned), strings.Join(cleaned, ", ")))
 				continue
 			}
@@ -1002,13 +1015,22 @@ func resetSession(config *Config, sessName string) {
 	if short := liveShortID(config, sessName, agents); short != "" {
 		stopAgent(short)
 	}
-	if info := config.Sessions[sessName]; info != nil {
-		mirrorMu.Lock()
-		delete(lastStatus, info.TopicID)
-		mirrorMu.Unlock()
+	var topicID int64
+	updateConfig(func(c *Config) bool {
+		info := c.Sessions[sessName]
+		if info == nil {
+			return false
+		}
+		topicID = info.TopicID
 		info.SessionID = ""
 		info.ShortID = ""
-		saveConfig(config)
+		info.ResumingAt = 0
+		return true
+	})
+	if topicID != 0 {
+		mirrorMu.Lock()
+		delete(lastStatus, topicID)
+		mirrorMu.Unlock()
 	}
 }
 
