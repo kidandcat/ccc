@@ -19,8 +19,8 @@ type Config struct {
 	GroupID           int64               `json:"group_id,omitempty"`           // the forum group the bots live in
 	TranscriptionLang string              `json:"transcription_lang,omitempty"` // language code for whisper (e.g. "es")
 	RelayURL          string              `json:"relay_url,omitempty"`          // relay server for files over 50 MB
-	Profiles          map[string]*Profile `json:"profiles,omitempty"`           // profile name -> Claude account (CLAUDE_CONFIG_DIR)
-	DefaultProfile    string              `json:"default_profile,omitempty"`    // profile used when selection has no better answer
+	Profiles          map[string]*Profile `json:"profiles,omitempty"`           // identity -> account (engine + isolated home)
+	DefaultProfile    string              `json:"default_profile,omitempty"`    // default account; new bots inherit its engine unless default_engine is set
 	DataDir           string              `json:"data_dir,omitempty"`           // runtime root (default ~/.local/share/ccc)
 	Model             string              `json:"model,omitempty"`              // model every bot runs on (default: claude's own)
 	DefaultEngine     string              `json:"default_engine,omitempty"`     // engine assigned to new bots (default: claude)

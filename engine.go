@@ -63,15 +63,27 @@ func botEngine(b *Bot) string {
 
 // defaultEngine is the engine assigned to a newly created bot (General text
 // or /bot). Spawned children inherit the parent instead (createBotRow).
+//
+// Priority: an explicit config default_engine, then the default account's
+// engine (engine is set when the account is added), then Claude. `/engine` is
+// a secondary assignment of a bot onto another pool, not the way you introduce
+// an engine.
 func defaultEngine(cfg *Config) string {
 	if cfg == nil {
 		return engineClaude
 	}
-	e, err := parseEngine(cfg.DefaultEngine)
-	if err != nil {
-		return engineClaude
+	if strings.TrimSpace(cfg.DefaultEngine) != "" {
+		e, err := parseEngine(cfg.DefaultEngine)
+		if err != nil {
+			return engineClaude
+		}
+		return e
 	}
-	return e
+	p := defaultProfile(cfg)
+	if !p.Implicit {
+		return profileEngine(p)
+	}
+	return engineClaude
 }
 
 func engineLabel(engine string) string {
@@ -92,11 +104,11 @@ func engineLabel(engine string) string {
 func engineLoginHint(engine string) string {
 	switch engine {
 	case engineGrok:
-		return "install Grok Build (~/.grok/bin/grok) and run `grok login` (`grok login --device-auth` on a VM)"
+		return "add a Grok account with /account add <identity> grok (isolated GROK_HOME; drives grok login --device-auth)"
 	case engineAntigravity:
-		return "install Antigravity CLI (~/.local/bin/agy) and authenticate with an interactive `agy` session first"
+		return "add an Antigravity account with /account add <identity> agy (isolated HOME; drives agy auth login)"
 	default:
-		return "use /account to add a Claude login"
+		return "add a Claude account with /account add you@example.com claude"
 	}
 }
 
@@ -311,6 +323,11 @@ func buildTurn(engine string, p Profile, cfg *Config, mcpCfg, sessionID, sysProm
 // (claudeEnv + env_passthrough, never a parent CLAUDE*/ANTHROPIC*). Grok and
 // Antigravity get the same whitelist and passthrough, plus the prefixes those
 // CLIs actually read for auth — and never a fabricated CLAUDE_CONFIG_DIR.
+//
+// A registered (non-implicit) Grok account pins GROK_HOME to its config dir so
+// auth.json is isolated. A registered Antigravity account pins HOME,
+// GEMINI_HOME, XDG_* and GEMINI_FORCE_FILE_STORAGE so ~/.gemini lives under
+// the ccc data dir and does not collide with Claude profiles or the real home.
 func engineEnv(cfg *Config, engine string, p Profile) []string {
 	if engine == engineClaude {
 		return botEnv(cfg, p)
@@ -322,10 +339,14 @@ func engineEnv(cfg *Config, engine string, p Profile) []string {
 			continue
 		}
 		name := kv[:eq]
+		if isolatedEngineVar(engine, name) {
+			continue
+		}
 		if engineAuthPrefix(name) {
 			env = append(env, kv)
 		}
 	}
+	env = applyEngineIsolation(env, engine, p)
 	if cfg == nil {
 		return env
 	}
@@ -334,11 +355,60 @@ func engineEnv(cfg *Config, engine string, p Profile) []string {
 		if name == "" || strings.HasPrefix(name, "CLAUDE") || strings.HasPrefix(name, "ANTHROPIC") {
 			continue
 		}
+		if isolatedEngineVar(engine, name) {
+			continue
+		}
 		if v, ok := os.LookupEnv(name); ok {
 			env = append(env, name+"="+v)
 		}
 	}
 	return env
+}
+
+// isolatedEngineVar is an auth/home variable ccc sets itself for this engine,
+// so a parent-shell value must not leak through.
+func isolatedEngineVar(engine, name string) bool {
+	switch engine {
+	case engineGrok:
+		return name == "GROK_HOME"
+	case engineAntigravity:
+		switch name {
+		case "HOME", "GEMINI_HOME", "GEMINI_FORCE_FILE_STORAGE",
+			"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME":
+			return true
+		}
+	}
+	return false
+}
+
+func applyEngineIsolation(env []string, engine string, p Profile) []string {
+	if p.Implicit || strings.TrimSpace(p.ConfigDir) == "" {
+		return env
+	}
+	home := engineHome(p)
+	switch engine {
+	case engineGrok:
+		return setEnvValue(env, "GROK_HOME", home)
+	case engineAntigravity:
+		env = setEnvValue(env, "HOME", home)
+		env = setEnvValue(env, "GEMINI_HOME", filepath.Join(home, ".gemini"))
+		env = setEnvValue(env, "GEMINI_FORCE_FILE_STORAGE", "true")
+		env = setEnvValue(env, "XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+		env = setEnvValue(env, "XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+		return env
+	}
+	return env
+}
+
+func setEnvValue(env []string, name, value string) []string {
+	prefix := name + "="
+	for i, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }
 
 func engineAuthPrefix(name string) bool {

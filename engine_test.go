@@ -220,6 +220,31 @@ func TestEngineEnvNeverSetsClaudeConfigDir(t *testing.T) {
 		t.Error("ANTHROPIC_* must not reach a non-Claude engine via passthrough")
 	}
 
+	grokP := Profile{Name: "work", Engine: engineGrok, ConfigDir: "/tmp/grok-home"}
+	t.Setenv("GROK_HOME", "/tmp/parent-grok")
+	grokIso := strings.Join(engineEnv(cfg, engineGrok, grokP), "\n")
+	if !strings.Contains(grokIso, "GROK_HOME=/tmp/grok-home") {
+		t.Errorf("registered grok account must pin GROK_HOME:\n%s", grokIso)
+	}
+	if strings.Contains(grokIso, "/tmp/parent-grok") {
+		t.Error("parent GROK_HOME must not leak into a registered grok account")
+	}
+
+	agyP := Profile{Name: "lab", Engine: engineAntigravity, ConfigDir: "/tmp/agy-home"}
+	t.Setenv("GEMINI_HOME", "/tmp/real-gemini")
+	agyIso := strings.Join(engineEnv(cfg, engineAntigravity, agyP), "\n")
+	if !strings.Contains(agyIso, "HOME=/tmp/agy-home") ||
+		!strings.Contains(agyIso, "GEMINI_HOME=/tmp/agy-home/.gemini") ||
+		!strings.Contains(agyIso, "GEMINI_FORCE_FILE_STORAGE=true") {
+		t.Errorf("registered agy account must isolate HOME/GEMINI_HOME:\n%s", agyIso)
+	}
+	if strings.Contains(agyIso, "/tmp/real-gemini") {
+		t.Error("parent GEMINI_HOME must not leak into a registered agy account")
+	}
+	if strings.Contains(agyIso, "CLAUDE_CONFIG_DIR") {
+		t.Error("agy isolation must not invent a Claude config dir")
+	}
+
 	claude := strings.Join(engineEnv(cfg, engineClaude, p), "\n")
 	if !strings.Contains(claude, "CLAUDE_CONFIG_DIR=/tmp/claude-profile") {
 		t.Error("Claude must still get its profile config dir")
@@ -278,6 +303,23 @@ func TestDefaultEngineFromConfig(t *testing.T) {
 	}
 	if defaultEngine(&Config{DefaultEngine: "nope"}) != engineClaude {
 		t.Fatal("a typo in config must not break new bots")
+	}
+}
+
+func TestDefaultEngineFromDefaultAccount(t *testing.T) {
+	cfg := &Config{
+		Profiles: map[string]*Profile{
+			"you@example.com": {Engine: engineClaude, ConfigDir: "/tmp/c"},
+			"work":            {Engine: engineGrok, ConfigDir: "/tmp/g"},
+		},
+		DefaultProfile: "work",
+	}
+	if defaultEngine(cfg) != engineGrok {
+		t.Fatalf("new bots should inherit the default account's engine, got %q", defaultEngine(cfg))
+	}
+	cfg.DefaultEngine = engineClaude
+	if defaultEngine(cfg) != engineClaude {
+		t.Fatal("explicit default_engine still wins over the default account")
 	}
 }
 

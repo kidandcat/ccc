@@ -274,7 +274,7 @@ func (r *Runner) Stop(botID int64) bool {
 // account is skipped here too, but it does not fail over: maintenance can wait
 // for tomorrow.
 func (r *Runner) PlainTurn(model, prompt string) (string, error) {
-	p, ok := r.pickProfileExcluding(nil)
+	p, ok := r.pickAccount(engineClaude, nil)
 	if !ok {
 		return "", errors.New("no healthy Claude profile available")
 	}
@@ -473,22 +473,14 @@ func (r *Runner) execute(b *Bot, t *Turn, input string, triggers []int64) {
 	engine := botEngine(b)
 
 	for attempt := 0; attempt < 3; attempt++ {
-		var p Profile
-		if engine == engineClaude {
-			var ok bool
-			p, ok = r.pickProfileExcluding(tried)
-			if !ok {
-				class = errFatal
-				lastErr = "no healthy Claude profile available"
-				break
-			}
-			tried[p.Name] = true
-			r.db.Model(&Turn{}).Where("id = ?", t.ID).Update("profile", p.Name)
-		} else {
-			// Grok and Antigravity do not use the Claude profile pool. The
-			// turn.profile column still wants a label for /usage.
-			r.db.Model(&Turn{}).Where("id = ?", t.ID).Update("profile", engine)
+		p, ok := r.pickAccount(engine, tried)
+		if !ok {
+			class = errFatal
+			lastErr = "no healthy " + engineLabel(engine) + " account available"
+			break
 		}
+		tried[p.Name] = true
+		r.db.Model(&Turn{}).Where("id = ?", t.ID).Update("profile", p.Name)
 
 		sessionID, resume := r.sessionFor(b)
 		res = r.spawn(p, b, t, sessionID, resume, envelope, prog)
@@ -516,27 +508,17 @@ func (r *Runner) execute(b *Bot, t *Turn, input string, triggers []int64) {
 			// deleted). Start a fresh conversation rather than losing the turn.
 			r.db.Model(&Bot{}).Where("id = ?", b.ID).Update("session_id", "")
 			b.SessionID = ""
-			if engine == engineClaude {
-				delete(tried, p.Name)
-			}
+			delete(tried, p.Name)
 			continue
 		case errAuthStale:
-			if engine == engineClaude {
-				r.markNeedsLogin(p)
-				continue
-			}
-			class = errFatal
+			r.markNeedsLogin(p)
+			continue
 		case errRateLimited:
-			if engine == engineClaude {
-				noteProfileLimit(p, time.Now())
-				continue
-			}
-			class = errFatal
+			noteProfileLimit(p, time.Now())
+			continue
 		case errTransient:
 			time.Sleep(10 * time.Second)
-			if engine == engineClaude {
-				delete(tried, p.Name)
-			}
+			delete(tried, p.Name)
 			continue
 		default:
 			class = errFatal
@@ -1040,14 +1022,27 @@ func (r *Runner) markNeedsLogin(p Profile) {
 	}
 	// The button runs the PTY login flow in account.go, so the owner never has
 	// to reach the machine to fix an account.
-	msg := fmt.Sprintf("🔑 Claude account <b>%s</b> needs a new login (a turn was refused).", htmlEscape(p.Name))
-	buttons := [][]InlineKeyboardButton{{{Text: "🔑 Relogin " + p.Name, CallbackData: "account:login:" + p.Name}}}
+	shown := accountDisplay(p)
+	msg := fmt.Sprintf("🔑 %s account <b>%s</b> needs a new login (a turn was refused).", engineLabel(profileEngine(p)), htmlEscape(shown))
+	buttons := [][]InlineKeyboardButton{{{Text: "🔑 Relogin " + shown, CallbackData: "account:login:" + accountTarget(p.Name)}}}
 	_, _ = sendMessageKeyboardGetID(cfg, cfg.ChatID, 0, msg, buttons) // safe-ignore: a failed notification must not fail the turn
 }
 
-// pickProfileExcluding is pickProfile with the profiles this turn already tried
-// (and any known to need a login) taken out of the running.
+// pickProfileExcluding is pickAccount for Claude. Kept so existing tests and
+// callers that mean "the Claude pool" keep compiling.
 func (r *Runner) pickProfileExcluding(exclude map[string]bool) (Profile, bool) {
+	return r.pickAccount(engineClaude, exclude)
+}
+
+// pickAccount chooses a healthy account whose engine matches. Failover stays
+// inside that engine: Claude↔Claude, Grok↔Grok. When no account of that
+// engine is registered, the machine-default implicit account is used so a
+// bot assigned with `/engine` still has somewhere to run.
+func (r *Runner) pickAccount(engine string, exclude map[string]bool) (Profile, bool) {
+	engine, err := parseEngine(engine)
+	if err != nil {
+		engine = engineClaude
+	}
 	cfg := r.config()
 	r.mu.Lock()
 	needs := make(map[string]bool, len(r.needsLogin))
@@ -1060,23 +1055,29 @@ func (r *Runner) pickProfileExcluding(exclude map[string]bool) (Profile, bool) {
 	stats := collectProfileStats(cfg, nil, now)
 	open := stats[:0:0]
 	for _, s := range stats {
+		if s.Engine != engine {
+			continue
+		}
 		if exclude[s.Name] || needs[s.Name] {
 			continue
 		}
 		open = append(open, s)
 	}
 	if len(open) == 0 {
-		// Everything is excluded. If the only problem is a stale needs_login
-		// flag and there is literally nothing else, try it anyway rather than
-		// dropping the turn.
+		// Everything of this engine is excluded. If the only problem is a
+		// stale needs_login flag and there is literally nothing else, try it
+		// anyway rather than dropping the turn.
 		for _, s := range stats {
-			if !exclude[s.Name] {
+			if s.Engine == engine && !exclude[s.Name] {
 				open = append(open, s)
 			}
 		}
-		if len(open) == 0 {
-			return Profile{}, false
+	}
+	if len(open) == 0 {
+		if len(listProfilesForEngine(cfg, engine)) == 0 && (exclude == nil || !exclude[engine]) {
+			return implicitAccount(engine), true
 		}
+		return Profile{}, false
 	}
 	name := chooseProfile(open, now)
 	p, ok := profileByName(cfg, name)

@@ -369,6 +369,52 @@ func TestAcceptBypassDisclaimer(t *testing.T) {
 	})
 }
 
+func TestGrokAndAgyLoginHealth(t *testing.T) {
+	dir := t.TempDir()
+	grok := Profile{Name: "work", Engine: engineGrok, ConfigDir: filepath.Join(dir, "grok")}
+	if in, _, err := grokLoggedIn(grok); in || err != nil {
+		t.Fatalf("missing auth.json should be logged out: in=%v err=%v", in, err)
+	}
+	if err := os.MkdirAll(engineHome(grok), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(grokAuthJSON(grok), []byte(`{"email":"me@x.ai"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in, acct, err := grokLoggedIn(grok)
+	if err != nil || !in || acct != "me@x.ai" {
+		t.Fatalf("grokLoggedIn = %v %q %v", in, acct, err)
+	}
+
+	agy := Profile{Name: "lab", Engine: engineAntigravity, ConfigDir: filepath.Join(dir, "agy")}
+	if in, _, err := agyLoggedIn(agy); in || err != nil {
+		t.Fatalf("missing token should be logged out: in=%v err=%v", in, err)
+	}
+	token := agyOAuthToken(agy)
+	if err := os.MkdirAll(filepath.Dir(token), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(token, []byte(`{"email":"lab@google.com"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in, acct, err = agyLoggedIn(agy)
+	if err != nil || !in || acct != "lab@google.com" {
+		t.Fatalf("agyLoggedIn = %v %q %v", in, acct, err)
+	}
+
+	mixed := &Config{Profiles: map[string]*Profile{
+		"you@example.com": {Engine: engineClaude, ConfigDir: filepath.Join(dir, "c")},
+		"work":            {Engine: engineGrok, ConfigDir: grok.ConfigDir},
+		"lab":             {Engine: engineAntigravity, ConfigDir: agy.ConfigDir},
+	}}
+	if got := listProfilesForEngine(mixed, engineGrok); len(got) != 1 || got[0].Name != "work" {
+		t.Fatalf("listProfilesForEngine(grok) = %+v", got)
+	}
+	if got := configuredEngines(mixed); len(got) != 3 {
+		t.Fatalf("configuredEngines = %v", got)
+	}
+}
+
 func TestListProfilesAndDefault(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Run("no profiles yields the implicit one", func(t *testing.T) {

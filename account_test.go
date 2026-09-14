@@ -107,7 +107,7 @@ func TestRenderAccountsCard(t *testing.T) {
 
 func TestRenderAccountsWithNoProfiles(t *testing.T) {
 	body, buttons := renderAccounts(nil)
-	if !strings.Contains(body, "/account add &lt;email&gt;") {
+	if !strings.Contains(body, "/account add &lt;identity&gt; &lt;engine&gt;") {
 		t.Errorf("an empty account list should say how to add one: %q", body)
 	}
 	if len(buttons) != 0 {
@@ -135,6 +135,9 @@ func TestAccountAddByEmail(t *testing.T) {
 	}
 	if p.Label != "jairo@agentero.com" {
 		t.Errorf("label = %q, want the email", p.Label)
+	}
+	if profileEngine(*p) != engineClaude {
+		t.Errorf("engine = %q, want claude (legacy add without engine)", p.Engine)
 	}
 	if in.config().DefaultProfile != "jairo@agentero.com" {
 		t.Errorf("the first account did not become the default: %q", in.config().DefaultProfile)
@@ -165,7 +168,9 @@ func TestAccountAddRejectsWhatIsNotAnEmail(t *testing.T) {
 		t.Errorf("a non-email created a profile: %+v", cfg.Profiles)
 	}
 	for _, got := range api.texts("") {
-		if !strings.Contains(got, "@example.com") {
+		// A second token that is not an engine is an engine error; a single
+		// non-email is still the Claude-email explanation.
+		if !strings.Contains(got, "@example.com") && !strings.Contains(got, "unknown engine") {
 			t.Errorf("a non-email was not explained: %q", got)
 		}
 		if strings.Contains(got, "Usage:") {
@@ -403,5 +408,117 @@ func TestSetGroupCommand(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(api.texts(""), "\n"), "-100999") {
 		t.Error("/setgroup did not confirm the new group")
+	}
+}
+
+func TestParseAccountAdd(t *testing.T) {
+	cases := []struct {
+		in, identity, engine string
+		ok                   bool
+	}{
+		{"you@example.com", "you@example.com", engineClaude, true},
+		{"you@example.com claude", "you@example.com", engineClaude, true},
+		{"claude you@example.com", "you@example.com", engineClaude, true},
+		{"work grok", "work", engineGrok, true},
+		{"grok work", "work", engineGrok, true},
+		{"work grok-build", "work", engineGrok, true},
+		{"lab agy", "lab", engineAntigravity, true},
+		{"antigravity lab", "lab", engineAntigravity, true},
+		{"lab antigravity", "lab", engineAntigravity, true},
+		{"", "", "", false},
+		{"grok", "", "", false},
+		{"work not-a-cli", "", "", false},
+		{"a b c", "", "", false},
+	}
+	for _, c := range cases {
+		id, eng, err := parseAccountAdd(c.in)
+		if c.ok {
+			if err != nil || id != c.identity || eng != c.engine {
+				t.Errorf("parseAccountAdd(%q) = (%q,%q,%v), want (%q,%q,nil)", c.in, id, eng, err, c.identity, c.engine)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("parseAccountAdd(%q) = (%q,%q), want error", c.in, id, eng)
+		}
+	}
+}
+
+func TestAccountAddTakesEngine(t *testing.T) {
+	in, _, api := testInstance(t)
+	if err := saveConfig(in.config()); err != nil {
+		t.Fatal(err)
+	}
+	stubPTY(t, in)
+
+	in.handleAccountCommand(dmMessage(42, ""), "add work grok")
+	p := in.config().Profiles["work"]
+	if p == nil {
+		t.Fatalf("grok account was not created: %+v", in.config().Profiles)
+	}
+	if profileEngine(*p) != engineGrok {
+		t.Errorf("engine = %q, want grok", p.Engine)
+	}
+	if want := filepath.Join(in.dataDir, "accounts", engineGrok, "work"); p.ConfigDir != want {
+		t.Errorf("grok home = %q, want %q", p.ConfigDir, want)
+	}
+
+	in.handleAccountCommand(dmMessage(42, ""), "add lab agy")
+	agy := in.config().Profiles["lab"]
+	if agy == nil || profileEngine(*agy) != engineAntigravity {
+		t.Fatalf("agy account = %+v", in.config().Profiles)
+	}
+	if want := filepath.Join(in.dataDir, "accounts", engineAntigravity, "lab"); agy.ConfigDir != want {
+		t.Errorf("agy home = %q, want %q", agy.ConfigDir, want)
+	}
+
+	in.handleAccountCommand(dmMessage(42, ""), "add you@example.com claude")
+	cl := in.config().Profiles["you@example.com"]
+	if cl == nil || profileEngine(*cl) != engineClaude {
+		t.Fatalf("claude account = %+v", in.config().Profiles)
+	}
+
+	if len(in.config().Profiles) != 3 {
+		t.Errorf("mixed pool size = %d, want 3: %+v", len(in.config().Profiles), in.config().Profiles)
+	}
+	joined := strings.Join(api.texts(""), "\n")
+	if !strings.Contains(joined, "Grok Build") || !strings.Contains(joined, "Antigravity") {
+		t.Errorf("add replies should name the engine:\n%s", joined)
+	}
+}
+
+func TestRenderAccountsShowsEngineAndMixedHealth(t *testing.T) {
+	cards := []accountCard{
+		{
+			Profile:    Profile{Name: "you@example.com", Engine: engineClaude, Label: "you@example.com"},
+			State:      accountOK,
+			Usage:      profileUsage{FiveHour: 10, SevenDay: 20, FiveHourKnown: true, SevenDayKnown: true},
+			IsDefault:  true,
+			Disclaimer: true,
+		},
+		{
+			Profile: Profile{Name: "work", Engine: engineGrok, Label: "work"},
+			State:   accountOK,
+		},
+		{
+			Profile: Profile{Name: "lab", Engine: engineAntigravity, Label: "lab"},
+			State:   accountLoggedOut,
+		},
+	}
+	body, _ := renderAccounts(cards)
+	for _, want := range []string{
+		"<b>Accounts</b>", "Claude Code", "Grok Build", "Antigravity",
+		"you@example.com", "work", "lab", "✅ logged in", "❌ not logged in",
+		"5h 10%",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("mixed card missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "bypass disclaimer") {
+		t.Errorf("grok/agy cards must not show the Claude disclaimer:\n%s", body)
+	}
+	if strings.Count(body, "usage:") != 1 {
+		t.Errorf("usage should be Claude-only:\n%s", body)
 	}
 }

@@ -386,6 +386,43 @@ func TestPickProfileExcludingSkipsTriedAndLoggedOutAccounts(t *testing.T) {
 	}
 }
 
+func TestPickAccountStaysInsideEngine(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{
+		DataDir: dir,
+		Profiles: map[string]*Profile{
+			"you@example.com": {Engine: engineClaude, ConfigDir: filepath.Join(dir, "claude")},
+			"work":            {Engine: engineGrok, ConfigDir: filepath.Join(dir, "grok-a")},
+			"personal":        {Engine: engineGrok, ConfigDir: filepath.Join(dir, "grok-b")},
+			"lab":             {Engine: engineAntigravity, ConfigDir: filepath.Join(dir, "agy")},
+		},
+	}
+	r := newRunner(nil, cfg, nil)
+
+	claude, ok := r.pickAccount(engineClaude, nil)
+	if !ok || profileEngine(claude) != engineClaude || claude.Name != "you@example.com" {
+		t.Fatalf("claude pick = %+v ok=%v", claude, ok)
+	}
+	grok, ok := r.pickAccount(engineGrok, nil)
+	if !ok || profileEngine(grok) != engineGrok {
+		t.Fatalf("grok pick = %+v ok=%v", grok, ok)
+	}
+	if grok.Name != "personal" && grok.Name != "work" {
+		t.Fatalf("grok pick left the grok pool: %q", grok.Name)
+	}
+	next, ok := r.pickAccount(engineGrok, map[string]bool{grok.Name: true})
+	if !ok || profileEngine(next) != engineGrok || next.Name == grok.Name {
+		t.Fatalf("grok failover = %+v ok=%v (from %q)", next, ok, grok.Name)
+	}
+	if _, ok := r.pickAccount(engineGrok, map[string]bool{"work": true, "personal": true}); ok {
+		t.Error("grok failover must not jump to Claude or Antigravity")
+	}
+	agy, ok := r.pickAccount(engineAntigravity, nil)
+	if !ok || agy.Name != "lab" {
+		t.Fatalf("agy pick = %+v ok=%v", agy, ok)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Input debounce (DESIGN §14.18)
 // ---------------------------------------------------------------------------

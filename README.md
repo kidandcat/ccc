@@ -43,8 +43,8 @@ the Telegram UX.
 | **Instance** | One `ccc listen` process on one machine, bound to one Telegram bot token and one forum group. |
 | **Bot** | One forum topic. A name, a role, a working directory and a memory scope. |
 | **Turn** | One engine process (`claude -p`, `grok --single`, or `agy --print`): one input, one answer. One turn per bot at a time; messages that arrive meanwhile are folded into the next turn. |
-| **Engine** | Which CLI a bot's turns spawn: `claude` (default), `grok` / `grok-build`, or `antigravity` / `agy`. Set per bot with `/engine`, or for new bots with `ccc config set default_engine`. |
-| **Account** | One Claude login = one `CLAUDE_CONFIG_DIR`. Claude turns pick the healthiest account and fail over. Grok and Antigravity use the CLI on `PATH` and that CLI's own login; they do not get a fake `CLAUDE_CONFIG_DIR`. |
+| **Engine** | Which CLI an **account** runs: `claude`, `grok` / `grok-build`, or `antigravity` / `agy`. Set when you add the account (`/account add <identity> <engine>`). A bot's turns pick a healthy account from that engine's pool. `/engine` is a secondary way to assign a bot onto another pool. |
+| **Account** | One login for one engine. Claude = `CLAUDE_CONFIG_DIR`. Grok = isolated `GROK_HOME`. Antigravity = isolated `HOME` (`~/.gemini`). One ccc process can hold several Claude emails + several Grok logins + several agy logins at once. Failover stays inside the same engine. |
 | **Memory** | Durable facts in three scopes: `user` (about you, shared by all bots), `project` (about one code base) and `bot` (private). |
 | **Watch** | A command re-run on an interval. The bot is woken **only when the output changes**, with a diff. Nothing changing costs nothing. |
 | **Schedule** | A wakeup at a time, or on a cron expression. |
@@ -156,16 +156,21 @@ In the forum group, send:
 ccc records the group id. Then, anywhere:
 
 ```
-/account add you@example.com
+/account add you@example.com claude
 ```
 
-An account **is** its email: that is what you type and what `/account` shows,
-and ccc derives the config dir behind it from the address (you never see or type
-that). ccc creates the dir, runs `claude auth login` on a pseudo-terminal and
-posts you the login URL. Open it on a device where you are signed in to the
-right Claude account, and send the code it gives you back into the same chat.
-ccc feeds it to the CLI, confirms with `claude auth status`, then accepts the
-bypass-permissions disclaimer for you.
+(`/account add you@example.com` still works: omitted engine is Claude.)
+
+An account is its identity plus its engine. Claude identities are emails; Grok
+and Antigravity accept a short name or email. ccc derives an isolated home
+behind it (you never see or type that path). For Claude it runs
+`claude auth login` on a pseudo-terminal and posts the login URL. Open it on a
+device where you are signed in to the right account, and send the code it gives
+you back into the same chat. ccc feeds it to the CLI, confirms with
+`claude auth status`, then accepts the bypass-permissions disclaimer for you.
+
+Grok and Antigravity use the same `/account` flow with their own CLI login
+(`grok login --device-auth`, `agy auth login`) and isolated homes.
 
 If the device turned out to be signed in as somebody else, ccc says so and
 stores the account under the address it actually logged in as. The account
@@ -176,8 +181,16 @@ email as soon as ccc has asked `claude auth status` once.
 > Telegram only. The login runs with a directory of no-op `open` / `xdg-open`
 > shims first on `PATH` and `$BROWSER` pointed at one of them.
 
-Add a second account the same way (`/account add other@example.com`) — turns are
-spread across them and fail over when one runs out.
+Add more accounts the same way. Mix engines in one instance:
+
+```
+/account add other@example.com claude
+/account add work grok
+/account add lab agy
+```
+
+Turns pick a healthy account whose engine matches the bot. Failover stays
+Claude↔Claude or Grok↔Grok — ccc does not jump Claude→Grok mid-conversation.
 
 ### 7. Make your first bot
 
@@ -223,7 +236,7 @@ what the bot is doing. It is replaced by the answer, and your message gets a ✅
 | `/new` | Fresh conversation. Memories are kept. |
 | `/stop` | Kill the running turn and drop the queue. |
 | `/cwd [path]` | Show or set the bot's working directory. |
-| `/engine [name]` | Show or set the bot's engine: `claude` (default), `grok` / `grok-build`, `antigravity` / `agy`. Switching engines starts a fresh conversation. |
+| `/engine [name]` | Show this bot's engine pool, or assign it to another (`claude`, `grok`, `antigravity`). Secondary: engine is set when you add the account. Switching pools starts a fresh conversation. |
 | `/memory [query]` | List or search the memories this bot can see. |
 | `/memory stats` | Per scope: how many entries, how many bytes, whether it is due for compaction, and when it was last compacted. |
 | `/memory restore <id>` | Undo one memory compaction (owner only). The id is in the compaction message and in `/memory stats`. |
@@ -243,8 +256,9 @@ what the bot is doing. It is replaced by the answer, and your message gets a ✅
 
 | Command | Effect |
 |---|---|
-| `/account` | Status card per Claude account, with buttons. |
-| `/account add\|login\|remove\|default <email>` | Manage accounts by their email (see above). |
+| `/account` | Status card per account (engine + health), with buttons. |
+| `/account add <identity> <engine>` | Register an account for that engine and start its login. |
+| `/account login\|remove\|default <identity>` | Relogin, remove, or make default (new bots inherit that account's engine). |
 | `/access` | Who may talk to ccc (see below). |
 | `/model [name]` | Show or set the model every bot runs on. `/model default` clears it. |
 | `/setgroup` | Bind ccc to the forum group the command was sent in. |
@@ -352,53 +366,55 @@ An approved user can talk to the bots. They cannot use `/account`, `/access`,
 
 ---
 
-## Engines
+## Engines and accounts
 
-Each bot runs on one CLI. Existing bots stay on Claude Code unless you change
-them. New bots take `default_engine` from config (Claude if unset).
+Engine is a property of an **account**, set when you add it. One ccc process
+can mix several Claude emails, several Grok logins and several Antigravity
+logins. A bot's turns pick a healthy account from the pool that matches what
+that bot runs on. New bots inherit the default account's engine (or
+`default_engine` if you set one). `/engine` only assigns a bot onto another
+already-registered pool — it is not the way you introduce an engine.
 
-| Engine | Telegram / config | Binary | Session | MCP |
-|---|---|---|---|---|
-| **Claude Code** (default) | `claude` | `claude` on `PATH` | ccc mints a UUID; `--session-id` then `--resume` | ccc MCP (`remember`, `send_to_bot`, …) |
-| **Grok Build** | `grok` or `grok-build` | `grok` (`~/.grok/bin/grok`) | ccc mints a UUID; `--session-id` then `--resume` | not wired — Grok MCP is persistent TOML (`grok mcp add`), not a per-turn flag |
-| **Antigravity** | `antigravity` or `agy` | `agy` (`~/.local/bin/agy`) | first turn lets `agy` mint a `conversation_id`; later turns pass `--conversation` | not wired — agy MCP is `~/.gemini/config/mcp_config.json`, not a per-turn flag |
+| Engine | Add account | Isolated home | Binary | Session | MCP |
+|---|---|---|---|---|---|
+| **Claude Code** | `/account add you@x.com claude` | `CLAUDE_CONFIG_DIR` under `<data_dir>/profiles/` | `claude` | ccc mints a UUID; `--session-id` then `--resume` | ccc MCP (`remember`, `send_to_bot`, …) |
+| **Grok Build** | `/account add work grok` | `GROK_HOME` = `<data_dir>/accounts/grok/<id>` (`auth.json`) | `grok` (`~/.grok/bin/grok`) | ccc mints a UUID; `--session-id` then `--resume` | not wired — Grok MCP is persistent TOML (`grok mcp add`), not a per-turn flag |
+| **Antigravity** | `/account add lab agy` | isolated `HOME` + `GEMINI_HOME` + `GEMINI_FORCE_FILE_STORAGE` under `<data_dir>/accounts/antigravity/<id>` | `agy` (`~/.local/bin/agy`) | first turn lets `agy` mint a `conversation_id`; later turns pass `--conversation` | not wired — agy MCP is `~/.gemini/config/mcp_config.json`, not a per-turn flag |
 
 ```
-/engine                 # show this bot's engine
-/engine grok            # next turn is `grok --single …`
-/engine antigravity     # next turn is `agy --print …`
-/engine claude          # back to Claude Code
+/account add you@example.com claude
+/account add work grok
+/account add lab antigravity
+/account                         # mixed list: identity, engine, health
 
-ccc config set default_engine grok    # new bots start on Grok
+/engine                          # which pool this bot uses
+/engine grok                     # assign this bot to the Grok pool (secondary)
+
+ccc config set default_engine grok    # optional override for new bots
 ccc config get default_engine
 ```
 
-**Claude** is unchanged: profile pool, `CLAUDE_CONFIG_DIR`, failover, MCP,
-`--output-format stream-json`. See `/account` and the bootstrap steps above.
+**Claude** is unchanged: profile pool, `CLAUDE_CONFIG_DIR`, same-engine
+failover, MCP, `--output-format stream-json`.
 
-**Grok Build.** Install the CLI (typically `~/.grok/bin/grok` on `PATH`), then
-log in once. On a VM there is no browser:
+**Grok Build.** `/account add work grok` creates an isolated `GROK_HOME` and
+drives `grok login --device-auth` on a PTY (the VM has no browser). Turns set
+`GROK_HOME` so `auth.json` is this account, not `~/.grok`. Failover is
+Grok↔Grok. Turns run `grok --always-approve --output-format
+streaming-messages-json --single <envelope>`. Guess labeled: the `grok`
+binary was not on the machine that built this; flags were checked against
+Grok Build's published headless docs and Hairok's Mac-verified set.
 
-```bash
-grok login --device-auth
-```
-
-ccc does not invent a Claude config dir for Grok. Auth is whatever `grok`
-already uses (`grok login`, or `XAI_*` / `GROK_*` in the environment /
-`env_passthrough`). Turns run `grok --always-approve --output-format
-streaming-messages-json --single <envelope>` so Telegram progress can reuse
-the Claude stream parser. Guess labeled: the `grok` binary was not on the
-machine that built this; flags were checked against Grok Build's published
-headless docs and Hairok's Mac-verified set.
-
-**Antigravity.** Install `agy` (typically `~/.local/bin/agy`), then
-authenticate with an **interactive** `agy` session first. A headless run that
-is not already logged in exits with `authentication required` instead of
-hanging. ccc does not invent a Claude config dir. Turns run
+**Antigravity.** `/account add lab agy` creates an isolated HOME so
+`~/.gemini` cannot collide with Claude profiles or the real user home, and
+forces file-store tokens (`GEMINI_FORCE_FILE_STORAGE=true`) instead of the OS
+keyring. Login is `agy auth login` as the CLI requires. A headless run that
+is not already logged in exits with `authentication required`. Turns run
 `agy --print <prompt> --output-format stream-json --dangerously-skip-permissions`
 and `--conversation` on resume. `--print-timeout 120m` is a ccc choice (agy's
 default is 5 minutes). Guess labeled: `agy` was not on the build machine;
-flags match the official headless docs and Hairok's Mac-verified set.
+flags match the official headless docs. Isolation is HOME/XDG/`GEMINI_HOME`
+because agy has no official profile selector.
 
 Progress streaming works when the CLI emits a usable NDJSON stream. If an
 engine only prints the final answer, Telegram still gets that text (the
@@ -422,14 +438,16 @@ CLI's own default. An unknown agy model fails the turn.
 | A bot's default working directory | `<data_dir>/bots/<name>/workspace` |
 | Files you send a bot | `<its cwd>/inbox/` |
 | Claude accounts | `<data_dir>/profiles/<name>` (one `CLAUDE_CONFIG_DIR` each) |
-| Shared conversation transcripts | `<data_dir>/projects`, symlinked into every account |
+| Grok / Antigravity accounts | `<data_dir>/accounts/grok/<id>` (`GROK_HOME`) and `<data_dir>/accounts/antigravity/<id>` (isolated HOME) |
+| Shared conversation transcripts | `<data_dir>/projects`, symlinked into every Claude account |
 | Logs | `~/Library/Caches/ccc/ccc.log` (macOS) or `journalctl --user -u ccc` |
 
 `data_dir` defaults to `~/.local/share/ccc`.
 
-All accounts point their `projects/` at the **same** directory on purpose: that
-is what lets a turn refused by one account resume the very same conversation on
-another.
+Claude accounts point their `projects/` at the **same** directory on purpose:
+that is what lets a turn refused by one Claude account resume the very same
+conversation on another. Grok and Antigravity keep isolated homes and fail
+over only inside their own pool.
 
 ---
 

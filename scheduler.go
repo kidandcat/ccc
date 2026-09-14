@@ -371,14 +371,18 @@ func (s *scheduler) runDoctor(now time.Time) {
 			// The doctor run is where a profile learns (or confirms) which
 			// account it holds: that is the name it is shown and addressed by
 			// everywhere in Telegram (DESIGN §8).
-			p.Name = s.in.rememberProfileEmail(p.Name, account)
+			if profileEngine(p) == engineClaude {
+				p.Name = s.in.rememberProfileEmail(p.Name, account)
+			}
 		}
-		if accepted, known := bypassAccepted(p); known && !accepted {
-			findings = append(findings, doctorFinding{accountDisplay(p), "bypass disclaimer not accepted"})
+		if profileEngine(p) == engineClaude {
+			if accepted, known := bypassAccepted(p); known && !accepted {
+				findings = append(findings, doctorFinding{accountDisplay(p), "bypass disclaimer not accepted"})
+			}
+			// Reading the usage cache is what refreshes the numbers chooseProfile
+			// and /status use; the result is per-call, so this is the refresh.
+			readProfileUsage(p)
 		}
-		// Reading the usage cache is what refreshes the numbers chooseProfile
-		// and /status use; the result is per-call, so this is the refresh.
-		readProfileUsage(p)
 	}
 	s.doctor.findings = findings
 }
@@ -398,7 +402,7 @@ func (in *instance) notifyNeedsLogin(p Profile, why string) {
 		return
 	}
 	shown := accountDisplay(p)
-	body := fmt.Sprintf("🔑 Claude account <b>%s</b> needs a new login (%s).", htmlEscape(shown), htmlEscape(why))
+	body := fmt.Sprintf("🔑 %s account <b>%s</b> needs a new login (%s).", engineLabel(profileEngine(p)), htmlEscape(shown), htmlEscape(why))
 	buttons := [][]InlineKeyboardButton{{{Text: "🔑 Relogin " + shown, CallbackData: "account:login:" + accountTarget(p.Name)}}}
 	if _, err := sendMessageKeyboardGetID(cfg, cfg.ChatID, 0, body, buttons); err != nil {
 		hookLog("needs-login notification failed: %v", err)

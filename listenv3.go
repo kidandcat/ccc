@@ -258,6 +258,9 @@ func linkSharedProjects(cfg *Config) {
 	shared := filepath.Join(dataDir(cfg), "projects")
 	profiles := listProfiles(cfg)
 	for _, p := range profiles {
+		if profileEngine(p) != engineClaude {
+			continue
+		}
 		dir := profileProjectsDir(p)
 		if _, err := os.Lstat(shared); err != nil {
 			// The implicit ~/.claude profile already owns a real projects/ with
@@ -296,7 +299,7 @@ func setBotCommandsV3(botToken string) {
 		{"command": "new", "description": "Start a fresh conversation (memory kept)"},
 		{"command": "stop", "description": "Stop the running turn and drop the queue"},
 		{"command": "cwd", "description": "Show or set this bot's working directory"},
-		{"command": "engine", "description": "Show or set this bot's engine: claude, grok, antigravity"},
+		{"command": "engine", "description": "Show this bot's engine pool (set at /account add); assign another pool"},
 		{"command": "memory", "description": "Memories: /memory [query] | stats | restore <id>"},
 		{"command": "forget", "description": "Forget a memory: /forget <scope> <key>"},
 		{"command": "watches", "description": "List this bot's watches"},
@@ -304,7 +307,7 @@ func setBotCommandsV3(botToken string) {
 		{"command": "bots", "description": "List all bots"},
 		{"command": "status", "description": "Instance health: profiles, queue, running turns"},
 		{"command": "usage", "description": "Tokens, cache hit ratio and cost per bot"},
-		{"command": "account", "description": "Claude accounts (owner only)"},
+		{"command": "account", "description": "Accounts by engine (owner only)"},
 		{"command": "access", "description": "Who may talk to ccc (owner only)"},
 		{"command": "model", "description": "Show or set the model (owner only)"},
 	}
@@ -1058,8 +1061,13 @@ func (in *instance) renderStatus() string {
 		if p, ok := profileByName(cfg, s.Name); ok {
 			shown = accountDisplay(p)
 		}
-		fmt.Fprintf(&sb, "• %s — 5h %d%%, 7d %d%%, %d running (%s)\n",
-			htmlEscape(shown), s.FiveHour, s.SevenDay, s.WorkingAgents, state)
+		if s.Engine == engineClaude {
+			fmt.Fprintf(&sb, "• %s (%s) — 5h %d%%, 7d %d%%, %d running (%s)\n",
+				htmlEscape(shown), htmlEscape(s.Engine), s.FiveHour, s.SevenDay, s.WorkingAgents, state)
+		} else {
+			fmt.Fprintf(&sb, "• %s (%s) — %d running (%s)\n",
+				htmlEscape(shown), htmlEscape(s.Engine), s.WorkingAgents, state)
+		}
 	}
 	if findings := in.sched.findingsSnapshot(); len(findings) > 0 {
 		sb.WriteString("\n<b>Doctor</b>\n")
@@ -1102,13 +1110,20 @@ func callbackIsDM(cb *CallbackQuery) bool {
 	return cb.Message != nil && cb.Message.Chat.Type == "private"
 }
 
-// handleEngineCommand shows or sets the CLI a bot's turns spawn (claude, grok,
-// antigravity). Switching engines rotates the session: the conversation id
-// belongs to one CLI and cannot be resumed by another.
+// handleEngineCommand assigns a bot to an engine's account pool. Engine itself
+// is defined when the account is added (`/account add <identity> <engine>`).
+// This command is secondary: it is how a bot in a mixed instance picks which
+// pool to run on. Switching pools rotates the session — conversation ids are
+// per CLI.
 func (in *instance) handleEngineCommand(msg *TelegramMessage, b *Bot, rest string) {
 	rest = strings.TrimSpace(rest)
 	if rest == "" {
-		in.reply(msg, "<b>Engine</b>\n<code>"+htmlEscape(botEngine(b))+"</code> ("+htmlEscape(engineLabel(botEngine(b)))+")\nSet it with /engine claude, /engine grok or /engine antigravity.")
+		engine := botEngine(b)
+		n := len(listProfilesForEngine(in.config(), engine))
+		in.reply(msg, "<b>Engine</b>\n<code>"+htmlEscape(engine)+"</code> ("+htmlEscape(engineLabel(engine))+") · "+
+			fmt.Sprintf("%d account(s) in this pool", n)+
+			"\nEngine is set when you add an account (<code>/account add &lt;identity&gt; &lt;engine&gt;</code>). "+
+			"/engine assigns this bot to another pool.")
 		return
 	}
 	engine, err := parseEngine(rest)
@@ -1125,9 +1140,12 @@ func (in *instance) handleEngineCommand(msg *TelegramMessage, b *Bot, rest strin
 		in.reply(msg, "Could not update the engine: "+htmlEscape(err.Error()))
 		return
 	}
-	reply := "⚙️ Engine set to <code>" + htmlEscape(engine) + "</code> (" + htmlEscape(engineLabel(engine)) + "); the next message starts a fresh conversation."
+	reply := "⚙️ This bot now uses the <code>" + htmlEscape(engine) + "</code> account pool (" + htmlEscape(engineLabel(engine)) + "); the next message starts a fresh conversation."
+	if n := len(listProfilesForEngine(in.config(), engine)); n == 0 {
+		reply += "\nNo " + htmlEscape(engine) + " accounts yet. Add one: <code>/account add &lt;identity&gt; " + htmlEscape(engine) + "</code>."
+	}
 	if engine != engineClaude {
-		reply += "\nNo ccc MCP tools on this engine. Login: " + htmlEscape(engineLoginHint(engine)) + "."
+		reply += "\nNo ccc MCP tools on this engine."
 	}
 	in.reply(msg, reply)
 }

@@ -2,17 +2,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
 )
 
-// account.go is `/account` (DESIGN §8): the only UI for Claude accounts, so the
-// owner never needs a terminal on the machine ccc runs on. It renders one card
-// per profile, drives `claude auth login` through the pseudo-terminal in
-// ptyflow.go, and records the bypass-permissions disclaimer straight into the
-// profile's settings.json afterwards (acceptBypassDisclaimer).
+// account.go is `/account` (DESIGN §8): the only UI for accounts, so the owner
+// never needs a terminal on the machine ccc runs on. Engine is set when the
+// account is added (`/account add <identity> <engine>`). It renders one card
+// per account (Claude, Grok, Antigravity), drives that CLI's login through the
+// pseudo-terminal in ptyflow.go, and — for Claude only — records the
+// bypass-permissions disclaimer straight into settings.json afterwards.
 
 // accountState is the health of one profile as the card shows it.
 type accountState int
@@ -20,7 +22,7 @@ type accountState int
 const (
 	accountOK         accountState = iota // logged in and usable
 	accountNeedsLogin                     // credentials exist but a turn was refused; re-login
-	accountLoggedOut                      // `claude auth status` says logged out
+	accountLoggedOut                      // auth status / credential file says logged out
 	accountUnknown                        // could not ask
 )
 
@@ -74,7 +76,9 @@ func (in *instance) collectAccountCards() []accountCard {
 			pr.state = accountOK
 		}
 		pr.account = account
-		pr.p.Name = in.rememberProfileEmail(p.Name, account)
+		if profileEngine(p) == engineClaude {
+			pr.p.Name = in.rememberProfileEmail(p.Name, account)
+		}
 		probes = append(probes, pr)
 	}
 
@@ -109,6 +113,9 @@ func (in *instance) collectAccountCards() []accountCard {
 // already recorded against the old key follow it so /usage stays whole.
 // It returns the key the profile is addressable by afterwards.
 func (in *instance) rememberProfileEmail(name, account string) string {
+	if p, ok := profileByName(in.config(), name); ok && profileEngine(p) != engineClaude {
+		return name
+	}
 	email := normalizeEmail(account)
 	if !isAccountEmail(email) {
 		return name
@@ -194,9 +201,9 @@ func (in *instance) busyBotsByProfile() map[string][]string {
 // renderAccounts is the /account status body plus its buttons.
 func renderAccounts(cards []accountCard) (string, [][]InlineKeyboardButton) {
 	var sb strings.Builder
-	sb.WriteString("<b>Claude accounts</b>\n")
+	sb.WriteString("<b>Accounts</b>\n")
 	if len(cards) == 0 {
-		sb.WriteString("None configured. <code>/account add &lt;email&gt;</code>")
+		sb.WriteString("None configured. <code>/account add &lt;identity&gt; &lt;engine&gt;</code>")
 		return sb.String(), nil
 	}
 	var buttons [][]InlineKeyboardButton
@@ -208,18 +215,21 @@ func renderAccounts(cards []accountCard) (string, [][]InlineKeyboardButton) {
 		if c.IsDefault {
 			marker = " ⭐"
 		}
-		fmt.Fprintf(&sb, "\n<b>%s</b>%s — %s\n", htmlEscape(name), marker, c.State.icon())
-		if acct := normalizeEmail(c.Account); acct != "" && acct != normalizeEmail(name) {
+		eng := profileEngine(c.Profile)
+		fmt.Fprintf(&sb, "\n<b>%s</b>%s — %s · %s\n", htmlEscape(name), marker, engineLabel(eng), c.State.icon())
+		if acct := strings.TrimSpace(c.Account); acct != "" && normalizeEmail(acct) != normalizeEmail(name) && acct != name {
 			fmt.Fprintf(&sb, "  %s\n", htmlEscape(acct))
 		}
-		fmt.Fprintf(&sb, "  usage: 5h %s · 7d %s\n",
-			pct(c.Usage.FiveHour, c.Usage.FiveHourKnown), pct(c.Usage.SevenDay, c.Usage.SevenDayKnown))
+		if eng == engineClaude {
+			fmt.Fprintf(&sb, "  usage: 5h %s · 7d %s\n",
+				pct(c.Usage.FiveHour, c.Usage.FiveHourKnown), pct(c.Usage.SevenDay, c.Usage.SevenDayKnown))
+		}
 		if len(c.Bots) > 0 {
 			fmt.Fprintf(&sb, "  running: %s\n", htmlEscape(strings.Join(c.Bots, ", ")))
 		} else {
 			sb.WriteString("  running: nothing\n")
 		}
-		if !c.Disclaimer {
+		if eng == engineClaude && !c.Disclaimer {
 			sb.WriteString("  ⚠️ bypass disclaimer not accepted\n")
 		}
 		target := accountTarget(c.Profile.Name)
@@ -246,36 +256,77 @@ func (in *instance) handleAccountCommand(msg *TelegramMessage, rest string) {
 
 	case "add":
 		if arg == "" {
-			in.reply(msg, "Usage: /account add &lt;email&gt;")
+			in.reply(msg, accountAddUsage)
 			return
 		}
 		in.accountAdd(msg, arg)
 
 	case "login":
 		if arg == "" {
-			in.reply(msg, "Usage: /account login &lt;email&gt;")
+			in.reply(msg, "Usage: /account login &lt;identity&gt;")
 			return
 		}
 		in.startLogin(msg.Chat.ID, msg.MessageThreadID, arg)
 
 	case "remove":
 		if arg == "" {
-			in.reply(msg, "Usage: /account remove &lt;email&gt;")
+			in.reply(msg, "Usage: /account remove &lt;identity&gt;")
 			return
 		}
 		in.accountAskRemove(msg, arg)
 
 	case "default":
 		if arg == "" {
-			in.reply(msg, "Usage: /account default &lt;email&gt;")
+			in.reply(msg, "Usage: /account default &lt;identity&gt;")
 			return
 		}
 		in.accountSetDefault(msg.Chat.ID, msg.MessageThreadID, arg)
 
 	default:
-		in.reply(msg, "Usage: /account [status] · add &lt;email&gt; · login &lt;email&gt; · remove &lt;email&gt; · default &lt;email&gt;")
+		in.reply(msg, "Usage: /account [status] · add &lt;identity&gt; [engine] · login · remove · default")
 	}
 }
+
+const accountAddUsage = "Usage: /account add &lt;identity&gt; &lt;engine&gt;\n" +
+	"<code>/account add you@example.com claude</code>\n" +
+	"<code>/account add work grok</code>\n" +
+	"<code>/account add lab agy</code>"
+
+// parseAccountAdd reads `/account add` arguments. Engine is part of add, not a
+// later `/engine` flip. Accepted shapes:
+//
+//	you@example.com              → claude (legacy)
+//	you@example.com claude
+//	claude you@example.com
+//	work grok
+//	grok work
+//	lab agy / antigravity lab
+func parseAccountAdd(arg string) (identity, engine string, err error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return "", "", errAccountAddUsage
+	}
+	first, rest := splitFirstWord(arg)
+	second, extra := splitFirstWord(rest)
+	if strings.TrimSpace(extra) != "" {
+		return "", "", errAccountAddUsage
+	}
+	if e, ok := knownEngineName(first); ok {
+		if second == "" {
+			return "", "", errAccountAddUsage
+		}
+		return second, e, nil
+	}
+	if second == "" {
+		return first, engineClaude, nil
+	}
+	if e, ok := knownEngineName(second); ok {
+		return first, e, nil
+	}
+	return "", "", fmt.Errorf("unknown engine %q (use claude, grok or antigravity)", second)
+}
+
+var errAccountAddUsage = fmt.Errorf("usage")
 
 func (in *instance) postAccounts(chatID, topicID int64) {
 	cfg := in.config()
@@ -290,24 +341,36 @@ func (in *instance) postAccounts(chatID, topicID int64) {
 	_, _ = sendMessageKeyboardGetID(cfg, chatID, topicID, body, buttons) // safe-ignore: same
 }
 
-// accountAdd registers a new profile with its own config dir and starts the
-// login flow for it (DESIGN §8 steps 1-3). The account is named by the email of
-// the Claude account behind it: that is the only identifier the owner ever
-// types, and the config dir is derived from it.
+// accountAdd registers a new account for one engine and starts that engine's
+// login flow. Engine is stored on the profile; turns pick from the matching
+// pool. Claude identities are emails; Grok/Antigravity accept a short name.
 func (in *instance) accountAdd(msg *TelegramMessage, arg string) {
-	email := normalizeEmail(arg)
-	if !isAccountEmail(email) {
-		in.reply(msg, "Accounts are identified by the email of the Claude account, so I need one: "+
-			"<code>/account add you@example.com</code>")
+	identity, engine, err := parseAccountAdd(arg)
+	if err != nil {
+		if errors.Is(err, errAccountAddUsage) {
+			in.reply(msg, accountAddUsage)
+			return
+		}
+		in.reply(msg, htmlEscape(err.Error()))
+		return
+	}
+	key := normalizeAccountKey(identity, engine)
+	if engine == engineClaude && !isAccountEmail(key) {
+		in.reply(msg, "Claude accounts are identified by email: "+
+			"<code>/account add you@example.com claude</code>")
+		return
+	}
+	if engine != engineClaude && !isAccountIdentity(key) {
+		in.reply(msg, "That identity is not a usable name. Use a short label or email, no spaces or slashes.")
 		return
 	}
 	cfg := in.config()
-	if p, exists := profileByName(cfg, email); exists {
+	if p, exists := profileByName(cfg, key); exists {
 		in.reply(msg, "That account already exists. Use <code>/account login "+
 			htmlEscape(accountDisplay(p))+"</code>.")
 		return
 	}
-	dir := profileDirFor(cfg, email)
+	dir := accountDirFor(cfg, engine, key)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		in.reply(msg, "Could not create the config dir: "+htmlEscape(err.Error()))
 		return
@@ -318,9 +381,9 @@ func (in *instance) accountAdd(msg *TelegramMessage, arg string) {
 		}
 		// An explicit config dir per profile is what keeps two accounts'
 		// credentials apart; see profiles.go.
-		c.Profiles[email] = &Profile{ConfigDir: dir, Label: email}
-		if len(c.Profiles) == 1 && c.DefaultProfile == "" {
-			c.DefaultProfile = email
+		c.Profiles[key] = &Profile{Engine: engine, ConfigDir: dir, Label: key}
+		if c.DefaultProfile == "" {
+			c.DefaultProfile = key
 		}
 		return true
 	})
@@ -329,11 +392,14 @@ func (in *instance) accountAdd(msg *TelegramMessage, arg string) {
 		return
 	}
 	in.setConfig(updated)
-	// Share transcripts with the other accounts so failover can resume a
-	// conversation this profile never started (DESIGN §4).
-	linkSharedProjects(updated)
-	in.reply(msg, "➕ Added <b>"+htmlEscape(email)+"</b>. Logging it in now...")
-	in.startLogin(msg.Chat.ID, msg.MessageThreadID, email)
+	// Claude profiles share transcripts so same-engine failover can resume a
+	// conversation this profile never started (DESIGN §4). Other engines keep
+	// their own isolated homes.
+	if engine == engineClaude {
+		linkSharedProjects(updated)
+	}
+	in.reply(msg, "➕ Added <b>"+htmlEscape(key)+"</b> ("+htmlEscape(engineLabel(engine))+"). Logging it in now...")
+	in.startLogin(msg.Chat.ID, msg.MessageThreadID, key)
 }
 
 func (in *instance) accountSetDefault(chatID, topicID int64, name string) {
@@ -492,8 +558,8 @@ func (t telegramPrompter) Progress(text string) {
 }
 
 func (t telegramPrompter) AskForCode(ctx context.Context, url string) (string, error) {
-	t.in.post(t.chatID, t.topicID, "🔗 Open this on the device with the right Claude account, "+
-		"then send me the code it gives you (or /cancel):\n\n"+htmlEscape(url))
+	t.in.post(t.chatID, t.topicID, "🔗 Open this on the device with the right account, "+
+		"then send me the code it gives you if asked (or /cancel):\n\n"+htmlEscape(url))
 	select {
 	case code := <-t.waiter.codes:
 		return code, nil
@@ -509,8 +575,8 @@ func (in *instance) startLogin(chatID, topicID int64, name string) {
 	p, ok := profileByName(cfg, name)
 	if !ok {
 		hint := ""
-		if isAccountEmail(name) {
-			hint = " Add it with <code>/account add " + htmlEscape(normalizeEmail(name)) + "</code>."
+		if isAccountEmail(name) || isAccountIdentity(name) {
+			hint = " Add it with <code>/account add " + htmlEscape(strings.ToLower(strings.TrimSpace(name))) + " &lt;engine&gt;</code>."
 		}
 		in.post(chatID, topicID, "No account <b>"+htmlEscape(name)+"</b>."+hint)
 		return
@@ -540,31 +606,37 @@ func (in *instance) startLogin(chatID, topicID int64, name string) {
 			in.login.mu.Unlock()
 		}()
 
-		in.post(chatID, topicID, "🔑 Starting <code>claude auth login</code> for <b>"+htmlEscape(accountDisplay(p))+"</b>...")
-		account, err := runLoginFlow(ctx, in.ptyStart(), p, telegramPrompter{in: in, chatID: chatID, topicID: topicID, waiter: waiter})
+		in.post(chatID, topicID, "🔑 Starting "+htmlEscape(loginCommandLabel(p))+" for <b>"+htmlEscape(accountDisplay(p))+"</b>...")
+		account, err := runAccountLogin(ctx, in.ptyStart(), p, telegramPrompter{in: in, chatID: chatID, topicID: topicID, waiter: waiter})
 		if err != nil {
 			in.post(chatID, topicID, "❌ Login failed: "+htmlEscape(truncate(err.Error(), 500)))
 			return
 		}
 		// The browser may have been signed in as somebody else: the account is
-		// whatever `claude auth status` reports, not what the owner typed.
-		name = in.reconcileLoginEmail(chatID, topicID, name, account)
-		in.post(chatID, topicID, "✅ <b>"+htmlEscape(name)+"</b> is logged in.")
-
-		// The account is only usable once the disclaimer is accepted too. That
-		// is one settings.json key, written straight into the profile's config
-		// dir — no second claude process, no TUI to answer (DESIGN §14.23).
-		// The profile is re-read from the config first: the login may have
-		// re-keyed it onto the email `auth status` reported.
-		target := p
-		if fresh, ok := profileByName(in.config(), name); ok {
-			target = fresh
+		// whatever auth status reports, not what the owner typed. Re-key is
+		// Claude-only (emails).
+		if profileEngine(p) == engineClaude {
+			name = in.reconcileLoginEmail(chatID, topicID, name, account)
+		} else if hint := strings.TrimSpace(account); hint != "" && hint != name {
+			in.post(chatID, topicID, "ℹ️ Logged in as <b>"+htmlEscape(hint)+"</b>.")
 		}
-		if err := acceptBypassDisclaimer(target); err != nil {
-			in.post(chatID, topicID, "⚠️ Could not accept the bypass disclaimer: "+
-				htmlEscape(truncate(err.Error(), 300))+"\n<code>"+htmlEscape(bypassDisclaimerHint(target))+"</code>")
-		} else {
-			in.post(chatID, topicID, "🛡 Bypass disclaimer accepted for <b>"+htmlEscape(name)+"</b>.")
+		in.post(chatID, topicID, "✅ <b>"+htmlEscape(name)+"</b> is logged in ("+htmlEscape(engineLabel(profileEngine(p)))+").")
+
+		// Claude is only usable once the disclaimer is accepted too. That is
+		// one settings.json key, written straight into the profile's config
+		// dir — no second claude process, no TUI to answer (DESIGN §14.23).
+		// Other engines have no equivalent gate.
+		if profileEngine(p) == engineClaude {
+			target := p
+			if fresh, ok := profileByName(in.config(), name); ok {
+				target = fresh
+			}
+			if err := acceptBypassDisclaimer(target); err != nil {
+				in.post(chatID, topicID, "⚠️ Could not accept the bypass disclaimer: "+
+					htmlEscape(truncate(err.Error(), 300))+"\n<code>"+htmlEscape(bypassDisclaimerHint(target))+"</code>")
+			} else {
+				in.post(chatID, topicID, "🛡 Bypass disclaimer accepted for <b>"+htmlEscape(name)+"</b>.")
+			}
 		}
 		in.clearNeedsLogin(name)
 		in.postAccounts(chatID, topicID)

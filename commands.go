@@ -149,7 +149,7 @@ func setup(botToken string) error {
 
 	fmt.Println()
 	fmt.Println("✅ Setup complete. Send a message in the group's General topic to create")
-	fmt.Println("   your first bot, or /account to add a Claude account.")
+	fmt.Println("   your first bot, or /account add you@example.com claude.")
 	startListenerService()
 	return nil
 }
@@ -232,19 +232,19 @@ func doctor(fix bool) {
 
 	fmt.Print("grok.............. ")
 	if p, err := resolveEngineBin(engineGrok); err == nil {
-		fmt.Printf("✅ %s (optional; /engine grok)\n", p)
+		fmt.Printf("✅ %s (optional; /account add <id> grok)\n", p)
 	} else {
-		fmt.Println("— not found (optional; needed for grok bots)")
-		fmt.Println("   Install Grok Build to ~/.grok/bin/grok, then: grok login")
-		fmt.Println("   On a VM: grok login --device-auth")
+		fmt.Println("— not found (optional; needed for grok accounts)")
+		fmt.Println("   Install Grok Build to ~/.grok/bin/grok, then: /account add work grok")
+		fmt.Println("   (isolated GROK_HOME; ccc drives grok login --device-auth)")
 	}
 
 	fmt.Print("agy............... ")
 	if p, err := resolveEngineBin(engineAntigravity); err == nil {
-		fmt.Printf("✅ %s (optional; /engine antigravity)\n", p)
+		fmt.Printf("✅ %s (optional; /account add <id> agy)\n", p)
 	} else {
-		fmt.Println("— not found (optional; needed for antigravity bots)")
-		fmt.Println("   Install Antigravity CLI to ~/.local/bin/agy, then authenticate with an interactive agy session")
+		fmt.Println("— not found (optional; needed for antigravity accounts)")
+		fmt.Println("   Install Antigravity CLI to ~/.local/bin/agy, then: /account add lab agy")
 	}
 
 	if !doctorProfiles(fix) {
@@ -353,8 +353,8 @@ COMMANDS:
     doctor [--fix]          Check dependencies and configuration; --fix also
                             records the bypass disclaimer for every account
     maintain                Run the daily growth-control job once, now
-    profile <cmd>           Manage Claude accounts (list/add/remove/default/
-                            login/accept-disclaimer)
+    profile <cmd>           Manage accounts (list/add/remove/default/
+                            login/accept-disclaimer); engine is set at add
     mcp --bot <id>          MCP server for one turn (spawned by Claude Code)
     send <file>             Send a file into the topic of the bot owning this directory
     relay [port]            Relay server for files over 50 MB (default port: 8080)
@@ -362,10 +362,11 @@ COMMANDS:
 TELEGRAM (in the forum group):
     Text in General         Create a new bot from your message
     Text in a bot's topic   Talk to that bot
-    /role /new /stop /cwd /engine /memory /forget /watches /schedules   per bot
+    /role /new /stop /cwd /memory /forget /watches /schedules           per bot
+    /engine                 assign this bot to an engine's account pool
     /bots /status /usage                                        anywhere
     /memory stats|restore <id>                                  memory upkeep
-    /account /access /model /setgroup                           owner only
+    /account add <id> <engine> /access /model /setgroup         owner only
 
 FLAGS:
     -h, --help              Show this help

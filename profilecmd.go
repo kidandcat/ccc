@@ -9,8 +9,8 @@ import (
 	"time"
 )
 
-// `ccc profile …` — manage the Claude accounts ccc dispatches under, plus the
-// doctor section and the Telegram-side rendering of the same table.
+// `ccc profile …` — manage the accounts ccc dispatches under (engine is set at
+// add), plus the doctor section and the Telegram-side rendering of the same table.
 
 func profileCommand(args []string) error {
 	if len(args) == 0 {
@@ -23,17 +23,30 @@ func profileCommand(args []string) error {
 		return nil
 	case "add":
 		if len(args) < 3 {
-			return fmt.Errorf("usage: ccc profile add <name> <config_dir> [--label <label>]")
+			return fmt.Errorf("usage: ccc profile add <name> <config_dir> [--engine claude|grok|agy] [--label <label>]")
 		}
 		label := ""
+		engine := engineClaude
 		rest := args[3:]
 		for i := 0; i < len(rest); i++ {
-			if rest[i] == "--label" && i+1 < len(rest) {
-				label = rest[i+1]
-				i++
+			switch rest[i] {
+			case "--label":
+				if i+1 < len(rest) {
+					label = rest[i+1]
+					i++
+				}
+			case "--engine":
+				if i+1 < len(rest) {
+					e, err := parseEngine(rest[i+1])
+					if err != nil {
+						return err
+					}
+					engine = e
+					i++
+				}
 			}
 		}
-		return profileAdd(args[1], args[2], label)
+		return profileAdd(args[1], args[2], label, engine)
 	case "remove", "rm":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: ccc profile remove <name>")
@@ -61,22 +74,20 @@ func profileCommand(args []string) error {
 }
 
 func printProfileUsage() {
-	fmt.Println(`ccc profile - manage the Claude accounts ccc runs agents under.
+	fmt.Println(`ccc profile - manage the accounts ccc runs agents under.
 
-Each profile is one CLAUDE_CONFIG_DIR: its own credentials, .claude.json and
-settings.json. Profiles share <data_dir>/projects, so any account can resume
-any bot's conversation; ccc picks one per turn (DESIGN §4).
+Engine is set when the account is added. Claude profiles are one
+CLAUDE_CONFIG_DIR; Grok profiles are an isolated GROK_HOME; Antigravity
+profiles are an isolated HOME. Failover stays inside one engine.
 
-A profile is named by the email of the Claude account behind it — that is what
-/account shows and takes in Telegram. The CLI also accepts the legacy name a
-profile was registered under before, for as long as it is still keyed by it.
+Telegram: /account add <identity> <engine>
 
     ccc profile list                              Show profiles, usage and login state
-    ccc profile add <email> <dir> [--label X]     Register a profile (creates dir)
-    ccc profile remove <email>                    Unregister an unused profile
-    ccc profile default <email>                   Set the profile for new sessions
-    ccc profile login <email>                     Run 'claude auth login' for it (interactive)
-    ccc profile accept-disclaimer <email>         Record the bypass-permissions disclaimer for it`)
+    ccc profile add <id> <dir> [--engine E] [--label X]
+    ccc profile remove <id>                       Unregister an unused profile
+    ccc profile default <id>                      Set the default account (new bots inherit its engine)
+    ccc profile login <id>                        Run that engine's login (interactive)
+    ccc profile accept-disclaimer <id>            Record the Claude bypass-permissions disclaimer`)
 }
 
 // loadConfigOrNil returns the config, or nil when there is none — every profile
@@ -135,7 +146,7 @@ func renderProfileTable(config *Config, probeLogin bool) string {
 	rows := collectProfileRows(config, probeLogin)
 	def := defaultProfile(config).Name
 	var sb strings.Builder
-	header := []string{"ACCOUNT", "LABEL", "CONFIG DIR", "5h", "7d", "TURNS", "LOGIN"}
+	header := []string{"ACCOUNT", "ENGINE", "LABEL", "CONFIG DIR", "5h", "7d", "TURNS", "LOGIN"}
 	table := [][]string{header}
 	for _, r := range rows {
 		name := r.Profile.Name
@@ -158,6 +169,7 @@ func renderProfileTable(config *Config, probeLogin bool) string {
 		working := fmt.Sprintf("%d", r.RunningTurns)
 		table = append(table, []string{
 			name,
+			profileEngine(r.Profile),
 			orDash(r.Profile.Label),
 			r.Profile.ConfigDir,
 			pct(r.Usage.FiveHour, r.Usage.FiveHourKnown),
@@ -200,7 +212,7 @@ func orDash(s string) string {
 	return s
 }
 
-func profileAdd(name, dir, label string) error {
+func profileAdd(name, dir, label, engine string) error {
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("profile name cannot be empty")
 	}
@@ -234,17 +246,23 @@ func profileAdd(name, dir, label string) error {
 			config.DefaultProfile = defaultProfileName
 		}
 	}
-	config.Profiles[name] = &Profile{ConfigDir: dir, Label: label}
+	engine, err = parseEngine(engine)
+	if err != nil {
+		return err
+	}
+	config.Profiles[name] = &Profile{Engine: engine, ConfigDir: dir, Label: label}
 	if config.DefaultProfile == "" {
 		config.DefaultProfile = name
 	}
 	if err := saveConfig(config); err != nil {
 		return err
 	}
-	fmt.Printf("✅ profile %q → %s\n", name, dir)
-	if accepted, known := bypassAccepted(Profile{Name: name, ConfigDir: dir}); !accepted {
-		if known {
-			fmt.Printf("⚠️  bypass-permissions disclaimer not accepted for this profile.\n   %s\n", bypassDisclaimerHint(Profile{Name: name, ConfigDir: dir}))
+	fmt.Printf("✅ profile %q (%s) → %s\n", name, engine, dir)
+	if engine == engineClaude {
+		if accepted, known := bypassAccepted(Profile{Name: name, Engine: engine, ConfigDir: dir}); !accepted {
+			if known {
+				fmt.Printf("⚠️  bypass-permissions disclaimer not accepted for this profile.\n   %s\n", bypassDisclaimerHint(Profile{Name: name, Engine: engine, ConfigDir: dir}))
+			}
 		}
 	}
 	fmt.Printf("Next: ccc profile login %s\n", name)
@@ -303,24 +321,42 @@ func profileSetDefault(name string) error {
 	return nil
 }
 
-// profileLogin hands the terminal to `claude auth login` under the profile's
-// scrubbed environment. It is interactive by design: ccc never handles
+// profileLogin hands the terminal to that engine's login under the account's
+// isolated environment. It is interactive by design: ccc never handles
 // credentials itself.
 func profileLogin(name string) error {
 	p, ok := profileByName(loadConfigOrNil(), name)
 	if !ok {
 		return fmt.Errorf("no such profile: %s", name)
 	}
-	if err := os.MkdirAll(claudeHome(p), 0700); err != nil {
+	home := engineHome(p)
+	if err := os.MkdirAll(home, 0700); err != nil {
 		return err
 	}
-	fmt.Printf("Logging in profile %q (CLAUDE_CONFIG_DIR=%s)…\n", p.Name, claudeHome(p))
-	cmd := exec.Command(claudeBin(), "auth", "login")
-	cmd.Env = claudeEnv(p)
+	bin, args, err := loginCLIArgs(p)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Logging in profile %q (%s)…\n", p.Name, profileEngine(p))
+	cmd := exec.Command(bin, args...)
+	cmd.Env = engineEnv(nil, profileEngine(p), p)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func loginCLIArgs(p Profile) (string, []string, error) {
+	switch profileEngine(p) {
+	case engineGrok:
+		bin, err := resolveEngineBin(engineGrok)
+		return bin, []string{"login", "--device-auth"}, err
+	case engineAntigravity:
+		bin, err := resolveEngineBin(engineAntigravity)
+		return bin, []string{"auth", "login"}, err
+	default:
+		return claudeBin(), []string{"auth", "login"}, nil
+	}
 }
 
 // profileAcceptDisclaimer records the bypass-permissions disclaimer for one
@@ -357,13 +393,14 @@ func doctorProfiles(fix bool) bool {
 		if p.Name == def {
 			marker = " (default)"
 		}
-		fmt.Printf("  %s%s\n", p.Name, marker)
+		fmt.Printf("  %s%s (%s)\n", p.Name, marker, profileEngine(p))
 
 		fmt.Printf("    config dir.... ")
-		if st, err := os.Stat(claudeHome(p)); err == nil && st.IsDir() {
-			fmt.Printf("✅ %s\n", claudeHome(p))
+		home := engineHome(p)
+		if st, err := os.Stat(home); err == nil && st.IsDir() {
+			fmt.Printf("✅ %s\n", home)
 		} else {
-			fmt.Printf("❌ %s (missing)\n", claudeHome(p))
+			fmt.Printf("❌ %s (missing)\n", home)
 			ok = false
 		}
 
@@ -386,6 +423,9 @@ func doctorProfiles(fix bool) bool {
 			ok = false
 		}
 
+		if profileEngine(p) != engineClaude {
+			continue
+		}
 		// The bypass-permissions disclaimer is accepted ONCE PER CONFIG DIR,
 		// as one settings.json key ccc writes itself (acceptBypassDisclaimer).
 		// Without it `--permission-mode bypassPermissions` is refused, so an

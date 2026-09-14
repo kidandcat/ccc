@@ -14,33 +14,38 @@ import (
 	"time"
 )
 
-// Multi-profile support: one ccc can drive several Claude accounts at once.
+// Multi-profile support: one ccc can drive several accounts at once, mixing
+// engines in the same instance (Claude + Grok + Antigravity).
 //
-// A profile is just a CLAUDE_CONFIG_DIR. That env var fully scopes a Claude
-// Code installation: credentials (the macOS Keychain service name gets a hash
-// suffix derived from the dir), .claude.json, projects/ and settings.json all
-// move with it. Everything ccc reads off disk or asks the CLI for must
-// therefore be addressed per profile.
+// Engine is a property of the account, set when it is added — not a per-bot
+// toggle. A Claude profile is a CLAUDE_CONFIG_DIR (credentials, .claude.json,
+// projects/ and settings.json). A Grok profile is an isolated GROK_HOME
+// (auth.json). An Antigravity profile is an isolated HOME so ~/.gemini stays
+// off the real user home and off Claude's config dirs.
 //
-// v3 deliberately points every profile's projects/ at the SAME shared
-// directory (DESIGN §4), so a turn that fails over to another account can
-// resume the same conversation UUID.
+// Claude profiles of an instance still share projects/ (DESIGN §4) so failover
+// can resume the same conversation UUID. Failover stays inside one engine.
 //
-// Verified against Claude Code 2.1.270.
+// Verified against Claude Code 2.1.270. Grok isolation is the documented
+// GROK_HOME. Antigravity has no official profile selector; isolation is HOME +
+// GEMINI_HOME + GEMINI_FORCE_FILE_STORAGE (file token, not the OS keyring).
 
 // defaultProfileName is the name of the synthesized profile used when the user
 // has not configured any. It keeps single-account setups working unchanged.
 const defaultProfileName = "default"
 
-// Profile is one Claude account sandbox.
+// Profile is one account sandbox: a Claude CLAUDE_CONFIG_DIR, a Grok
+// GROK_HOME, or an isolated Antigravity HOME. Engine is set at add time.
 type Profile struct {
 	// Name is the config-map key; it is not stored inside the object.
 	Name string `json:"-"`
-	// ConfigDir is the value of CLAUDE_CONFIG_DIR for this profile. An EMPTY
-	// config_dir means "whatever claude uses by default" — ccc then passes no
-	// CLAUDE_CONFIG_DIR at all. That distinction matters: setting the variable
-	// to ~/.claude is NOT the same as leaving it unset, because claude then
-	// starts a fresh <dir>/.claude.json instead of using ~/.claude.json.
+	// Engine is claude, grok or antigravity. Empty means Claude so existing
+	// config.json entries stay backward compatible.
+	Engine string `json:"engine,omitempty"`
+	// ConfigDir is the isolated home for this account. Claude: CLAUDE_CONFIG_DIR
+	// (empty = claude's own default layout). Grok: GROK_HOME. Antigravity: the
+	// HOME the agy child runs with. An EMPTY config_dir means "whatever that
+	// CLI uses by default" — ccc then sets no isolation variable.
 	ConfigDir string `json:"config_dir"`
 	// Label is a human hint (usually the account email). Cosmetic only.
 	Label string `json:"label,omitempty"`
@@ -49,6 +54,16 @@ type Profile struct {
 	// the var was already set in ccc's own environment at startup), so a
 	// single-account install behaves exactly as it did before profiles existed.
 	Implicit bool `json:"-"`
+}
+
+// profileEngine is the engine this account was registered for. Empty or
+// unknown values are Claude so a hand-edited config cannot break dispatch.
+func profileEngine(p Profile) string {
+	e, err := parseEngine(p.Engine)
+	if err != nil {
+		return engineClaude
+	}
+	return e
 }
 
 // inheritedConfigDir is $CLAUDE_CONFIG_DIR as it was when ccc started, captured
@@ -71,7 +86,19 @@ func implicitProfile() Profile {
 		// ccc was started with an explicit dir — pass it through to children.
 		implicit = false
 	}
-	return Profile{Name: defaultProfileName, ConfigDir: dir, Implicit: implicit}
+	return Profile{Name: defaultProfileName, Engine: engineClaude, ConfigDir: dir, Implicit: implicit}
+}
+
+// implicitAccount is the fallback when a bot's engine has no registered
+// accounts: Claude's implicit profile, or a machine-default Grok/Antigravity
+// home. That keeps `/engine grok` working before any grok account is added,
+// and lets existing tests spawn grok/agy against the CLI on PATH.
+func implicitAccount(engine string) Profile {
+	engine, err := parseEngine(engine)
+	if err != nil || engine == engineClaude {
+		return implicitProfile()
+	}
+	return Profile{Name: engine, Engine: engine, Implicit: true}
 }
 
 // listProfiles returns every configured profile sorted by name, or the single
@@ -91,13 +118,18 @@ func listProfiles(config *Config) []Profile {
 		if p == nil {
 			continue
 		}
+		engine := profileEngine(*p)
 		if strings.TrimSpace(p.ConfigDir) == "" {
-			// Explicitly registered, but pinned to claude's own default layout.
-			imp := implicitProfile()
-			out = append(out, Profile{Name: name, ConfigDir: imp.ConfigDir, Label: p.Label, Implicit: imp.Implicit})
+			if engine == engineClaude {
+				// Explicitly registered, but pinned to claude's own default layout.
+				imp := implicitProfile()
+				out = append(out, Profile{Name: name, Engine: engineClaude, ConfigDir: imp.ConfigDir, Label: p.Label, Implicit: imp.Implicit})
+				continue
+			}
+			out = append(out, Profile{Name: name, Engine: engine, Label: p.Label, Implicit: true})
 			continue
 		}
-		out = append(out, Profile{Name: name, ConfigDir: expandPath(p.ConfigDir), Label: p.Label})
+		out = append(out, Profile{Name: name, Engine: engine, ConfigDir: expandPath(p.ConfigDir), Label: p.Label})
 	}
 	if len(out) == 0 {
 		return []Profile{implicitProfile()}
@@ -147,9 +179,36 @@ var accountEmailRe = regexp.MustCompile(`^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$`)
 // isAccountEmail reports whether s is plausibly an email address.
 func isAccountEmail(s string) bool { return accountEmailRe.MatchString(strings.TrimSpace(s)) }
 
+// accountIdentityRe is the shape non-Claude identities accept: a short name or
+// email, no spaces or path separators. Claude still requires a real email.
+var accountIdentityRe = regexp.MustCompile(`^[A-Za-z0-9._@+-][A-Za-z0-9._@+-]{0,63}$`)
+
+// isAccountIdentity reports whether s is a usable account key for grok/agy.
+func isAccountIdentity(s string) bool { return accountIdentityRe.MatchString(strings.TrimSpace(s)) }
+
 // normalizeEmail is the canonical form of an account key: addresses are
 // case-insensitive in practice and the config map is not.
 func normalizeEmail(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
+
+// normalizeAccountKey is the config-map key for an identity. Claude stays
+// email-canonical; other engines are just lowercased.
+func normalizeAccountKey(identity, engine string) string {
+	identity = strings.TrimSpace(identity)
+	if profileEngine(Profile{Engine: engine}) == engineClaude {
+		return normalizeEmail(identity)
+	}
+	return strings.ToLower(identity)
+}
+
+// knownEngineName reports whether s is an engine name or alias (not empty).
+func knownEngineName(s string) (string, bool) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return "", false
+	}
+	e, err := parseEngine(s)
+	return e, err == nil
+}
 
 // profileDirName turns an email into a filesystem-safe directory name
 // ("jairo@agentero.com" -> "jairo_at_agentero.com"). It exists only so a
@@ -236,6 +295,83 @@ func profileDirFor(config *Config, email string) string {
 		dir = filepath.Join(root, fmt.Sprintf("%s-%d", base, i))
 	}
 	return dir
+}
+
+// accountDirFor picks the isolated home for a new account. Claude keeps the
+// existing <data_dir>/profiles/<email> layout. Grok and Antigravity live under
+// <data_dir>/accounts/<engine>/<identity> so their credentials never share a
+// directory with Claude profiles or with each other.
+func accountDirFor(config *Config, engine, identity string) string {
+	engine, err := parseEngine(engine)
+	if err != nil || engine == engineClaude {
+		return profileDirFor(config, identity)
+	}
+	root := filepath.Join(dataDir(config), "accounts", engine)
+	base := profileDirName(identity)
+	taken := map[string]bool{}
+	for _, p := range listProfiles(config) {
+		if p.ConfigDir != "" {
+			taken[p.ConfigDir] = true
+		}
+	}
+	dir := filepath.Join(root, base)
+	for i := 2; taken[dir]; i++ {
+		dir = filepath.Join(root, fmt.Sprintf("%s-%d", base, i))
+	}
+	return dir
+}
+
+// engineHome is the on-disk root a turn or login uses for this account.
+// Claude: CLAUDE_CONFIG_DIR. Grok: GROK_HOME (default ~/.grok). Antigravity:
+// isolated HOME (default the real user home).
+func engineHome(p Profile) string {
+	switch profileEngine(p) {
+	case engineGrok:
+		if p.ConfigDir != "" {
+			return p.ConfigDir
+		}
+		home, _ := os.UserHomeDir() // safe-ignore: empty home yields a relative .grok path, same fallback as implicitProfile
+		return filepath.Join(home, ".grok")
+	case engineAntigravity:
+		if p.ConfigDir != "" {
+			return p.ConfigDir
+		}
+		home, _ := os.UserHomeDir() // safe-ignore: empty home yields the process cwd, the least-bad machine default
+		return home
+	default:
+		return claudeHome(p)
+	}
+}
+
+// listProfilesForEngine is the account pool a turn of this engine may use.
+func listProfilesForEngine(config *Config, engine string) []Profile {
+	engine, err := parseEngine(engine)
+	if err != nil {
+		engine = engineClaude
+	}
+	var out []Profile
+	for _, p := range listProfiles(config) {
+		if profileEngine(p) == engine {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// configuredEngines lists distinct engines that have a registered account.
+func configuredEngines(config *Config) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range listProfiles(config) {
+		e := profileEngine(p)
+		if seen[e] {
+			continue
+		}
+		seen[e] = true
+		out = append(out, e)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // defaultProfile is the profile new sessions fall back to: config.DefaultProfile
@@ -430,6 +566,7 @@ func clampPercent(v int) int {
 // Keeping it a plain value makes chooseProfile a pure, unit-testable function.
 type profileStat struct {
 	Name          string
+	Engine        string
 	FiveHour      int
 	SevenDay      int
 	WorkingAgents int
@@ -530,6 +667,7 @@ func collectProfileStats(config *Config, working map[string]int, now time.Time) 
 		u := readProfileUsage(p)
 		stats = append(stats, profileStat{
 			Name:          p.Name,
+			Engine:        profileEngine(p),
 			FiveHour:      u.FiveHour,
 			SevenDay:      u.SevenDay,
 			WorkingAgents: working[p.Name],
@@ -692,10 +830,26 @@ func isStaleTokenError(s string) bool {
 	return strings.Contains(s, staleTokenMsg)
 }
 
-// profileLoggedIn asks the CLI whether a profile is authenticated. It uses the
-// scrubbed environment so the answer is about the profile's own credentials and
-// not about whatever OAuth state ccc's parent process leaked in.
+// grokAuthJSON is $GROK_HOME/auth.json — the file `grok login` writes.
+func grokAuthJSON(p Profile) string { return filepath.Join(engineHome(p), "auth.json") }
+
+// agyOAuthToken is the file-store token agy writes when
+// GEMINI_FORCE_FILE_STORAGE=true (headless / no keyring).
+func agyOAuthToken(p Profile) string {
+	return filepath.Join(engineHome(p), ".gemini", "antigravity-cli", "antigravity-oauth-token")
+}
+
+// profileLoggedIn asks whether a profile is authenticated. Claude uses
+// `claude auth status --json`. Grok looks at $GROK_HOME/auth.json. Antigravity
+// looks at the isolated ~/.gemini token file. The answer is about THIS
+// account's credentials, not a parent process leak.
 func profileLoggedIn(p Profile) (loggedIn bool, account string, err error) {
+	switch profileEngine(p) {
+	case engineGrok:
+		return grokLoggedIn(p)
+	case engineAntigravity:
+		return agyLoggedIn(p)
+	}
 	// `auth status --json` exits 1 for a logged-out config dir while still
 	// printing its JSON, so the payload is authoritative and the exit code is
 	// only a fallback for "the command did not run at all".
@@ -716,4 +870,62 @@ func profileLoggedIn(p Profile) (loggedIn bool, account string, err error) {
 		acct = st.Account
 	}
 	return st.LoggedIn, acct, nil
+}
+
+// grokLoggedIn reports whether $GROK_HOME/auth.json exists and looks like a
+// session. The file is the authority: `grok login` writes it, and ccc never
+// invents credentials.
+func grokLoggedIn(p Profile) (bool, string, error) {
+	data, err := os.ReadFile(grokAuthJSON(p))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, "", nil
+		}
+		return false, "", err
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return false, "", nil
+	}
+	return true, accountHintFromJSON(data), nil
+}
+
+// agyLoggedIn reports whether the isolated HOME has a file-store OAuth token.
+// agy also keeps google_accounts.json under ~/.gemini; either is enough to
+// treat the account as logged in.
+func agyLoggedIn(p Profile) (bool, string, error) {
+	home := engineHome(p)
+	for _, rel := range []string{
+		filepath.Join(".gemini", "antigravity-cli", "antigravity-oauth-token"),
+		filepath.Join(".gemini", "oauth_creds.json"),
+		filepath.Join(".gemini", "google_accounts.json"),
+	} {
+		data, err := os.ReadFile(filepath.Join(home, rel))
+		if err != nil {
+			continue
+		}
+		if len(strings.TrimSpace(string(data))) == 0 {
+			continue
+		}
+		return true, accountHintFromJSON(data), nil
+	}
+	return false, "", nil
+}
+
+// accountHintFromJSON picks an email-looking field out of an auth blob so the
+// status card can show more than the identity the owner typed. Missing or
+// unlike-email values are fine: the account key is still the identity.
+func accountHintFromJSON(data []byte) string {
+	var blob map[string]any
+	if json.Unmarshal(data, &blob) != nil {
+		return ""
+	}
+	for _, key := range []string{"email", "account", "user", "username", "login"} {
+		if s, ok := blob[key].(string); ok {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				return s
+			}
+		}
+	}
+	return ""
 }

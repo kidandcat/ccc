@@ -26,8 +26,8 @@ bot.
 | Concept | Definition |
 |---|---|
 | **Instance** | One `ccc listen` process on one machine, bound to one Telegram bot token and one forum group. Instance-level config: model, env passthrough, default profile, data dir. |
-| **Profile** | One Claude account = one `CLAUDE_CONFIG_DIR` (see `profiles.go`). Two profiles per instance is the normal case. Profiles are interchangeable at turn granularity (§4). |
-| **Bot** | One forum topic. Identity = `name` + `role` (free text set with `/role`) + its own memory scope + an **engine** (`claude` default, or `grok` / `antigravity`). Claude bots share MCP tools, the system prompt template, the instance model and env. Grok/Antigravity bots spawn that CLI instead and do not get ccc MCP. Optional per-bot `cwd` (default: `<data_dir>/bots/<name>/workspace`). |
+| **Profile** | One account for one engine (see `profiles.go`). Claude = one `CLAUDE_CONFIG_DIR`. Grok = isolated `GROK_HOME`. Antigravity = isolated HOME/`GEMINI_HOME`. Engine is set when the account is added. Same-engine accounts are interchangeable at turn granularity (§4). One instance may mix engines. |
+| **Bot** | One forum topic. Identity = `name` + `role` (free text set with `/role`) + its own memory scope + an **engine** derived from the default account (or `default_engine`). Turns pick a healthy account of that engine. `/engine` is a secondary pool assignment. Claude bots share MCP tools. Grok/Antigravity bots spawn that CLI and do not get ccc MCP. Optional per-bot `cwd` (default: `<data_dir>/bots/<name>/workspace`). |
 | **Session** | The Claude Code conversation behind a bot: a UUID ccc mints and resumes. A bot has exactly one live session; `/new` rotates it. |
 | **Turn** | One `claude -p` process: input = one user/bot/system message (plus context envelope), output = streamed events until `result`. At most one turn per bot at a time; further inputs queue (FIFO) and are delivered together on the next turn. |
 
@@ -123,10 +123,11 @@ A retried turn reuses the same session UUID: because profiles share
 
 ## 4. Profiles: selection and shared sessions
 
-- `pickProfile()` chooses per **turn**: lowest cached 5-hour utilization,
-  tie-break fewer turns currently running on that account (read from
-  `turns.status = running`, §14.6), then name; excludes profiles in cooldown or
-  `needs_login`.
+- `pickAccount(engine)` chooses per **turn** among accounts of that engine:
+  lowest cached 5-hour utilization (Claude), tie-break fewer turns currently
+  running on that account (read from `turns.status = running`, §14.6), then
+  name; excludes profiles in cooldown or `needs_login`. Failover never crosses
+  engines (Claude↔Claude, Grok↔Grok) unless a future design documents it.
 - **Shared sessions**: all profiles of an instance point their `projects/` at
   the same directory (`<data_dir>/projects`, symlinked into each config dir by
   `ccc` when a profile is added; for the implicit `~/.claude` profile the
@@ -305,14 +306,14 @@ older than 90 days.
 | `/new` | topic | Rotate the session (fresh conversation, memory kept). |
 | `/stop` | topic | Kill the running turn (SIGTERM the `claude` process), drop the queue. |
 | `/cwd [path]` | topic | Show or set the bot's working dir. |
-| `/engine [name]` | topic | Show or set the bot's engine (`claude`, `grok`/`grok-build`, `antigravity`/`agy`). Rotates the session. New bots take `default_engine` from config.json (default `claude`). |
+| `/engine [name]` | topic | Secondary: assign this bot to an engine's account pool (`claude`, `grok`/`grok-build`, `antigravity`/`agy`). Rotates the session. Engine itself is set at `/account add`. New bots inherit the default account's engine, or `default_engine` if set. |
 | `/memory [query]` | topic | List/search memories visible to this bot; `/forget <scope> <key>`. |
 | `/memory stats` | topic | Per scope: entries, bytes, whether it is over the compaction threshold, last compaction (§7.1). |
 | `/memory restore <id>` | topic | Undo one compaction. Owner only. |
 | `/usage` | anywhere | Tokens, cache hit ratio, turns, average duration and cost per bot, today and last 7 days (§14.19). |
 | `/watches`, `/schedules` | topic | List and cancel. |
 | `/bots` | anywhere | Table of bots, status, last activity. |
-| `/account` | anywhere | Status card per account with buttons; subcommands `status`, `add <email>`, `login <email>`, `remove <email>`, `default <email>`. |
+| `/account` | anywhere | Status card per account (engine + health) with buttons; subcommands `status`, `add <identity> <engine>`, `login`, `remove`, `default`. |
 | `/model [name]` | anywhere | Show/set the instance model. |
 | `/access` | anywhere | Pairing/allowlist management (below). Owner only. |
 | `/watches`, `/schedules` | topic | List and cancel (also listed above). |
@@ -320,8 +321,10 @@ older than 90 days.
 | `/status` | anywhere | Instance health: profiles, running turns, queue, doctor findings. |
 
 ### Account management from Telegram (login without a terminal)
-An account is addressed by the **email** of the Claude account behind it, never
-by a name the owner invents and never by the directory it lives in:
+Engine is defined when the account is added (`/account add <identity> <engine>`),
+not by flipping `/engine` on a bot. Claude identities are the **email** of the
+Claude account; Grok and Antigravity accept a short name or email. The
+directory behind the account is never shown:
 
 - The profile key in `config.json` is the address, lowercased. The config dir is
   derived from it (`jairo@agentero.com` → `<data_dir>/profiles/jairo_at_agentero.com`)
