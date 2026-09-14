@@ -27,7 +27,7 @@ bot.
 |---|---|
 | **Instance** | One `ccc listen` process on one machine, bound to one Telegram bot token and one forum group. Instance-level config: model, env passthrough, default profile, data dir. |
 | **Profile** | One Claude account = one `CLAUDE_CONFIG_DIR` (see `profiles.go`). Two profiles per instance is the normal case. Profiles are interchangeable at turn granularity (§4). |
-| **Bot** | One forum topic. Identity = `name` + `role` (free text set with `/role`) + its own memory scope. All bots share the same tools, system prompt template, model and env. Optional per-bot `cwd` (default: `<data_dir>/bots/<name>/workspace`). |
+| **Bot** | One forum topic. Identity = `name` + `role` (free text set with `/role`) + its own memory scope + an **engine** (`claude` default, or `grok` / `antigravity`). Claude bots share MCP tools, the system prompt template, the instance model and env. Grok/Antigravity bots spawn that CLI instead and do not get ccc MCP. Optional per-bot `cwd` (default: `<data_dir>/bots/<name>/workspace`). |
 | **Session** | The Claude Code conversation behind a bot: a UUID ccc mints and resumes. A bot has exactly one live session; `/new` rotates it. |
 | **Turn** | One `claude -p` process: input = one user/bot/system message (plus context envelope), output = streamed events until `result`. At most one turn per bot at a time; further inputs queue (FIFO) and are delivered together on the next turn. |
 
@@ -38,7 +38,8 @@ input (Telegram text | inbox message | schedule | watch diff)
   → enqueue(bot)                       (SQLite: turns.status=queued)
   → pick profile                       (§4)
   → build envelope                     (§9)
-  → spawn: claude -p <flags>           (§3.1) with claudeEnv(profile)
+  → spawn: engine CLI                  (§3.1) Claude: claude -p + claudeEnv(profile);
+                                       Grok: grok --single; Antigravity: agy --print
   → consume stream-json                (§3.2) → Telegram progress message
   → on result: persist, post final text, run post-turn hooks (§3.3)
   → on failure: classify (§3.4) → retry on the other profile or surface
@@ -138,8 +139,8 @@ A retried turn reuses the same session UUID: because profiles share
 ## 5. Data model (SQLite via GORM, `<data_dir>/ccc.db`, WAL, FK on)
 
 ```
-bots        id, name (unique), topic_id, role (text), cwd, session_id, status (idle|running|waiting|disabled),
-            created_at, archived_at, parent_bot_id (for spawned workers)
+bots        id, name (unique), topic_id, role (text), cwd, session_id, engine (claude|grok|antigravity, default claude),
+            status (idle|running|waiting|disabled), created_at, archived_at, parent_bot_id (for spawned workers)
 turns       id, bot_id, session_id, profile, source (user|bot|schedule|watch|system), input (text),
             output (text), status (queued|running|done|failed), stop_reason, error_class,
             started_at, ended_at, usage_json
@@ -304,6 +305,7 @@ older than 90 days.
 | `/new` | topic | Rotate the session (fresh conversation, memory kept). |
 | `/stop` | topic | Kill the running turn (SIGTERM the `claude` process), drop the queue. |
 | `/cwd [path]` | topic | Show or set the bot's working dir. |
+| `/engine [name]` | topic | Show or set the bot's engine (`claude`, `grok`/`grok-build`, `antigravity`/`agy`). Rotates the session. New bots take `default_engine` from config.json (default `claude`). |
 | `/memory [query]` | topic | List/search memories visible to this bot; `/forget <scope> <key>`. |
 | `/memory stats` | topic | Per scope: entries, bytes, whether it is over the compaction threshold, last compaction (§7.1). |
 | `/memory restore <id>` | topic | Undo one compaction. Owner only. |

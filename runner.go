@@ -470,24 +470,30 @@ func (r *Runner) execute(b *Bot, t *Turn, input string, triggers []int64) {
 	var res *streamResult
 	var class string
 	var lastErr string
+	engine := botEngine(b)
 
 	for attempt := 0; attempt < 3; attempt++ {
-		p, ok := r.pickProfileExcluding(tried)
-		if !ok {
-			class = errFatal
-			lastErr = "no healthy Claude profile available"
-			break
+		var p Profile
+		if engine == engineClaude {
+			var ok bool
+			p, ok = r.pickProfileExcluding(tried)
+			if !ok {
+				class = errFatal
+				lastErr = "no healthy Claude profile available"
+				break
+			}
+			tried[p.Name] = true
+			r.db.Model(&Turn{}).Where("id = ?", t.ID).Update("profile", p.Name)
+		} else {
+			// Grok and Antigravity do not use the Claude profile pool. The
+			// turn.profile column still wants a label for /usage.
+			r.db.Model(&Turn{}).Where("id = ?", t.ID).Update("profile", engine)
 		}
-		tried[p.Name] = true
-		r.db.Model(&Turn{}).Where("id = ?", t.ID).Update("profile", p.Name)
 
 		sessionID, resume := r.sessionFor(b)
 		res = r.spawn(p, b, t, sessionID, resume, envelope, prog)
 		if res.ok() {
-			if !resume {
-				r.db.Model(&Bot{}).Where("id = ?", b.ID).Update("session_id", sessionID)
-				b.SessionID = sessionID
-			}
+			r.persistSession(b, sessionID, resume, res)
 			class = ""
 			break
 		}
@@ -498,7 +504,11 @@ func (r *Runner) execute(b *Bot, t *Turn, input string, triggers []int64) {
 		}
 		lastErr = res.failureText()
 		class = classifyFailure(lastErr, res.exitCode)
-		hookLog("turn %d on profile %s failed (%s): %s", t.ID, p.Name, class, truncate(lastErr, 300))
+		who := p.Name
+		if who == "" {
+			who = engine
+		}
+		hookLog("turn %d on %s failed (%s): %s", t.ID, who, class, truncate(lastErr, 300))
 
 		switch class {
 		case errSessionLost:
@@ -506,17 +516,27 @@ func (r *Runner) execute(b *Bot, t *Turn, input string, triggers []int64) {
 			// deleted). Start a fresh conversation rather than losing the turn.
 			r.db.Model(&Bot{}).Where("id = ?", b.ID).Update("session_id", "")
 			b.SessionID = ""
-			delete(tried, p.Name)
+			if engine == engineClaude {
+				delete(tried, p.Name)
+			}
 			continue
 		case errAuthStale:
-			r.markNeedsLogin(p)
-			continue
+			if engine == engineClaude {
+				r.markNeedsLogin(p)
+				continue
+			}
+			class = errFatal
 		case errRateLimited:
-			noteProfileLimit(p, time.Now())
-			continue
+			if engine == engineClaude {
+				noteProfileLimit(p, time.Now())
+				continue
+			}
+			class = errFatal
 		case errTransient:
 			time.Sleep(10 * time.Second)
-			delete(tried, p.Name)
+			if engine == engineClaude {
+				delete(tried, p.Name)
+			}
 			continue
 		default:
 			class = errFatal
@@ -613,13 +633,41 @@ func inboxInput(db *gorm.DB, m InboxMessage) string {
 	return fmt.Sprintf("Message from %s:\n%s", sender, m.Text)
 }
 
-// sessionFor returns the session UUID for the next turn and whether it is a
-// resume. A bot without a session gets a fresh UUID minted by ccc.
+// sessionFor returns the session id for the next turn and whether it is a
+// resume. Claude and Grok get a UUID minted by ccc. Antigravity mints its
+// own conversation_id on the first turn (captured from the stream), so an
+// empty id is left empty rather than inventing one agy would ignore.
 func (r *Runner) sessionFor(b *Bot) (string, bool) {
 	if strings.TrimSpace(b.SessionID) != "" {
 		return b.SessionID, true
 	}
+	if botEngine(b) == engineAntigravity {
+		return "", false
+	}
 	return newUUID(), false
+}
+
+// persistSession writes the conversation id after a successful turn. Claude
+// keeps the historical "mint on first turn, leave it on resume" write. Grok
+// is the same (ccc-minted UUID). Antigravity mints its own conversation_id,
+// which the stream parser puts on res.SessionID.
+func (r *Runner) persistSession(b *Bot, sessionID string, resume bool, res *streamResult) {
+	if botEngine(b) == engineClaude {
+		if !resume {
+			r.db.Model(&Bot{}).Where("id = ?", b.ID).Update("session_id", sessionID)
+			b.SessionID = sessionID
+		}
+		return
+	}
+	sid := sessionID
+	if res != nil && strings.TrimSpace(res.SessionID) != "" {
+		sid = res.SessionID
+	}
+	if sid == "" || (resume && strings.TrimSpace(b.SessionID) != "") {
+		return
+	}
+	r.db.Model(&Bot{}).Where("id = ?", b.ID).Update("session_id", sid)
+	b.SessionID = sid
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +679,9 @@ type streamResult struct {
 	Subtype   string
 	IsError   bool
 	UsageJSON string
+	// SessionID is captured from a CLI that mints its own conversation id
+	// (Antigravity). Claude and Grok use the UUID ccc passed in.
+	SessionID string
 	exitCode  int
 	stderr    string
 	spawnErr  error
@@ -653,12 +704,13 @@ func (s *streamResult) failureText() string {
 		parts = append(parts, s.Text)
 	}
 	if len(parts) == 0 {
-		parts = append(parts, fmt.Sprintf("claude exited %d with no output", s.exitCode))
+		parts = append(parts, fmt.Sprintf("engine exited %d with no output", s.exitCode))
 	}
 	return strings.Join(parts, "\n")
 }
 
-// spawn runs one `claude -p` process and consumes its event stream.
+// spawn runs one engine process (`claude -p`, `grok --single`, or `agy --print`)
+// and consumes its event stream.
 func (r *Runner) spawn(p Profile, b *Bot, t *Turn, sessionID string, resume bool, envelope string, prog *progress) *streamResult {
 	res := &streamResult{}
 	cfg := r.config()
@@ -671,16 +723,21 @@ func (r *Runner) spawn(p Profile, b *Bot, t *Turn, sessionID string, resume bool
 		return res
 	}
 	sysPrompt := renderSystemPrompt(
-		promptBot{Name: b.Name, Role: b.Role, Cwd: cwd}, hostnameOrUnknown(), botRoster(r.db, b.ID),
+		promptBot{Name: b.Name, Role: b.Role, Cwd: cwd, Engine: botEngine(b)}, hostnameOrUnknown(), botRoster(r.db, b.ID),
 		topicIconEmoji(topicIcons(r.db, r.config())))
-	mcpCfg := r.mcpConfigJSON(b.ID, t.ID)
+	mcpCfg := ""
+	if botEngine(b) == engineClaude {
+		mcpCfg = r.mcpConfigJSON(b.ID, t.ID)
+	}
+	spec, err := buildTurn(botEngine(b), p, cfg, mcpCfg, sessionID, sysPrompt, envelope, resume)
+	if err != nil {
+		res.spawnErr = err
+		return res
+	}
 
-	args := claudeTurnArgs(instanceModel(cfg), sysPrompt, mcpCfg, sessionID, resume)
-	args = append(args, envelope)
-
-	cmd := exec.Command(claudeBin(), args...)
+	cmd := exec.Command(spec.Bin, spec.Args...)
 	cmd.Dir = cwd
-	cmd.Env = botEnv(cfg, p)
+	cmd.Env = spec.Env
 	// Own process group: /stop must reach the whole tool tree, not just claude.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
@@ -702,8 +759,22 @@ func (r *Runner) spawn(p Profile, b *Bot, t *Turn, sessionID string, resume bool
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	sawJSON := false
+	var raw strings.Builder
 	for scanner.Scan() {
-		r.consumeEvent(scanner.Bytes(), res, prog)
+		line := scanner.Bytes()
+		if consumeTurnEvent(spec.Stream, line, res, prog) {
+			sawJSON = true
+			continue
+		}
+		if raw.Len() > 0 {
+			raw.WriteByte('\n')
+		}
+		raw.Write(line)
+	}
+	// An engine that only prints the final answer still delivers it.
+	if res.Text == "" && !sawJSON {
+		res.Text = strings.TrimSpace(raw.String())
 	}
 	waitErr := cmd.Wait()
 
@@ -729,11 +800,12 @@ func (r *Runner) spawn(p Profile, b *Bot, t *Turn, sessionID string, resume bool
 
 // streamEvent is the subset of the stream-json protocol ccc reads.
 type streamEvent struct {
-	Type    string          `json:"type"`
-	Subtype string          `json:"subtype"`
-	Result  string          `json:"result"`
-	IsError bool            `json:"is_error"`
-	Usage   json.RawMessage `json:"usage"`
+	Type      string          `json:"type"`
+	Subtype   string          `json:"subtype"`
+	SessionID string          `json:"session_id"`
+	Result    string          `json:"result"`
+	IsError   bool            `json:"is_error"`
+	Usage     json.RawMessage `json:"usage"`
 	// TotalCostUSD sits beside usage on the result event, not inside it. /usage
 	// wants both, so it is folded into the stored usage object (mergeUsage).
 	TotalCostUSD float64 `json:"total_cost_usd"`
@@ -747,10 +819,31 @@ type streamEvent struct {
 	} `json:"message"`
 }
 
+func consumeTurnEvent(kind streamKind, line []byte, res *streamResult, prog *progress) bool {
+	switch kind {
+	case streamAgy:
+		return consumeAgyEvent(line, res, prog)
+	case streamText:
+		return false
+	default:
+		return consumeClaudeEvent(line, res, prog)
+	}
+}
+
 func (r *Runner) consumeEvent(line []byte, res *streamResult, prog *progress) {
+	consumeClaudeEvent(line, res, prog) // safe-ignore: tests and the Claude stream treat a bad line as noise
+}
+
+func consumeClaudeEvent(line []byte, res *streamResult, prog *progress) bool {
 	var ev streamEvent
 	if err := json.Unmarshal(line, &ev); err != nil {
-		return // safe-ignore: non-JSON noise on stdout is not fatal to the turn
+		return false // safe-ignore: non-JSON noise on stdout is not fatal to the turn
+	}
+	if ev.Type == "" {
+		return false
+	}
+	if ev.SessionID != "" && res.SessionID == "" {
+		res.SessionID = ev.SessionID
 	}
 	switch ev.Type {
 	case "assistant":
@@ -771,6 +864,7 @@ func (r *Runner) consumeEvent(line []byte, res *streamResult, prog *progress) {
 		res.IsError = ev.IsError
 		res.UsageJSON = mergeUsage(ev.Usage, ev.TotalCostUSD)
 	}
+	return true
 }
 
 // mergeUsage stores the result event's usage object with the run's cost folded
@@ -890,6 +984,9 @@ func classifyFailure(text string, exitCode int) string {
 	case isStaleTokenError(text) ||
 		strings.Contains(l, "not logged in") ||
 		strings.Contains(l, "please run `claude login`") ||
+		strings.Contains(l, "please run `grok login`") ||
+		strings.Contains(l, "authentication required") ||
+		strings.Contains(l, "not authenticated") ||
 		strings.Contains(l, "invalid api key") ||
 		strings.Contains(l, "oauth token has expired") ||
 		strings.Contains(l, "authentication_error"):

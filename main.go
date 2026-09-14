@@ -23,6 +23,7 @@ type Config struct {
 	DefaultProfile    string              `json:"default_profile,omitempty"`    // profile used when selection has no better answer
 	DataDir           string              `json:"data_dir,omitempty"`           // runtime root (default ~/.local/share/ccc)
 	Model             string              `json:"model,omitempty"`              // model every bot runs on (default: claude's own)
+	DefaultEngine     string              `json:"default_engine,omitempty"`     // engine assigned to new bots (default: claude)
 	EnvPassthrough    []string            `json:"env_passthrough,omitempty"`    // extra env var names bots inherit (DESIGN §3.1)
 	// Tuning knobs. They are pointers where 0 is a meaningful value, so an
 	// absent key means "use the default" rather than "set it to zero".
@@ -298,7 +299,7 @@ func withDefaultNote(value string, isDefault bool) string {
 // configKeys are the keys `ccc config` understands. Secrets are never printed
 // back (DESIGN §12): the bot token reads as "configured".
 var configKeys = []string{"bot_token", "chat_id", "group_id", "model", "data_dir", "env_passthrough", "relay_url",
-	"transcription_lang", "default_profile", "debounce_ms", "compaction_model", "maintenance_hour"}
+	"transcription_lang", "default_profile", "default_engine", "debounce_ms", "compaction_model", "maintenance_hour"}
 
 func configGet(config *Config, key string) (string, error) {
 	switch key {
@@ -323,6 +324,8 @@ func configGet(config *Config, key string) (string, error) {
 		return firstNonEmpty(config.TranscriptionLang, "(auto-detect)"), nil
 	case "default_profile":
 		return firstNonEmpty(config.DefaultProfile, "(first by name)"), nil
+	case "default_engine":
+		return withDefaultNote(defaultEngine(config), strings.TrimSpace(config.DefaultEngine) == ""), nil
 	case "debounce_ms":
 		return withDefaultNote(fmt.Sprint(debounceMS(config)), config.DebounceMS == nil), nil
 	case "compaction_model":
@@ -369,6 +372,16 @@ func configSet(config *Config, key, value string) error {
 		config.TranscriptionLang = value
 	case "default_profile":
 		config.DefaultProfile = value
+	case "default_engine":
+		e, err := parseEngine(value)
+		if err != nil {
+			return err
+		}
+		if e == engineClaude {
+			config.DefaultEngine = ""
+		} else {
+			config.DefaultEngine = e
+		}
 	case "debounce_ms":
 		n, err := parseRange(key, value, 0, maxDebounceMS)
 		if err != nil {

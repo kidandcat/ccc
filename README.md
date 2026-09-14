@@ -12,14 +12,17 @@
 ## What ccc is
 
 A **topic is a bot**, not a session. Each bot has a name, a free-text role you
-set with `/role`, its own working directory, its own Claude conversation and a
+set with `/role`, its own working directory, its own conversation and a
 memory shared with the rest of the team. You send it a message; it does the work
 and answers in the topic. There are no commands in the normal flow.
 
-Under the hood ccc drives Claude Code as a **stateless runner**: every message is
-one `claude -p` process with a session id ccc mints and resumes. ccc owns
-everything the runner does not — bot identity, memory, inter-bot messaging,
-scheduling, account management, access control and the Telegram UX.
+Under the hood ccc drives a coding CLI as a **stateless runner**. The default
+engine is Claude Code: every message is one `claude -p` process with a session
+id ccc mints and resumes. A bot can also run on **Grok Build** (`grok`) or
+**Antigravity** (`agy`) — same topic, same envelope, that CLI's native
+print/resume flags. ccc owns everything the runner does not — bot identity,
+memory, inter-bot messaging, scheduling, account management, access control and
+the Telegram UX.
 
 ```
 ┌────────────┐   message    ┌──────────┐   claude -p --resume  ┌──────────────┐
@@ -39,8 +42,9 @@ scheduling, account management, access control and the Telegram UX.
 |---|---|
 | **Instance** | One `ccc listen` process on one machine, bound to one Telegram bot token and one forum group. |
 | **Bot** | One forum topic. A name, a role, a working directory and a memory scope. |
-| **Turn** | One `claude -p` run: one input, one answer. One turn per bot at a time; messages that arrive meanwhile are folded into the next turn. |
-| **Account** | One Claude login = one `CLAUDE_CONFIG_DIR`. Each turn picks the healthiest account; a turn refused by one is retried on another. |
+| **Turn** | One engine process (`claude -p`, `grok --single`, or `agy --print`): one input, one answer. One turn per bot at a time; messages that arrive meanwhile are folded into the next turn. |
+| **Engine** | Which CLI a bot's turns spawn: `claude` (default), `grok` / `grok-build`, or `antigravity` / `agy`. Set per bot with `/engine`, or for new bots with `ccc config set default_engine`. |
+| **Account** | One Claude login = one `CLAUDE_CONFIG_DIR`. Claude turns pick the healthiest account and fail over. Grok and Antigravity use the CLI on `PATH` and that CLI's own login; they do not get a fake `CLAUDE_CONFIG_DIR`. |
 | **Memory** | Durable facts in three scopes: `user` (about you, shared by all bots), `project` (about one code base) and `bot` (private). |
 | **Watch** | A command re-run on an interval. The bot is woken **only when the output changes**, with a diff. Nothing changing costs nothing. |
 | **Schedule** | A wakeup at a time, or on a cron expression. |
@@ -219,6 +223,7 @@ what the bot is doing. It is replaced by the answer, and your message gets a ✅
 | `/new` | Fresh conversation. Memories are kept. |
 | `/stop` | Kill the running turn and drop the queue. |
 | `/cwd [path]` | Show or set the bot's working directory. |
+| `/engine [name]` | Show or set the bot's engine: `claude` (default), `grok` / `grok-build`, `antigravity` / `agy`. Switching engines starts a fresh conversation. |
 | `/memory [query]` | List or search the memories this bot can see. |
 | `/memory stats` | Per scope: how many entries, how many bytes, whether it is due for compaction, and when it was last compacted. |
 | `/memory restore <id>` | Undo one memory compaction (owner only). The id is in the compaction message and in `/memory stats`. |
@@ -344,6 +349,66 @@ An approved user can talk to the bots. They cannot use `/account`, `/access`,
 > boundary**, which is why this is not optional. Secrets reach bots only through
 > `env_passthrough`; ccc never posts environment values or credential files, and
 > `send_file` refuses anything inside a config or credentials directory.
+
+---
+
+## Engines
+
+Each bot runs on one CLI. Existing bots stay on Claude Code unless you change
+them. New bots take `default_engine` from config (Claude if unset).
+
+| Engine | Telegram / config | Binary | Session | MCP |
+|---|---|---|---|---|
+| **Claude Code** (default) | `claude` | `claude` on `PATH` | ccc mints a UUID; `--session-id` then `--resume` | ccc MCP (`remember`, `send_to_bot`, …) |
+| **Grok Build** | `grok` or `grok-build` | `grok` (`~/.grok/bin/grok`) | ccc mints a UUID; `--session-id` then `--resume` | not wired — Grok MCP is persistent TOML (`grok mcp add`), not a per-turn flag |
+| **Antigravity** | `antigravity` or `agy` | `agy` (`~/.local/bin/agy`) | first turn lets `agy` mint a `conversation_id`; later turns pass `--conversation` | not wired — agy MCP is `~/.gemini/config/mcp_config.json`, not a per-turn flag |
+
+```
+/engine                 # show this bot's engine
+/engine grok            # next turn is `grok --single …`
+/engine antigravity     # next turn is `agy --print …`
+/engine claude          # back to Claude Code
+
+ccc config set default_engine grok    # new bots start on Grok
+ccc config get default_engine
+```
+
+**Claude** is unchanged: profile pool, `CLAUDE_CONFIG_DIR`, failover, MCP,
+`--output-format stream-json`. See `/account` and the bootstrap steps above.
+
+**Grok Build.** Install the CLI (typically `~/.grok/bin/grok` on `PATH`), then
+log in once. On a VM there is no browser:
+
+```bash
+grok login --device-auth
+```
+
+ccc does not invent a Claude config dir for Grok. Auth is whatever `grok`
+already uses (`grok login`, or `XAI_*` / `GROK_*` in the environment /
+`env_passthrough`). Turns run `grok --always-approve --output-format
+streaming-messages-json --single <envelope>` so Telegram progress can reuse
+the Claude stream parser. Guess labeled: the `grok` binary was not on the
+machine that built this; flags were checked against Grok Build's published
+headless docs and Hairok's Mac-verified set.
+
+**Antigravity.** Install `agy` (typically `~/.local/bin/agy`), then
+authenticate with an **interactive** `agy` session first. A headless run that
+is not already logged in exits with `authentication required` instead of
+hanging. ccc does not invent a Claude config dir. Turns run
+`agy --print <prompt> --output-format stream-json --dangerously-skip-permissions`
+and `--conversation` on resume. `--print-timeout 120m` is a ccc choice (agy's
+default is 5 minutes). Guess labeled: `agy` was not on the build machine;
+flags match the official headless docs and Hairok's Mac-verified set.
+
+Progress streaming works when the CLI emits a usable NDJSON stream. If an
+engine only prints the final answer, Telegram still gets that text (the
+progress line stays at "thinking").
+
+`/model` is still instance-wide and is passed through as `--model` on every
+engine when set. Use a slug that engine accepts, or `/model default` for the
+CLI's own default. An unknown agy model fails the turn.
+
+`ccc doctor` reports `grok` and `agy` as optional.
 
 ---
 

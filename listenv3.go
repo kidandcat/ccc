@@ -296,6 +296,7 @@ func setBotCommandsV3(botToken string) {
 		{"command": "new", "description": "Start a fresh conversation (memory kept)"},
 		{"command": "stop", "description": "Stop the running turn and drop the queue"},
 		{"command": "cwd", "description": "Show or set this bot's working directory"},
+		{"command": "engine", "description": "Show or set this bot's engine: claude, grok, antigravity"},
 		{"command": "memory", "description": "Memories: /memory [query] | stats | restore <id>"},
 		{"command": "forget", "description": "Forget a memory: /forget <scope> <key>"},
 		{"command": "watches", "description": "List this bot's watches"},
@@ -746,6 +747,9 @@ func (in *instance) handleCommand(msg *TelegramMessage, text string, inGroup boo
 		}
 		setBotStatus(in.db, b.ID, botIdle)
 
+	case "/engine":
+		in.handleEngineCommand(msg, b, rest)
+
 	case "/cwd":
 		if strings.TrimSpace(rest) == "" {
 			in.reply(msg, "<code>"+htmlEscape(botCwd(in.config(), b))+"</code>")
@@ -992,8 +996,14 @@ func (in *instance) renderBots() string {
 		if role == "" {
 			role = "(no role)"
 		}
-		fmt.Fprintf(&sb, "• <b>%s</b> [%s] — %s · last %s\n",
-			htmlEscape(b.Name), b.Status, htmlEscape(truncate(role, 80)), when)
+		engine := botEngine(b)
+		if engine == engineClaude {
+			fmt.Fprintf(&sb, "• <b>%s</b> [%s] — %s · last %s\n",
+				htmlEscape(b.Name), b.Status, htmlEscape(truncate(role, 80)), when)
+		} else {
+			fmt.Fprintf(&sb, "• <b>%s</b> [%s] %s — %s · last %s\n",
+				htmlEscape(b.Name), b.Status, htmlEscape(engine), htmlEscape(truncate(role, 80)), when)
+		}
 	}
 	return sb.String()
 }
@@ -1009,6 +1019,9 @@ func (in *instance) renderStatus() string {
 	in.db.Model(&Bot{}).Where("archived_at IS NULL").Count(&nBots)
 	fmt.Fprintf(&sb, "bots: %d · running: %d · queued: %d\n", nBots, running, queued)
 	fmt.Fprintf(&sb, "model: %s\n", firstNonEmpty(instanceModel(cfg), "claude default"))
+	if e := defaultEngine(cfg); e != engineClaude {
+		fmt.Fprintf(&sb, "default engine: %s\n", e)
+	}
 	fmt.Fprintf(&sb, "data: <code>%s</code>\n", htmlEscape(dataDir(cfg)))
 	var watches, schedules int64
 	in.db.Model(&Watch{}).Where("enabled = ?", true).Count(&watches)
@@ -1087,6 +1100,36 @@ func callbackChatID(cb *CallbackQuery) int64 {
 
 func callbackIsDM(cb *CallbackQuery) bool {
 	return cb.Message != nil && cb.Message.Chat.Type == "private"
+}
+
+// handleEngineCommand shows or sets the CLI a bot's turns spawn (claude, grok,
+// antigravity). Switching engines rotates the session: the conversation id
+// belongs to one CLI and cannot be resumed by another.
+func (in *instance) handleEngineCommand(msg *TelegramMessage, b *Bot, rest string) {
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		in.reply(msg, "<b>Engine</b>\n<code>"+htmlEscape(botEngine(b))+"</code> ("+htmlEscape(engineLabel(botEngine(b)))+")\nSet it with /engine claude, /engine grok or /engine antigravity.")
+		return
+	}
+	engine, err := parseEngine(rest)
+	if err != nil {
+		in.reply(msg, htmlEscape(err.Error()))
+		return
+	}
+	if botEngine(b) == engine {
+		in.reply(msg, "⚙️ Already on <code>"+htmlEscape(engine)+"</code>.")
+		return
+	}
+	if err := in.db.Model(&Bot{}).Where("id = ?", b.ID).
+		Updates(map[string]any{"engine": engine, "session_id": ""}).Error; err != nil {
+		in.reply(msg, "Could not update the engine: "+htmlEscape(err.Error()))
+		return
+	}
+	reply := "⚙️ Engine set to <code>" + htmlEscape(engine) + "</code> (" + htmlEscape(engineLabel(engine)) + "); the next message starts a fresh conversation."
+	if engine != engineClaude {
+		reply += "\nNo ccc MCP tools on this engine. Login: " + htmlEscape(engineLoginHint(engine)) + "."
+	}
+	in.reply(msg, reply)
 }
 
 // handleModelCommand shows or sets the model every bot runs on (DESIGN §8).

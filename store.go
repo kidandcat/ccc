@@ -28,7 +28,7 @@ import (
 // safe; every write is short.
 
 // Bot is one forum topic: an identity (name + role) with its own memory scope,
-// workspace and Claude session.
+// workspace, engine (claude|grok|antigravity) and conversation session.
 type Bot struct {
 	ID          int64  `gorm:"primaryKey"`
 	Name        string `gorm:"uniqueIndex;not null"`
@@ -36,7 +36,8 @@ type Bot struct {
 	Role        string
 	Cwd         string
 	SessionID   string
-	Status      string `gorm:"not null;default:idle"` // idle|running|waiting|disabled
+	Engine      string `gorm:"not null;default:claude"` // claude|grok|antigravity
+	Status      string `gorm:"not null;default:idle"`   // idle|running|waiting|disabled
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 	ArchivedAt  *time.Time
@@ -816,7 +817,13 @@ func createBotRow(db *gorm.DB, config *Config, name, role, cwd string, parentBot
 	if err := os.MkdirAll(cwd, 0o755); err != nil {
 		return nil, err
 	}
-	b := &Bot{Name: name, TopicID: topicID, Role: role, Cwd: cwd, Status: botIdle, ParentBotID: parentBotID}
+	engine := defaultEngine(config)
+	if parentBotID != nil {
+		if parent, err := botByID(db, *parentBotID); err == nil {
+			engine = botEngine(parent)
+		}
+	}
+	b := &Bot{Name: name, TopicID: topicID, Role: role, Cwd: cwd, Engine: engine, Status: botIdle, ParentBotID: parentBotID}
 	if err := db.Create(b).Error; err != nil {
 		return nil, err
 	}

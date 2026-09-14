@@ -230,6 +230,23 @@ func doctor(fix bool) {
 		allGood = false
 	}
 
+	fmt.Print("grok.............. ")
+	if p, err := resolveEngineBin(engineGrok); err == nil {
+		fmt.Printf("✅ %s (optional; /engine grok)\n", p)
+	} else {
+		fmt.Println("— not found (optional; needed for grok bots)")
+		fmt.Println("   Install Grok Build to ~/.grok/bin/grok, then: grok login")
+		fmt.Println("   On a VM: grok login --device-auth")
+	}
+
+	fmt.Print("agy............... ")
+	if p, err := resolveEngineBin(engineAntigravity); err == nil {
+		fmt.Printf("✅ %s (optional; /engine antigravity)\n", p)
+	} else {
+		fmt.Println("— not found (optional; needed for antigravity bots)")
+		fmt.Println("   Install Antigravity CLI to ~/.local/bin/agy, then authenticate with an interactive agy session")
+	}
+
 	if !doctorProfiles(fix) {
 		allGood = false
 	}
@@ -318,7 +335,7 @@ func isMacOS() bool {
 // ---------------------------------------------------------------------------
 
 func printHelp() {
-	fmt.Printf(`ccc - a team of Claude bots in one Telegram forum group (v%s)
+	fmt.Printf(`ccc - a team of Claude, Grok or Antigravity bots in one Telegram forum group (v%s)
 
 USAGE:
     ccc listen              Run the instance (normally done by the service)
@@ -326,7 +343,7 @@ USAGE:
 COMMANDS:
     setup <bot_token>       Interactive bootstrap (owner, group, service)
     config set <key> <val>  Non-interactive bootstrap; keys: bot_token, chat_id,
-                            group_id, model, data_dir, env_passthrough
+                            group_id, model, default_engine, data_dir, env_passthrough
     config get <key>        Show one value
     config                  Show the whole configuration
     setgroup                Record the forum group from your next message in it
@@ -345,7 +362,7 @@ COMMANDS:
 TELEGRAM (in the forum group):
     Text in General         Create a new bot from your message
     Text in a bot's topic   Talk to that bot
-    /role /new /stop /cwd /memory /forget /watches /schedules   per bot
+    /role /new /stop /cwd /engine /memory /forget /watches /schedules   per bot
     /bots /status /usage                                        anywhere
     /memory stats|restore <id>                                  memory upkeep
     /account /access /model /setgroup                           owner only

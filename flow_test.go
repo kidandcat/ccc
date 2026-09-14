@@ -485,6 +485,22 @@ func TestCommandsInTopic(t *testing.T) {
 		t.Error("/memory did not show the stored memory")
 	}
 
+	in.db.Model(&Bot{}).Where("id = ?", b.ID).Update("session_id", "eng-789")
+	in.handleMessage(ownerMessage(b.TopicID, "/engine"))
+	in.handleMessage(ownerMessage(b.TopicID, "/engine grok"))
+	after, _ = botByID(in.db, b.ID)
+	if after.Engine != engineGrok {
+		t.Errorf("engine = %q after /engine grok", after.Engine)
+	}
+	if after.SessionID != "" {
+		t.Error("/engine must rotate the session: the conversation id is per CLI")
+	}
+	in.handleMessage(ownerMessage(b.TopicID, "/engine not-a-cli"))
+	after, _ = botByID(in.db, b.ID)
+	if after.Engine != engineGrok {
+		t.Error("a bad /engine argument must not change the stored engine")
+	}
+
 	in.handleMessage(ownerMessage(b.TopicID, "/forget user deploy-target"))
 	var n int64
 	in.db.Model(&Memory{}).Where("key = ?", "deploy-target").Count(&n)
