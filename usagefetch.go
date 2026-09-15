@@ -353,7 +353,7 @@ func refreshClaudeOAuth(oauth *claudeAiOauth) (*claudeAiOauth, error) {
 }
 
 func keychainServiceName(p Profile) string {
-	home, _ := os.UserHomeDir()
+	home, _ := os.UserHomeDir() // safe-ignore: empty home falls through to the profile dir below
 	defaultDir := filepath.Join(home, ".claude")
 	dir := claudeHome(p)
 	if p.Implicit || dir == "" || filepath.Clean(dir) == filepath.Clean(defaultDir) {

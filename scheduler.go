@@ -49,7 +49,7 @@ func newScheduler(in *instance) *scheduler {
 }
 
 func (s *scheduler) Close() {
-	s.killAllBackground()
+	// Leave running jobs alone: they are detached and a new listen reattaches.
 	select {
 	case <-s.stop:
 	default:
@@ -60,6 +60,9 @@ func (s *scheduler) Close() {
 // Run is the loop. It never returns an error: a failing watch is reported to
 // its bot, and a failing doctor probe is simply retried next tick.
 func (s *scheduler) Run() {
+	// Reattach before the doctor probe: leftover running jobs should be
+	// supervised (or finished) even if auth checks take a while.
+	s.reattachBackgroundJobs()
 	// Probe the accounts once at boot so /status is meaningful immediately.
 	s.runDoctor(time.Now())
 	ticker := time.NewTicker(schedulerTick)
@@ -69,7 +72,6 @@ func (s *scheduler) Run() {
 	for {
 		select {
 		case <-s.stop:
-			s.killAllBackground()
 			return
 		case now := <-ticker.C:
 			s.runDueWatches(now)

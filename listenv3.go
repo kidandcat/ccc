@@ -186,11 +186,12 @@ func listenV3() error {
 	setBotCommandsV3(cfg.BotToken)
 	listenLog("ccc v3 listening (group: %d, db: %s)", cfg.GroupID, dbPath(cfg))
 
-	// Anything left running from a previous process is not running any more.
+	// Conversational turns that were mid-flight died with us. Background
+	// jobs do not: they are detached, and the scheduler reattaches them.
 	db.Model(&Turn{}).Where("status = ?", turnRunning).
 		Updates(map[string]any{"status": turnFailed, "error_class": errFatal, "stop_reason": "ccc restarted"})
 	db.Model(&Bot{}).Where("status = ?", botRunning).Update("status", botIdle)
-	failOrphanedBackgroundJobs(db, runner)
+	sched.reattachBackgroundJobs()
 	// Re-arm queues that survived the restart, including bot-to-bot messages
 	// whose sender's turn ended as the process was going down.
 	runner.deliverInbox(0)

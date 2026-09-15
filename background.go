@@ -1,10 +1,12 @@
 package main
 
 import (
-	"bytes"
-	"context"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -17,14 +19,25 @@ import (
 // The MCP tool only inserts a queued row; `ccc listen` starts and reaps the
 // process so the conversational turn is never blocked and never holds
 // turns.status=running for the job.
+//
+// Jobs are detached from listen's lifetime: a /bin/sh wrapper writes
+// stdout/stderr to <data_dir>/background/<id>/out.log and the exit code to
+// exit.code, in its own process group. A listen restart reattaches by
+// polling those artifacts (and kill(pid, 0)) instead of failing the row.
 
 const (
 	// backgroundTick is how often the listen loop looks for queued jobs and
 	// cancel requests. Watches stay on schedulerTick; jobs should start in
 	// about a second, not fifteen.
 	backgroundTick = time.Second
+	// backgroundWatchPoll is how often a supervisor goroutine looks for
+	// exit.code or process death. Faster than backgroundTick so a finished
+	// job wakes the bot without waiting a full second.
+	backgroundWatchPoll = 100 * time.Millisecond
 	// backgroundTimeout is a safety cap so a forgotten `sleep 999999` cannot
 	// live forever. Builds and installs that need longer should be split.
+	// Enforced by the supervisor against the row's deadline, not by binding
+	// the process to listen's context — that would kill the job on restart.
 	backgroundTimeout = 4 * time.Hour
 	// maxBackgroundPerBot caps concurrent running jobs for one bot.
 	maxBackgroundPerBot = 8
@@ -34,47 +47,72 @@ const (
 	backgroundWakeLimit = 8 * 1024
 	// backgroundListLimit is how many recent jobs list_background returns.
 	backgroundListLimit = 20
+
+	bgLogFile  = "out.log"
+	bgExitFile = "exit.code"
+	bgPidFile  = "pid"
 )
 
-// bgRuntime holds the live process handles the supervisor started. PIDs are
-// also written to the row so a cancel from `ccc mcp` can SIGTERM them.
+// backgroundWrapper is the /bin/sh program that actually runs a job. $1 is
+// the artifact directory, $2 is the user command (argv0 is "bgwrap"). It
+// redirects the command onto out.log and writes exit.code last, atomically,
+// so a new listen can finish the job without Wait4 on a reparented child.
+const backgroundWrapper = `
+jobdir=$1
+cmd=$2
+printf '%s\n' "$$" > "$jobdir/pid"
+/bin/sh -c "$cmd" > "$jobdir/out.log" 2>&1
+ec=$?
+printf '%s\n' "$ec" > "$jobdir/exit.code.tmp"
+mv "$jobdir/exit.code.tmp" "$jobdir/exit.code"
+`
+
+// bgHandle is one job this listen process is supervising. cmd is set only
+// when we started the wrapper ourselves (so we can Wait and reap); a
+// reattached orphan has only the PID.
+type bgHandle struct {
+	pid int
+	cmd *exec.Cmd
+}
+
+// bgRuntime holds the live jobs the supervisor is watching. PIDs are also
+// written to the row so a cancel from `ccc mcp` can SIGTERM them after a
+// restart, when this map is empty.
 type bgRuntime struct {
-	mu   sync.Mutex
-	cmds map[int64]*exec.Cmd
+	mu      sync.Mutex
+	handles map[int64]*bgHandle
 }
 
-func (r *bgRuntime) set(id int64, cmd *exec.Cmd) {
+func (r *bgRuntime) adopt(id int64, pid int, cmd *exec.Cmd) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.cmds == nil {
-		r.cmds = map[int64]*exec.Cmd{}
+	if r.handles == nil {
+		r.handles = map[int64]*bgHandle{}
 	}
-	r.cmds[id] = cmd
+	if _, ok := r.handles[id]; ok {
+		return false
+	}
+	r.handles[id] = &bgHandle{pid: pid, cmd: cmd}
+	return true
 }
 
-func (r *bgRuntime) get(id int64) *exec.Cmd {
+func (r *bgRuntime) pidOf(id int64) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.cmds == nil {
-		return nil
+	if r.handles == nil {
+		return 0
 	}
-	return r.cmds[id]
+	h := r.handles[id]
+	if h == nil {
+		return 0
+	}
+	return h.pid
 }
 
 func (r *bgRuntime) drop(id int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.cmds, id)
-}
-
-func (r *bgRuntime) snapshot() map[int64]*exec.Cmd {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make(map[int64]*exec.Cmd, len(r.cmds))
-	for k, v := range r.cmds {
-		out[k] = v
-	}
-	return out
+	delete(r.handles, id)
 }
 
 func killProcessGroup(pid int) {
@@ -84,6 +122,85 @@ func killProcessGroup(pid int) {
 	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
 		_ = syscall.Kill(pid, syscall.SIGTERM) // safe-ignore: best-effort; the process may already be gone
 	}
+}
+
+// processAlive is kill(pid, 0): the process exists (or we lack permission
+// to signal it, which still means it exists). Reparented orphans cannot be
+// Wait4'd, so this is how a new listen decides a job is still running.
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	if err == nil {
+		return true
+	}
+	return errors.Is(err, syscall.EPERM)
+}
+
+// ---------------------------------------------------------------------------
+// Durable artifacts
+// ---------------------------------------------------------------------------
+
+func backgroundJobDir(cfg *Config, id int64) string {
+	return filepath.Join(dataDir(cfg), "background", strconv.FormatInt(id, 10))
+}
+
+func readExitCode(dir string) (int, bool) {
+	b, err := os.ReadFile(filepath.Join(dir, bgExitFile))
+	if err != nil {
+		return 0, false
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func readJobLog(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, bgLogFile))
+	if err != nil {
+		return ""
+	}
+	out := string(b)
+	if len(out) > backgroundOutputLimit {
+		return out[:backgroundOutputLimit] + "\n…(output truncated)"
+	}
+	return out
+}
+
+func readPIDFile(dir string) int {
+	b, err := os.ReadFile(filepath.Join(dir, bgPidFile))
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+func jobPID(j *BackgroundJob, dir string) int {
+	if j.PID > 0 {
+		return j.PID
+	}
+	return readPIDFile(dir)
+}
+
+func jobDeadline(j *BackgroundJob) time.Time {
+	if j.Deadline != nil {
+		return *j.Deadline
+	}
+	if j.StartedAt != nil {
+		return j.StartedAt.Add(backgroundTimeout)
+	}
+	return time.Now().Add(backgroundTimeout)
 }
 
 // ---------------------------------------------------------------------------
@@ -227,39 +344,18 @@ func renderBackgroundWake(j *BackgroundJob) string {
 	return sb.String()
 }
 
-// failOrphanedBackgroundJobs marks leftover running jobs failed after a listen
-// restart: those processes died with the previous ccc. Queued jobs stay queued
-// so the new supervisor can start them. Each orphan wakes its bot.
-func failOrphanedBackgroundJobs(db *gorm.DB, r turnRunner) {
-	var jobs []BackgroundJob
-	if err := db.Where("status = ?", jobRunning).Find(&jobs).Error; err != nil {
-		return
-	}
-	now := time.Now()
-	for i := range jobs {
-		j := &jobs[i]
-		res := db.Model(&BackgroundJob{}).Where("id = ? AND status = ?", j.ID, jobRunning).
-			Updates(map[string]any{
-				"status": jobFailed, "error": "ccc restarted while the job was running", "ended_at": now, "pid": 0,
-			})
-		if res.RowsAffected == 0 {
-			continue
-		}
-		j.Status = jobFailed
-		j.Error = "ccc restarted while the job was running"
-		j.EndedAt = &now
-		if r == nil {
-			continue
-		}
-		if _, err := r.Enqueue(j.BotID, sourceBackground, renderBackgroundWake(j), 0); err != nil {
-			hookLog("background %d: orphan wakeup: %v", j.ID, err)
-		}
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Supervisor (runs inside the scheduler goroutine)
 // ---------------------------------------------------------------------------
+
+func (s *scheduler) stopped() bool {
+	select {
+	case <-s.stop:
+		return true
+	default:
+		return false
+	}
+}
 
 func (s *scheduler) tickBackground() {
 	s.applyBackgroundCancels()
@@ -273,8 +369,8 @@ func (s *scheduler) applyBackgroundCancels() {
 	}
 	for i := range jobs {
 		j := jobs[i]
-		if cmd := s.bg.get(j.ID); cmd != nil && cmd.Process != nil {
-			killProcessGroup(cmd.Process.Pid)
+		if pid := s.bg.pidOf(j.ID); pid > 0 {
+			killProcessGroup(pid)
 			continue
 		}
 		if j.PID > 0 {
@@ -304,66 +400,181 @@ func (s *scheduler) startQueuedBackground() {
 			continue
 		}
 		now := time.Now()
+		deadline := now.Add(backgroundTimeout)
 		res := s.in.db.Model(&BackgroundJob{}).Where("id = ? AND status = ?", j.ID, jobQueued).
-			Updates(map[string]any{"status": jobRunning, "started_at": now})
+			Updates(map[string]any{"status": jobRunning, "started_at": now, "deadline": deadline})
 		if res.RowsAffected == 0 {
 			continue
 		}
 		j.Status = jobRunning
 		j.StartedAt = &now
+		j.Deadline = &deadline
 		go s.runBackgroundJob(b, &j)
 	}
 }
 
 func (s *scheduler) runBackgroundJob(b *Bot, j *BackgroundJob) {
 	cfg := s.in.config()
-	ctx, cancel := context.WithTimeout(context.Background(), backgroundTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", j.Command)
+	dir := backgroundJobDir(cfg, j.ID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		s.finishBackgroundJob(j, jobFailed, -1, "", err.Error())
+		return
+	}
+
+	// No CommandContext: a cancelled listen context must not kill the job.
+	// The 4h cap is the deadline column, checked by watchBackgroundJob.
+	cmd := exec.Command("/bin/sh", "-c", backgroundWrapper, "bgwrap", dir, j.Command)
 	cmd.Dir = botCwd(cfg, b)
 	cmd.Env = instanceEnv(cfg)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
 
 	if err := cmd.Start(); err != nil {
 		s.finishBackgroundJob(j, jobFailed, -1, "", err.Error())
 		return
 	}
-	s.bg.set(j.ID, cmd)
-	s.in.db.Model(&BackgroundJob{}).Where("id = ?", j.ID).Update("pid", cmd.Process.Pid)
-
-	waitErr := cmd.Wait()
-	s.bg.drop(j.ID)
-
-	out := buf.String()
-	if len(out) > backgroundOutputLimit {
-		out = out[:backgroundOutputLimit] + "\n…(output truncated)"
+	j.PID = cmd.Process.Pid
+	s.in.db.Model(&BackgroundJob{}).Where("id = ?", j.ID).Update("pid", j.PID)
+	if !s.bg.adopt(j.ID, j.PID, cmd) {
+		// Another supervisor already claimed this id (reattach raced us).
+		// Reap so we do not leave a zombie, then leave watching to them.
+		go func() { _ = cmd.Wait() }() // safe-ignore: Wait is only to reap; finish comes from exit.code
+		return
 	}
-	exit := 0
-	if cmd.ProcessState != nil {
-		exit = cmd.ProcessState.ExitCode()
+	go func() { _ = cmd.Wait() }() // safe-ignore: Wait is only to reap; finish comes from exit.code
+	s.watchBackgroundJob(j)
+}
+
+// reattachBackgroundJobs is what a new listen does with leftover running
+// rows: finish the ones that already wrote exit.code, supervise the ones
+// whose PID is still alive, fail the rest. It does not kill anyone.
+func (s *scheduler) reattachBackgroundJobs() {
+	var jobs []BackgroundJob
+	if err := s.in.db.Where("status = ?", jobRunning).Find(&jobs).Error; err != nil {
+		return
 	}
-	status := jobDone
-	errText := ""
-	if waitErr != nil {
-		status = jobFailed
-		errText = waitErr.Error()
-		if ctx.Err() != nil {
-			errText = "timed out after " + backgroundTimeout.String()
+	for i := range jobs {
+		j := jobs[i]
+		dir := backgroundJobDir(s.in.config(), j.ID)
+		if pid := jobPID(&j, dir); pid > 0 && j.PID != pid {
+			j.PID = pid
+			s.in.db.Model(&BackgroundJob{}).Where("id = ?", j.ID).Update("pid", pid)
+		}
+		if !s.bg.adopt(j.ID, j.PID, nil) {
+			continue
+		}
+		go s.watchBackgroundJob(&j)
+	}
+}
+
+// watchBackgroundJob waits for exit.code or process death without requiring
+// Wait on a child. listen shutdown returns without killing the job.
+func (s *scheduler) watchBackgroundJob(j *BackgroundJob) {
+	defer s.bg.drop(j.ID)
+	cfg := s.in.config()
+	dir := backgroundJobDir(cfg, j.ID)
+	ticker := time.NewTicker(backgroundWatchPoll)
+	defer ticker.Stop()
+
+	killed := false
+	for {
+		if s.finishIfComplete(j, dir) {
+			return
+		}
+		if s.stopped() {
+			return
+		}
+		if !killed && s.shouldStopJob(j) {
+			if pid := jobPID(j, dir); pid > 0 {
+				killProcessGroup(pid)
+			}
+			killed = true
+		}
+		select {
+		case <-s.stop:
+			return
+		case <-ticker.C:
 		}
 	}
+}
+
+func (s *scheduler) shouldStopJob(j *BackgroundJob) bool {
 	var latest BackgroundJob
-	if s.in.db.First(&latest, j.ID).Error == nil && latest.CancelRequested {
-		status = jobFailed
-		if errText == "" {
-			errText = "cancelled"
-		} else if !strings.Contains(errText, "cancel") {
-			errText = "cancelled: " + errText
-		}
+	if err := s.in.db.First(&latest, j.ID).Error; err != nil {
+		return false
 	}
+	j.CancelRequested = latest.CancelRequested
+	j.Deadline = latest.Deadline
+	j.StartedAt = latest.StartedAt
+	j.PID = latest.PID
+	j.Status = latest.Status
+	if j.Status != jobRunning {
+		return false
+	}
+	if j.CancelRequested {
+		return true
+	}
+	return time.Now().After(jobDeadline(j))
+}
+
+func (s *scheduler) finishIfComplete(j *BackgroundJob, dir string) bool {
+	var latest BackgroundJob
+	if err := s.in.db.First(&latest, j.ID).Error; err != nil {
+		return true
+	}
+	if latest.Status != jobRunning {
+		return true
+	}
+	*j = latest
+
+	if code, ok := readExitCode(dir); ok {
+		s.finishFromArtifacts(j, dir, code, true)
+		return true
+	}
+	pid := jobPID(j, dir)
+	if processAlive(pid) {
+		return false
+	}
+	// PID is gone. The wrapper writes exit.code and then exits, so a
+	// restart that lands between those two steps should wait a beat.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if code, ok := readExitCode(dir); ok {
+			s.finishFromArtifacts(j, dir, code, true)
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	s.finishFromArtifacts(j, dir, -1, false)
+	return true
+}
+
+func (s *scheduler) finishFromArtifacts(j *BackgroundJob, dir string, code int, haveCode bool) {
+	out := readJobLog(dir)
+	status, errText, exit := classifyBackgroundFinish(j, code, haveCode)
 	s.finishBackgroundJob(j, status, exit, out, errText)
+}
+
+func classifyBackgroundFinish(j *BackgroundJob, code int, haveCode bool) (status string, errText string, exit int) {
+	exit = code
+	if !haveCode {
+		exit = -1
+	}
+	if j.CancelRequested {
+		return jobFailed, "cancelled", exit
+	}
+	// A job that actually finished successfully while listen was down is
+	// done, even if that was past the 4h deadline. The deadline is a kill
+	// switch for still-running jobs, not a rejection of a written exit 0.
+	if haveCode && code == 0 {
+		return jobDone, "", 0
+	}
+	if time.Now().After(jobDeadline(j)) {
+		return jobFailed, "timed out after " + backgroundTimeout.String(), exit
+	}
+	if !haveCode {
+		return jobFailed, "process died without writing an exit status", -1
+	}
+	return jobFailed, fmt.Sprintf("exit status %d", code), code
 }
 
 func (s *scheduler) finishBackgroundJob(j *BackgroundJob, status string, exit int, output, errText string) {
@@ -395,13 +606,5 @@ func (s *scheduler) enqueueBackgroundWake(j *BackgroundJob) {
 	}
 	if _, err := s.in.runner.Enqueue(b.ID, sourceBackground, renderBackgroundWake(j), 0); err != nil {
 		hookLog("background %d: enqueue failed: %v", j.ID, err)
-	}
-}
-
-func (s *scheduler) killAllBackground() {
-	for _, cmd := range s.bg.snapshot() {
-		if cmd != nil && cmd.Process != nil {
-			killProcessGroup(cmd.Process.Pid)
-		}
 	}
 }

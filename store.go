@@ -224,6 +224,7 @@ type BackgroundJob struct {
 	Kind            string // "shell"
 	Command         string
 	PID             int `gorm:"column:pid"`
+	Deadline        *time.Time // started_at + 4h; supervisor-enforced, survives listen restart
 	ExitCode        *int
 	Output          string
 	Error           string

@@ -447,7 +447,7 @@ func TestCleanupRemovesWhatNobodyCanReadAnyMore(t *testing.T) {
 	mustCreate(&MemoryArchive{CompactionID: 2, ArchivedAt: now.AddDate(0, 0, -10), Scope: scopeUser, Key: "fresh"})
 
 	var rep maintenanceReport
-	runCleanup(in.db, now, &rep)
+	runCleanup(in.db, in.config(), now, &rep)
 	if len(rep.Problems) != 0 {
 		t.Fatalf("problems: %v", rep.Problems)
 	}

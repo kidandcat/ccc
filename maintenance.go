@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -131,7 +132,7 @@ func runMaintenance(db *gorm.DB, cfg *Config, deps maintenanceDeps, now time.Tim
 	var rep maintenanceReport
 	rep.TurnsDeleted, rep.TurnsTrimmed = applyTurnRetention(db, now, &rep)
 	compactMemories(db, cfg, deps, now, &rep)
-	runCleanup(db, now, &rep)
+	runCleanup(db, cfg, now, &rep)
 	return rep
 }
 
@@ -542,7 +543,7 @@ func restoreCompaction(db *gorm.DB, compactionID int64) (label string, restored 
 // 3. Cleanup
 // ---------------------------------------------------------------------------
 
-func runCleanup(db *gorm.DB, now time.Time, rep *maintenanceReport) {
+func runCleanup(db *gorm.DB, cfg *Config, now time.Time, rep *maintenanceReport) {
 	del := func(what string, res *gorm.DB) int64 {
 		if res.Error != nil {
 			rep.Problems = append(rep.Problems, what+": "+res.Error.Error())
@@ -575,8 +576,18 @@ func runCleanup(db *gorm.DB, now time.Time, rep *maintenanceReport) {
 
 	rep.ArchivesDeleted = del("memory archive cleanup", db.Where("archived_at < ?",
 		now.AddDate(0, 0, -memoryArchiveRetentionDay)).Delete(&MemoryArchive{}))
+	jobCutoff := now.AddDate(0, 0, -backgroundJobRetentionDays)
+	if cfg != nil {
+		var old []BackgroundJob
+		if err := db.Where("status IN ? AND ended_at IS NOT NULL AND ended_at < ?",
+			[]string{jobDone, jobFailed}, jobCutoff).Find(&old).Error; err == nil {
+			for _, j := range old {
+				_ = os.RemoveAll(backgroundJobDir(cfg, j.ID)) // safe-ignore: leftover logs must not fail maintenance
+			}
+		}
+	}
 	rep.JobsDeleted = del("background job cleanup", db.Where("status IN ? AND ended_at IS NOT NULL AND ended_at < ?",
-		[]string{jobDone, jobFailed}, now.AddDate(0, 0, -backgroundJobRetentionDays)).Delete(&BackgroundJob{}))
+		[]string{jobDone, jobFailed}, jobCutoff).Delete(&BackgroundJob{}))
 }
 
 // ---------------------------------------------------------------------------

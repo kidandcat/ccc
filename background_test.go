@@ -1,7 +1,13 @@
 package main
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -213,8 +219,53 @@ func TestCancelRunningBackground(t *testing.T) {
 	}
 }
 
-func TestOrphanedRunningBackgroundJobFailsAndWakes(t *testing.T) {
-	in, runner, _ := testInstance(t)
+func writeJobArtifacts(t *testing.T, cfg *Config, id int64, output string, exit *int) {
+	t.Helper()
+	dir := backgroundJobDir(cfg, id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, bgLogFile), []byte(output), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if exit != nil {
+		if err := os.WriteFile(filepath.Join(dir, bgExitFile), []byte(strconv.Itoa(*exit)+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestReattachFinishedWhileDownWakesTheBot(t *testing.T) {
+	s, in, runner, _ := testScheduler(t)
+	b, err := in.createBot("worker", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	exit := 0
+	job := BackgroundJob{BotID: b.ID, Name: "while-down", Status: jobRunning, Kind: jobKindShell, Command: "echo hi", StartedAt: &now, PID: 999999}
+	if err := in.db.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	writeJobArtifacts(t, in.config(), job.ID, "hello-from-disk\n", &exit)
+	s.reattachBackgroundJobs()
+	got := waitJob(t, in, job.ID)
+	if got.Status != jobDone {
+		t.Fatalf("status = %q error=%q output=%q", got.Status, got.Error, got.Output)
+	}
+	if !strings.Contains(got.Output, "hello-from-disk") {
+		t.Errorf("output = %q", got.Output)
+	}
+	if len(runner.enqueued) != 1 || runner.enqueued[0].Source != sourceBackground {
+		t.Fatalf("wakeup = %+v", runner.enqueued)
+	}
+	if !strings.Contains(runner.enqueued[0].Text, "finished") || !strings.Contains(runner.enqueued[0].Text, "hello-from-disk") {
+		t.Errorf("wakeup:\n%s", runner.enqueued[0].Text)
+	}
+}
+
+func TestReattachDeadPIDWithoutExitFileFailsAndWakes(t *testing.T) {
+	s, in, runner, _ := testScheduler(t)
 	b, err := in.createBot("worker", "")
 	if err != nil {
 		t.Fatal(err)
@@ -224,13 +275,162 @@ func TestOrphanedRunningBackgroundJobFailsAndWakes(t *testing.T) {
 	if err := in.db.Create(&job).Error; err != nil {
 		t.Fatal(err)
 	}
-	failOrphanedBackgroundJobs(in.db, runner)
-	in.db.First(&job, job.ID)
-	if job.Status != jobFailed || !strings.Contains(job.Error, "restarted") {
-		t.Errorf("orphan = %+v", job)
+	s.reattachBackgroundJobs()
+	got := waitJob(t, in, job.ID)
+	if got.Status != jobFailed || !strings.Contains(got.Error, "without writing an exit status") {
+		t.Errorf("dead orphan = %+v", got)
 	}
 	if len(runner.enqueued) != 1 || runner.enqueued[0].Source != sourceBackground {
 		t.Fatalf("orphan wakeup = %+v", runner.enqueued)
+	}
+}
+
+func TestReattachAlivePIDKeepsRunning(t *testing.T) {
+	s, in, runner, _ := testScheduler(t)
+	b, err := in.createBot("worker", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		s.Close()
+		killProcessGroup(cmd.Process.Pid)
+		_ = cmd.Wait()
+	})
+	now := time.Now()
+	job := BackgroundJob{BotID: b.ID, Name: "still-going", Status: jobRunning, Kind: jobKindShell, Command: "sleep 30", StartedAt: &now, PID: cmd.Process.Pid}
+	if err := in.db.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	s.reattachBackgroundJobs()
+	time.Sleep(250 * time.Millisecond)
+	in.db.First(&job, job.ID)
+	if job.Status != jobRunning {
+		t.Fatalf("alive reattach marked the job %q error=%q", job.Status, job.Error)
+	}
+	if len(runner.enqueued) != 0 {
+		t.Fatalf("alive reattach woke the bot early: %+v", runner.enqueued)
+	}
+	listed, err := listBackgroundJobs(in.db, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(formatBackgroundList(listed), "[running]") {
+		t.Errorf("list_background after reattach: %s", formatBackgroundList(listed))
+	}
+}
+
+func TestBackgroundJobSurvivesSchedulerRestart(t *testing.T) {
+	s1, in, runner, _ := testScheduler(t)
+	b, err := in.createBot("worker", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	flag := filepath.Join(t.TempDir(), "go")
+	job, err := queueBackgroundJob(in.db, b.ID, 0, "hold",
+		fmt.Sprintf("while [ ! -f %s ]; do sleep 0.05; done; echo survived", strconv.Quote(flag)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		var latest BackgroundJob
+		if in.db.First(&latest, job.ID).Error == nil && latest.PID > 0 {
+			killProcessGroup(latest.PID)
+		}
+	})
+	s1.tickBackground()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		in.db.First(job, job.ID)
+		if job.Status == jobRunning && job.PID > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if job.Status != jobRunning || job.PID <= 0 {
+		t.Fatalf("job never started: %+v", job)
+	}
+	s1.Close()
+	if !processAlive(job.PID) {
+		t.Fatal("Close() killed the background job")
+	}
+	in.db.First(job, job.ID)
+	if job.Status != jobRunning {
+		t.Fatalf("Close() changed status to %q", job.Status)
+	}
+
+	s2 := newScheduler(in)
+	in.sched = s2
+	t.Cleanup(func() { s2.Close() })
+	s2.reattachBackgroundJobs()
+	time.Sleep(150 * time.Millisecond)
+	in.db.First(job, job.ID)
+	if job.Status != jobRunning {
+		t.Fatalf("reattach changed status to %q error=%q", job.Status, job.Error)
+	}
+	if len(runner.enqueued) != 0 {
+		t.Fatalf("reattach of a live job woke the bot: %+v", runner.enqueued)
+	}
+	if err := os.WriteFile(flag, []byte("go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := waitJob(t, in, job.ID)
+	if got.Status != jobDone {
+		t.Fatalf("after restart: status=%q error=%q output=%q", got.Status, got.Error, got.Output)
+	}
+	if !strings.Contains(got.Output, "survived") {
+		t.Errorf("output = %q", got.Output)
+	}
+	if len(runner.enqueued) != 1 || runner.enqueued[0].Source != sourceBackground {
+		t.Fatalf("expected the normal background wakeup, got %+v", runner.enqueued)
+	}
+}
+
+func TestCancelAfterReattach(t *testing.T) {
+	s1, in, runner, _ := testScheduler(t)
+	b, err := in.createBot("worker", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := queueBackgroundJob(in.db, b.ID, 0, "sleep", "sleep 30")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.tickBackground()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		in.db.First(job, job.ID)
+		if job.Status == jobRunning && job.PID > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if job.Status != jobRunning {
+		t.Fatalf("job never started: %+v", job)
+	}
+	s1.Close()
+	s2 := newScheduler(in)
+	in.sched = s2
+	t.Cleanup(func() { s2.Close() })
+	s2.reattachBackgroundJobs()
+	msg, err := cancelBackgroundJob(in.db, b.ID, job.ID, killProcessGroup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(msg, "cancel") {
+		t.Errorf("cancel said %q", msg)
+	}
+	s2.tickBackground()
+	got := waitJob(t, in, job.ID)
+	if got.Status != jobFailed || !strings.Contains(got.Error, "cancel") {
+		t.Errorf("cancelled after reattach = %+v", got)
+	}
+	if len(runner.enqueued) != 1 || runner.enqueued[0].Source != sourceBackground {
+		t.Errorf("expected a failed wakeup, got %+v", runner.enqueued)
 	}
 }
 

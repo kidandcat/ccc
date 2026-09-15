@@ -167,8 +167,9 @@ access      telegram_user_id (pk), display, state (pending|approved|blocked), pa
             replies (how many times ccc has answered this stranger, §14.7)
 settings    key (pk), value                                  -- instance settings edited from Telegram
 background_jobs  id, bot_id, name, status (queued|running|done|failed), kind (shell),
-            command, pid, exit_code, output, error, cancel_requested,
+            command, pid, deadline, exit_code, output, error, cancel_requested,
             created_by_turn_id, started_at, ended_at, created_at
+            -- artifacts: <data_dir>/background/<id>/{out.log,exit.code,pid}
 ```
 
 Indexes beyond the ones the columns above imply: `turns(bot_id, created_at)`
@@ -241,14 +242,19 @@ One goroutine in `ccc listen`:
 - **Schedules**: enqueue a turn with `source=schedule` and the note when
   `fire_at` passes; recurring via cron expression.
 - **Background jobs**: every second, claim queued `background_jobs` (cap: 8
-  running per bot), start `/bin/sh -c` in the bot's cwd with the instance env
-  (same as watches: `env_passthrough`, no Claude profile), wait in a
-  goroutine, then mark done/failed and enqueue a turn with
-  `source=background` whose input has job id, name, exit code and truncated
-  stdout/stderr. A cancel sets `cancel_requested` and SIGTERMs the process
-  group. Leftover `running` rows after a listen restart are failed and wake
-  the bot. This is **not** Claude Code background agents: no transcript
-  scraping, no `claude attach`.
+  running per bot) and start a detached `/bin/sh` wrapper in the bot's cwd
+  with the instance env (same as watches: `env_passthrough`, no Claude
+  profile). The wrapper runs the user command, redirects combined
+  stdout/stderr to `<data_dir>/background/<id>/out.log`, and writes
+  `exit.code` when it finishes. The process group is its own (`Setpgid`);
+  listen's context is not the job's lifetime. The 4h safety cap is a
+  `deadline` column the supervisor checks. On graceful shutdown the jobs
+  are left `status=running` with their PID. A new listen **reattaches**:
+  `exit.code` present → finish from the log and enqueue `source=background`;
+  PID still alive (`kill(pid, 0)`) → keep supervising; PID dead and no
+  exit file → fail with a clear error and wake the bot. A cancel sets
+  `cancel_requested` and SIGTERMs the stored process group. This is **not**
+  Claude Code background agents: no transcript scraping, no `claude attach`.
 - **Doctor loop** (every 15 min): `claude auth status --json` per profile
   (exit code 1 = logged out — verified), disclaimer check, usage cache read.
   Transitions to `needs_login` → owner notification with **Relogin** button.
@@ -297,7 +303,8 @@ originals back and consumes the archive rows; `/memory stats` shows count, bytes
 and last compaction per scope.
 
 **Cleanup.** Delivered `inbox` rows and answered `questions` older than 30 days;
-finished `background_jobs` older than 30 days;
+finished `background_jobs` older than 30 days (and their
+`<data_dir>/background/<id>/` artifact dirs);
 `bot`-scope memories of bots archived more than 30 days ago (nothing can read
 them — bot memories are visible to that bot alone); `memories_archive` rows
 older than 90 days.
@@ -718,8 +725,9 @@ login strings are still matched against the TUI.
 
 **14.24 `spawn_bot` was removed.** Bots must not create other bots. Only the
 owner creates bots (plain text in General, or `/bot`). Long parallel work
-uses `run_background` in the same topic — a queued shell job the listen
-supervisor starts and reaps, then a `source=background` wakeup. That is
+uses `run_background` in the same topic — a detached shell job the listen
+supervisor starts, reattaches across `ccc listen` / LaunchAgent restarts,
+and wakes with `source=background` when it finishes. That is
 closer to Grok Bot's background Task than to Claude Code background agents
 (which stay a non-goal: no transcript scraping, no `claude attach`).
 `archive_bot` stays so a bot can retire itself.
