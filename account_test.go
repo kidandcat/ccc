@@ -473,19 +473,22 @@ func TestAccountAddTakesEngine(t *testing.T) {
 	stubPTY(t, in)
 
 	in.handleAccountCommand(dmMessage(42, ""), "add work grok")
-	p := in.config().Profiles["work"]
+	p := in.config().Profiles["work/grok"]
 	if p == nil {
 		t.Fatalf("grok account was not created: %+v", in.config().Profiles)
 	}
 	if profileEngine(*p) != engineGrok {
 		t.Errorf("engine = %q, want grok", p.Engine)
 	}
+	if p.Label != "work" {
+		t.Errorf("label = %q, want the identity, not the composite key", p.Label)
+	}
 	if want := filepath.Join(in.dataDir, "accounts", engineGrok, "work"); p.ConfigDir != want {
 		t.Errorf("grok home = %q, want %q", p.ConfigDir, want)
 	}
 
 	in.handleAccountCommand(dmMessage(42, ""), "add lab agy")
-	agy := in.config().Profiles["lab"]
+	agy := in.config().Profiles["lab/antigravity"]
 	if agy == nil || profileEngine(*agy) != engineAntigravity {
 		t.Fatalf("agy account = %+v", in.config().Profiles)
 	}
@@ -541,5 +544,100 @@ func TestRenderAccountsShowsEngineAndMixedHealth(t *testing.T) {
 	}
 	if strings.Count(body, "usage:") != 1 {
 		t.Errorf("usage should be Claude-only:\n%s", body)
+	}
+}
+
+// The same email on Claude and Codex is two accounts; the same email on the
+// same engine is still rejected. Status cards show the email, not the
+// composite key.
+func TestAccountAddSameEmailDifferentEngine(t *testing.T) {
+	in, _, api := testInstance(t)
+	if err := saveConfig(in.config()); err != nil {
+		t.Fatal(err)
+	}
+	stubPTY(t, in)
+
+	in.handleAccountCommand(dmMessage(42, ""), "add jairo.caroaccino@agentero.com claude")
+	in.handleAccountCommand(dmMessage(42, ""), "add jairo.caroaccino@agentero.com codex")
+
+	cfg := in.config()
+	claude := cfg.Profiles["jairo.caroaccino@agentero.com"]
+	codex := cfg.Profiles["jairo.caroaccino@agentero.com/codex"]
+	if claude == nil || profileEngine(*claude) != engineClaude {
+		t.Fatalf("claude profile missing: %+v", cfg.Profiles)
+	}
+	if codex == nil || profileEngine(*codex) != engineCodex {
+		t.Fatalf("codex profile missing: %+v", cfg.Profiles)
+	}
+	if codex.Label != "jairo.caroaccino@agentero.com" {
+		t.Errorf("codex label = %q, want the email", codex.Label)
+	}
+	if want := filepath.Join(in.dataDir, "accounts", engineCodex, "jairo.caroaccino_at_agentero.com"); codex.ConfigDir != want {
+		t.Errorf("codex home = %q, want %q", codex.ConfigDir, want)
+	}
+	if got := accountDisplay(Profile{Name: "jairo.caroaccino@agentero.com/codex", Engine: engineCodex, Label: "jairo.caroaccino@agentero.com"}); got != "jairo.caroaccino@agentero.com" {
+		t.Errorf("display = %q, want the email", got)
+	}
+
+	// Duplicate engine is still a no-op.
+	before := len(cfg.Profiles)
+	in.handleAccountCommand(dmMessage(42, ""), "add jairo.caroaccino@agentero.com codex")
+	if len(in.config().Profiles) != before {
+		t.Errorf("same engine was added twice: %+v", in.config().Profiles)
+	}
+	joined := strings.Join(api.texts(""), "\n")
+	if !strings.Contains(joined, "already exists") {
+		t.Errorf("duplicate same-engine add was not rejected:\n%s", joined)
+	}
+	if !strings.Contains(joined, "jairo.caroaccino@agentero.com/codex") {
+		t.Errorf("duplicate hint should name the composite login:\n%s", joined)
+	}
+}
+
+func TestAccountLoginDisambiguation(t *testing.T) {
+	in, _, api := testInstance(t)
+	in.setConfig(&Config{
+		BotToken: "TESTTOKEN", ChatID: 42, GroupID: -100777, DataDir: in.dataDir,
+		Profiles: map[string]*Profile{
+			"jairo@example.com":       {Engine: engineClaude, Label: "jairo@example.com", ConfigDir: "/tmp/c"},
+			"jairo@example.com/codex": {Engine: engineCodex, Label: "jairo@example.com", ConfigDir: "/tmp/x"},
+		},
+	})
+	if err := saveConfig(in.config()); err != nil {
+		t.Fatal(err)
+	}
+	stubPTY(t, in)
+
+	in.handleAccountCommand(dmMessage(42, ""), "login jairo@example.com")
+	bare := strings.Join(api.texts(""), "\n")
+	if !strings.Contains(bare, "Several accounts") {
+		t.Errorf("bare email should ask for the engine:\n%s", bare)
+	}
+	if !strings.Contains(bare, "jairo@example.com/codex") || !strings.Contains(bare, "jairo@example.com") {
+		t.Errorf("disambiguation should list both addresses:\n%s", bare)
+	}
+	if strings.Contains(bare, "Starting") {
+		t.Error("bare email must not start a login")
+	}
+
+	n := len(api.texts(""))
+	in.handleAccountCommand(dmMessage(42, ""), "login jairo@example.com/codex")
+	slash := strings.Join(api.texts("")[n:], "\n")
+	if !strings.Contains(slash, "Starting") || !strings.Contains(slash, "Codex") {
+		t.Errorf("email/codex should start the Codex login:\n%s", slash)
+	}
+
+	waitForLogin(t, in)
+	n = len(api.texts(""))
+	in.handleAccountCommand(dmMessage(42, ""), "login jairo@example.com claude")
+	words := strings.Join(api.texts("")[n:], "\n")
+	if !strings.Contains(words, "Starting") || !strings.Contains(words, "Claude") {
+		t.Errorf("email claude should start the Claude login:\n%s", words)
+	}
+
+	before := in.config().DefaultProfile
+	in.accountSetDefault(42, 0, "jairo@example.com")
+	if in.config().DefaultProfile != before {
+		t.Error("default with a shared email must not pick an engine silently")
 	}
 }

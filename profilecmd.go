@@ -90,6 +90,20 @@ Telegram: /account add <identity> <engine>
     ccc profile accept-disclaimer <id>            Record the Claude bypass-permissions disclaimer`)
 }
 
+// resolveProfileArg looks up a profile the way the owner typed it. A bare
+// email that exists on more than one engine is an error, not a silent pick.
+func resolveProfileArg(config *Config, name string) (Profile, error) {
+	matches := profilesForName(config, name)
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		return Profile{}, fmt.Errorf("no such profile: %s", name)
+	default:
+		return Profile{}, fmt.Errorf("%s", ambiguousAccountText(name, matches))
+	}
+}
+
 // loadConfigOrNil returns the config, or nil when there is none — every profile
 // helper treats nil as "no profiles configured", i.e. the implicit default.
 func loadConfigOrNil() *Config {
@@ -274,10 +288,11 @@ func profileRemove(name string) error {
 	if err != nil {
 		return err
 	}
-	// An email, or the legacy name the profile is still keyed by.
-	if p, ok := profileByName(config, name); ok {
-		name = p.Name
+	p, err := resolveProfileArg(config, name)
+	if err != nil {
+		return err
 	}
+	name = p.Name
 	if config.Profiles == nil || config.Profiles[name] == nil {
 		return fmt.Errorf("no such profile: %s", name)
 	}
@@ -309,9 +324,9 @@ func profileSetDefault(name string) error {
 	if err != nil {
 		return err
 	}
-	p, ok := profileByName(config, name)
-	if !ok {
-		return fmt.Errorf("no such profile: %s", name)
+	p, err := resolveProfileArg(config, name)
+	if err != nil {
+		return err
 	}
 	config.DefaultProfile = p.Name
 	if err := saveConfig(config); err != nil {
@@ -325,9 +340,9 @@ func profileSetDefault(name string) error {
 // isolated environment. It is interactive by design: ccc never handles
 // credentials itself.
 func profileLogin(name string) error {
-	p, ok := profileByName(loadConfigOrNil(), name)
-	if !ok {
-		return fmt.Errorf("no such profile: %s", name)
+	p, err := resolveProfileArg(loadConfigOrNil(), name)
+	if err != nil {
+		return err
 	}
 	home := engineHome(p)
 	if err := os.MkdirAll(home, 0700); err != nil {
@@ -363,9 +378,9 @@ func loginCLIArgs(p Profile) (string, []string, error) {
 // profile. It is idempotent, so running it on an already-accepted profile is a
 // no-op that still reports the state.
 func profileAcceptDisclaimer(name string) error {
-	p, ok := profileByName(loadConfigOrNil(), name)
-	if !ok {
-		return fmt.Errorf("no such profile: %s", name)
+	p, err := resolveProfileArg(loadConfigOrNil(), name)
+	if err != nil {
+		return err
 	}
 	if accepted, _ := bypassAccepted(p); accepted {
 		fmt.Printf("✅ %s had already accepted the bypass-permissions disclaimer (%s)\n", p.Name, profileSettings(p))

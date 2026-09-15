@@ -469,6 +469,55 @@ func TestListProfilesAndDefault(t *testing.T) {
 	})
 }
 
+func TestAccountKeysAndSharedEmailLookup(t *testing.T) {
+	if got := normalizeAccountKey("Jairo@X.com", engineClaude); got != "jairo@x.com" {
+		t.Errorf("claude key = %q", got)
+	}
+	if got := normalizeAccountKey("Jairo@X.com", engineCodex); got != "jairo@x.com/codex" {
+		t.Errorf("codex key = %q", got)
+	}
+	if got := normalizeAccountKey("work", engineGrok); got != "work/grok" {
+		t.Errorf("grok key = %q", got)
+	}
+
+	cfg := &Config{Profiles: map[string]*Profile{
+		"jairo@x.com":       {Engine: engineClaude, Label: "jairo@x.com", ConfigDir: "/tmp/c"},
+		"jairo@x.com/codex": {Engine: engineCodex, Label: "jairo@x.com", ConfigDir: "/tmp/x"},
+		"work/grok":         {Engine: engineGrok, Label: "work", ConfigDir: "/tmp/g"},
+	}}
+	if _, ok := profileByName(cfg, "jairo@x.com"); ok {
+		t.Fatal("bare email must not silently pick one of several engines")
+	}
+	if p, ok := profileByName(cfg, "jairo@x.com/codex"); !ok || profileEngine(p) != engineCodex {
+		t.Fatalf("email/codex = %+v ok=%v", p, ok)
+	}
+	if p, ok := profileByName(cfg, "jairo@x.com codex"); !ok || profileEngine(p) != engineCodex {
+		t.Fatalf("email codex = %+v ok=%v", p, ok)
+	}
+	if p, ok := profileByName(cfg, "jairo@x.com claude"); !ok || profileEngine(p) != engineClaude {
+		t.Fatalf("email claude = %+v ok=%v", p, ok)
+	}
+	if p, ok := profileByKey(cfg, "jairo@x.com"); !ok || profileEngine(p) != engineClaude {
+		t.Fatalf("exact Claude key = %+v ok=%v", p, ok)
+	}
+	if p, ok := profileByName(cfg, "work"); !ok || profileEngine(p) != engineGrok {
+		t.Fatalf("unique short name = %+v ok=%v", p, ok)
+	}
+	if p, exists := profileByIdentityEngine(cfg, "jairo@x.com", engineCodex); !exists || p.Name != "jairo@x.com/codex" {
+		t.Fatalf("identity+codex = %+v exists=%v", p, exists)
+	}
+	if _, exists := profileByIdentityEngine(cfg, "jairo@x.com", engineGrok); exists {
+		t.Fatal("email is not a grok account")
+	}
+
+	legacy := &Config{Profiles: map[string]*Profile{
+		"jairo@x.com": {Engine: engineCodex, Label: "jairo@x.com", ConfigDir: "/tmp/legacy"},
+	}}
+	if got := accountMapKey(legacy, "jairo@x.com", engineClaude); got != "jairo@x.com/claude" {
+		t.Errorf("claude key when email is taken = %q", got)
+	}
+}
+
 func TestClaudeEnvScrubsInheritedState(t *testing.T) {
 	// The leak this guards against: ccc started from inside a Claude Code
 	// session inherits these, and a child `claude` then authenticates and

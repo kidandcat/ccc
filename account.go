@@ -89,7 +89,7 @@ func (in *instance) collectAccountCards() []accountCard {
 
 	var cards []accountCard
 	for _, pr := range probes {
-		p, ok := profileByName(cfg, pr.p.Name)
+		p, ok := profileByKey(cfg, pr.p.Name)
 		if !ok {
 			p = pr.p
 		}
@@ -113,7 +113,7 @@ func (in *instance) collectAccountCards() []accountCard {
 // already recorded against the old key follow it so /usage stays whole.
 // It returns the key the profile is addressable by afterwards.
 func (in *instance) rememberProfileEmail(name, account string) string {
-	if p, ok := profileByName(in.config(), name); ok && profileEngine(p) != engineClaude {
+	if p, ok := profileByKey(in.config(), name); ok && profileEngine(p) != engineClaude {
 		return name
 	}
 	email := normalizeEmail(account)
@@ -263,21 +263,21 @@ func (in *instance) handleAccountCommand(msg *TelegramMessage, rest string) {
 
 	case "login":
 		if arg == "" {
-			in.reply(msg, "Usage: /account login &lt;identity&gt;")
+			in.reply(msg, "Usage: /account login &lt;identity&gt; [engine]")
 			return
 		}
 		in.startLogin(msg.Chat.ID, msg.MessageThreadID, arg)
 
 	case "remove":
 		if arg == "" {
-			in.reply(msg, "Usage: /account remove &lt;identity&gt;")
+			in.reply(msg, "Usage: /account remove &lt;identity&gt; [engine]")
 			return
 		}
 		in.accountAskRemove(msg, arg)
 
 	case "default":
 		if arg == "" {
-			in.reply(msg, "Usage: /account default &lt;identity&gt;")
+			in.reply(msg, "Usage: /account default &lt;identity&gt; [engine]")
 			return
 		}
 		in.accountSetDefault(msg.Chat.ID, msg.MessageThreadID, arg)
@@ -356,23 +356,24 @@ func (in *instance) accountAdd(msg *TelegramMessage, arg string) {
 		in.reply(msg, htmlEscape(err.Error()))
 		return
 	}
-	key := normalizeAccountKey(identity, engine)
-	if engine == engineClaude && !isAccountEmail(key) {
+	canon := normalizeEmail(identity)
+	if engine == engineClaude && !isAccountEmail(canon) {
 		in.reply(msg, "Claude accounts are identified by email: "+
 			"<code>/account add you@example.com claude</code>")
 		return
 	}
-	if engine != engineClaude && !isAccountIdentity(key) {
+	if engine != engineClaude && !isAccountIdentity(canon) {
 		in.reply(msg, "That identity is not a usable name. Use a short label or email, no spaces or slashes.")
 		return
 	}
 	cfg := in.config()
-	if p, exists := profileByName(cfg, key); exists {
+	if p, exists := profileByIdentityEngine(cfg, canon, engine); exists {
 		in.reply(msg, "That account already exists. Use <code>/account login "+
-			htmlEscape(accountDisplay(p))+"</code>.")
+			htmlEscape(accountAddress(p))+"</code>.")
 		return
 	}
-	dir := accountDirFor(cfg, engine, key)
+	key := accountMapKey(cfg, canon, engine)
+	dir := accountDirFor(cfg, engine, canon)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		in.reply(msg, "Could not create the config dir: "+htmlEscape(err.Error()))
 		return
@@ -383,7 +384,7 @@ func (in *instance) accountAdd(msg *TelegramMessage, arg string) {
 		}
 		// An explicit config dir per profile is what keeps two accounts'
 		// credentials apart; see profiles.go.
-		c.Profiles[key] = &Profile{Engine: engine, ConfigDir: dir, Label: key}
+		c.Profiles[key] = &Profile{Engine: engine, ConfigDir: dir, Label: canon}
 		if c.DefaultProfile == "" {
 			c.DefaultProfile = key
 		}
@@ -400,14 +401,18 @@ func (in *instance) accountAdd(msg *TelegramMessage, arg string) {
 	if engine == engineClaude {
 		linkSharedProjects(updated)
 	}
-	in.reply(msg, "➕ Added <b>"+htmlEscape(key)+"</b> ("+htmlEscape(engineLabel(engine))+"). Logging it in now...")
+	in.reply(msg, "➕ Added <b>"+htmlEscape(canon)+"</b> ("+htmlEscape(engineLabel(engine))+"). Logging it in now...")
 	in.startLogin(msg.Chat.ID, msg.MessageThreadID, key)
 }
 
 func (in *instance) accountSetDefault(chatID, topicID int64, name string) {
 	cfg := in.config()
-	p, ok := profileByName(cfg, name)
+	p, hint, ok := addressedAccount(cfg, name)
 	if !ok {
+		if hint != "" {
+			in.post(chatID, topicID, hint)
+			return
+		}
 		in.post(chatID, topicID, "No account <b>"+htmlEscape(name)+"</b>.")
 		return
 	}
@@ -425,8 +430,16 @@ func (in *instance) accountSetDefault(chatID, topicID int64, name string) {
 // otherwise asks for a button confirmation before unregistering it.
 func (in *instance) accountAskRemove(msg *TelegramMessage, name string) {
 	cfg := in.config()
-	p, ok := profileByName(cfg, name)
-	if !ok || cfg.Profiles[p.Name] == nil {
+	p, hint, ok := addressedAccount(cfg, name)
+	if !ok {
+		if hint != "" {
+			in.reply(msg, hint)
+			return
+		}
+		in.reply(msg, "No account <b>"+htmlEscape(name)+"</b>.")
+		return
+	}
+	if cfg.Profiles[p.Name] == nil {
 		in.reply(msg, "No account <b>"+htmlEscape(name)+"</b>.")
 		return
 	}
@@ -446,7 +459,9 @@ func (in *instance) accountAskRemove(msg *TelegramMessage, name string) {
 
 func (in *instance) accountRemove(name string) string {
 	shown := name
-	if p, ok := profileByName(in.config(), name); ok {
+	if p, ok := profileByKey(in.config(), name); ok {
+		name, shown = p.Name, accountDisplay(p)
+	} else if p, ok := profileByName(in.config(), name); ok {
 		name, shown = p.Name, accountDisplay(p)
 	}
 	// Re-check under the confirmation: a turn may have started meanwhile.
@@ -574,15 +589,24 @@ func (t telegramPrompter) AskForCode(ctx context.Context, url string) (string, e
 // reporting into the chat it was started from.
 func (in *instance) startLogin(chatID, topicID int64, name string) {
 	cfg := in.config()
-	p, ok := profileByName(cfg, name)
+	p, hint, ok := addressedAccount(cfg, name)
 	if !ok {
-		hint := ""
-		if isAccountEmail(name) || isAccountIdentity(name) {
-			hint = " Add it with <code>/account add " + htmlEscape(strings.ToLower(strings.TrimSpace(name))) + " &lt;engine&gt;</code>."
+		if hint != "" {
+			in.post(chatID, topicID, hint)
+			return
 		}
-		in.post(chatID, topicID, "No account <b>"+htmlEscape(name)+"</b>."+hint)
+		addHint := ""
+		identity, _ := parseAccountRef(name)
+		if identity == "" {
+			identity = strings.ToLower(strings.TrimSpace(name))
+		}
+		if isAccountEmail(identity) || isAccountIdentity(identity) {
+			addHint = " Add it with <code>/account add " + htmlEscape(identity) + " &lt;engine&gt;</code>."
+		}
+		in.post(chatID, topicID, "No account <b>"+htmlEscape(name)+"</b>."+addHint)
 		return
 	}
+	name = p.Name
 
 	ctx, cancel := context.WithTimeout(context.Background(), ptyLoginTimeout)
 	waiter := &loginWaiter{chatID: chatID, topicID: topicID, profile: name, codes: make(chan string, 1), cancel: cancel}
@@ -630,7 +654,7 @@ func (in *instance) startLogin(chatID, topicID int64, name string) {
 		// Other engines have no equivalent gate.
 		if profileEngine(p) == engineClaude {
 			target := p
-			if fresh, ok := profileByName(in.config(), name); ok {
+			if fresh, ok := profileByKey(in.config(), name); ok {
 				target = fresh
 			}
 			if err := acceptBypassDisclaimer(target); err != nil {

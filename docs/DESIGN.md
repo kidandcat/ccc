@@ -363,12 +363,21 @@ older than 90 days.
 ### Account management from Telegram (login without a terminal)
 Engine is defined when the account is added (`/account add <identity> <engine>`),
 not by flipping `/engine` on a bot. Claude identities are the **email** of the
-Claude account; Grok and Antigravity accept a short name or email. The
+Claude account; Grok, Antigravity and Codex accept a short name or email. The
 directory behind the account is never shown:
 
-- The profile key in `config.json` is the address, lowercased. The config dir is
-  derived from it (`jairo@agentero.com` → `<data_dir>/profiles/jairo_at_agentero.com`)
-  and is an implementation detail: it is never shown in Telegram.
+- The profile key in `config.json` is unique per **identity + engine**. Claude
+  keeps the address, lowercased, so existing Claude-only configs stay valid.
+  Every other engine uses a composite key (`jairo@agentero.com/codex`). The
+  same email may exist once per engine — `/account add you@x.com claude` and
+  `/account add you@x.com codex` are two accounts. `label` is the human
+  identity (the email); status cards show that, with the engine beside it.
+  The config dir is derived from the identity (`jairo@agentero.com` →
+  `<data_dir>/profiles/jairo_at_agentero.com`, or
+  `<data_dir>/accounts/<engine>/…` for non-Claude) and is never shown in
+  Telegram. `/account login you@x.com` works when only one profile has that
+  email; when several engines share it, the owner specifies the engine
+  (`you@x.com/codex` or `you@x.com codex`).
 - The address is learned from `claude auth status --json` and cached in the
   profile's `label`. Every doctor run (§7) refreshes it, and a profile that is
   still keyed by a legacy name is re-keyed onto its address then — the config
@@ -396,7 +405,8 @@ directory behind the account is never shown:
    (0600, atomic, other keys kept) and re-checks it with `bypassAccepted`. That
    key is the whole acceptance, so no TUI is driven for it (§14.23).
 4. Times out after 10 min; the partial profile is removed.
-`/account login <email>` runs steps 2–3 only. Every PTY string and pattern lives
+`/account login <email>` (or `<email>/<engine>` when the same identity exists
+on more than one engine) runs steps 2–3 only. Every PTY string and pattern lives
 in `ptyflow.go`, each with a note on how it was verified against 2.1.270
 (§14.9). Select lists are answered by reading the option number off the screen,
 never by assuming a position.

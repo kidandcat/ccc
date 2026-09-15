@@ -138,34 +138,114 @@ func listProfiles(config *Config) []Profile {
 	return out
 }
 
-// profileByName resolves a profile by the way the owner addressed it. Accounts
-// are identified by their email (DESIGN §8), but the lookup also accepts the
-// legacy name a profile was keyed by before its email was known, and matches
-// case-insensitively — an email typed with capitals is the same account.
-// An empty name means "the default".
-func profileByName(config *Config, name string) (Profile, bool) {
+// profileByKey resolves a profile by its config-map key. Buttons, pickAccount
+// and other internal callers have a real key; they must not go through
+// profileByName, which treats a bare email as ambiguous when several engines
+// share it.
+func profileByKey(config *Config, name string) (Profile, bool) {
 	if name == "" {
 		return defaultProfile(config), true
 	}
-	all := listProfiles(config)
-	for _, p := range all {
+	for _, p := range listProfiles(config) {
 		if p.Name == name {
 			return p, true
 		}
 	}
-	key := normalizeEmail(name)
-	for _, p := range all {
-		if normalizeEmail(p.Name) == key {
-			return p, true
-		}
-	}
-	// The email is known but the profile is still keyed by its legacy name.
-	for _, p := range all {
-		if normalizeEmail(p.Label) == key {
-			return p, true
-		}
+	return Profile{}, false
+}
+
+// profileByName resolves a profile by the way the owner addressed it. A bare
+// identity (usually an email) matches when exactly one profile uses it. When
+// several engines share that identity the lookup fails — the owner must name
+// the engine (`email/codex` or `email codex`). The config-map key and the
+// legacy name a profile was keyed by before its email was known still match,
+// case-insensitively. An empty name means "the default".
+func profileByName(config *Config, name string) (Profile, bool) {
+	matches := profilesForName(config, name)
+	if len(matches) == 1 {
+		return matches[0], true
 	}
 	return Profile{}, false
+}
+
+// profilesForName is the shared lookup behind profileByName and the
+// "specify the engine" reply. Zero matches means unknown; more than one means
+// the identity is shared across engines.
+func profilesForName(config *Config, name string) []Profile {
+	if name == "" {
+		return []Profile{defaultProfile(config)}
+	}
+	identity, engine := parseAccountRef(name)
+	if identity == "" {
+		return nil
+	}
+	if matches := profilesMatching(config, identity, engine); len(matches) > 0 {
+		return matches
+	}
+	if engine != "" {
+		return nil
+	}
+	// A legacy key ("default", "work") whose label is already an email: the
+	// identity parse does not see the key, but the owner can still type it.
+	key := normalizeEmail(name)
+	var out []Profile
+	for _, p := range listProfiles(config) {
+		if p.Name == name || normalizeEmail(p.Name) == key {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// profilesMatching finds profiles with this identity, optionally restricted
+// to one engine. Identity is the human address (email or short name), not the
+// config-map key.
+func profilesMatching(config *Config, identity, engine string) []Profile {
+	identity = normalizeEmail(identity)
+	if identity == "" {
+		return nil
+	}
+	if engine != "" {
+		if e, err := parseEngine(engine); err == nil {
+			engine = e
+		}
+	}
+	var out []Profile
+	for _, p := range listProfiles(config) {
+		if engine != "" && profileEngine(p) != engine {
+			continue
+		}
+		if profileIdentity(p) == identity || normalizeEmail(p.Name) == identity {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// profileByIdentityEngine is the existence check for /account add: the same
+// email on a different engine is a different account.
+func profileByIdentityEngine(config *Config, identity, engine string) (Profile, bool) {
+	if e, err := parseEngine(engine); err == nil {
+		engine = e
+	}
+	matches := profilesMatching(config, identity, engine)
+	if len(matches) == 0 {
+		return Profile{}, false
+	}
+	return matches[0], true
+}
+
+// profileIdentity is the human address a profile is known by: its label
+// (the email the owner typed, or the one auth status reported) or the
+// identity half of a composite key.
+func profileIdentity(p Profile) string {
+	if label := strings.TrimSpace(p.Label); label != "" {
+		return normalizeEmail(label)
+	}
+	if id, _, ok := splitAccountKey(p.Name); ok {
+		return id
+	}
+	return normalizeEmail(p.Name)
 }
 
 // ---------------------------------------------------------------------------
@@ -191,14 +271,141 @@ func isAccountIdentity(s string) bool { return accountIdentityRe.MatchString(str
 // case-insensitive in practice and the config map is not.
 func normalizeEmail(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
 
-// normalizeAccountKey is the config-map key for an identity. Claude stays
-// email-canonical; other engines are just lowercased.
+// normalizeAccountKey is the config-map key for an identity + engine.
+// Claude keeps the plain email so existing configs stay valid. Every other
+// engine (and a Claude account whose email is already taken by another
+// engine) uses `identity/engine` (e.g. `jairo@x.com/codex`).
 func normalizeAccountKey(identity, engine string) string {
-	identity = strings.TrimSpace(identity)
-	if profileEngine(Profile{Engine: engine}) == engineClaude {
-		return normalizeEmail(identity)
+	identity = normalizeEmail(identity)
+	e, err := parseEngine(engine)
+	if err != nil {
+		e = engineClaude
 	}
-	return strings.ToLower(identity)
+	if e == engineClaude {
+		return identity
+	}
+	return identity + "/" + e
+}
+
+// accountMapKey picks a unique Profiles map key. It is normalizeAccountKey
+// unless that string is already occupied by a different engine, in which
+// case Claude also gets the composite form (`email/claude`).
+func accountMapKey(config *Config, identity, engine string) string {
+	preferred := normalizeAccountKey(identity, engine)
+	if p, ok := profileByKey(config, preferred); ok && profileEngine(p) != profileEngine(Profile{Engine: engine}) {
+		e, err := parseEngine(engine)
+		if err != nil {
+			e = engineClaude
+		}
+		return normalizeEmail(identity) + "/" + e
+	}
+	return preferred
+}
+
+// splitAccountKey reads a composite `identity/engine` key. A bare email or
+// short name is not composite.
+func splitAccountKey(s string) (identity, engine string, ok bool) {
+	s = strings.TrimSpace(s)
+	i := strings.LastIndex(s, "/")
+	if i <= 0 || i == len(s)-1 {
+		return "", "", false
+	}
+	e, known := knownEngineName(s[i+1:])
+	if !known {
+		return "", "", false
+	}
+	return normalizeEmail(s[:i]), e, true
+}
+
+// parseAccountRef reads how the owner addressed an account:
+//
+//	you@example.com
+//	you@example.com/codex
+//	you@example.com codex
+//	codex you@example.com
+func parseAccountRef(s string) (identity, engine string) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", ""
+	}
+	if id, eng, ok := splitAccountKey(s); ok {
+		return id, eng
+	}
+	first, rest := splitFirstWord(s)
+	second, extra := splitFirstWord(rest)
+	if strings.TrimSpace(extra) != "" {
+		return normalizeEmail(s), ""
+	}
+	if second == "" {
+		return normalizeEmail(first), ""
+	}
+	if e, ok := knownEngineName(second); ok {
+		return normalizeEmail(first), e
+	}
+	if e, ok := knownEngineName(first); ok {
+		return normalizeEmail(second), e
+	}
+	return normalizeEmail(s), ""
+}
+
+// accountAddress is the unambiguous form to type back: the email when that
+// is unique to Claude, otherwise `identity/engine`.
+func accountAddress(p Profile) string {
+	return normalizeAccountKey(profileIdentity(p), profileEngine(p))
+}
+
+// addressedAccount is the user-facing lookup: unique match, not found, or
+// "specify the engine". hint is HTML for Telegram (empty when ok or unknown).
+func addressedAccount(config *Config, name string) (Profile, string, bool) {
+	matches := profilesForName(config, name)
+	switch len(matches) {
+	case 1:
+		return matches[0], "", true
+	case 0:
+		return Profile{}, "", false
+	default:
+		return Profile{}, ambiguousAccountHTML(name, matches), false
+	}
+}
+
+func ambiguousAccountHTML(typed string, matches []Profile) string {
+	return "Several accounts use <b>" + htmlEscape(accountRefIdentity(typed, matches)) +
+		"</b>. Specify the engine: " + joinAccountRefsHTML(matches) + "."
+}
+
+func ambiguousAccountText(typed string, matches []Profile) string {
+	refs := accountRefList(matches)
+	return fmt.Sprintf("several accounts use %s; specify the engine (%s)",
+		accountRefIdentity(typed, matches), strings.Join(refs, " or "))
+}
+
+func accountRefIdentity(typed string, matches []Profile) string {
+	identity, _ := parseAccountRef(typed)
+	if identity != "" {
+		return identity
+	}
+	if len(matches) > 0 {
+		return profileIdentity(matches[0])
+	}
+	return strings.TrimSpace(typed)
+}
+
+func accountRefList(matches []Profile) []string {
+	refs := make([]string, 0, len(matches))
+	for _, p := range matches {
+		refs = append(refs, accountAddress(p))
+	}
+	sort.Strings(refs)
+	return refs
+}
+
+func joinAccountRefsHTML(matches []Profile) string {
+	refs := accountRefList(matches)
+	escaped := make([]string, 0, len(refs))
+	for _, r := range refs {
+		escaped = append(escaped, "<code>"+htmlEscape(r)+"</code>")
+	}
+	return strings.Join(escaped, " or ")
 }
 
 // knownEngineName reports whether s is an engine name or alias (not empty).
@@ -237,16 +444,21 @@ func profileDirName(email string) string {
 	return out
 }
 
-// accountDisplay is how a profile is named in Telegram: its email. A profile
-// whose email is not known yet — a legacy name from before accounts were
-// addressed by email, or a config dir that has never logged in — falls back to
-// its key, which is what the owner can still address it by.
+// accountDisplay is how a profile is named in Telegram: its email (or the
+// short identity the owner typed). The engine is shown separately via
+// engineLabel; composite keys like `you@x.com/codex` are never the title.
 func accountDisplay(p Profile) string {
 	if isAccountEmail(p.Name) {
 		return p.Name
 	}
 	if isAccountEmail(p.Label) {
 		return normalizeEmail(p.Label)
+	}
+	if label := strings.TrimSpace(p.Label); label != "" {
+		return label
+	}
+	if id, _, ok := splitAccountKey(p.Name); ok {
+		return id
 	}
 	return p.Name
 }
@@ -276,7 +488,7 @@ func resolveAccountTarget(config *Config, target string) (Profile, bool) {
 		}
 		return Profile{}, false
 	}
-	return profileByName(config, target)
+	return profileByKey(config, target)
 }
 
 // profileDirFor picks the config dir for a new account. Two different addresses

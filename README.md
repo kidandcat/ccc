@@ -163,8 +163,10 @@ ccc records the group id. Then, anywhere:
 
 (`/account add you@example.com` still works: omitted engine is Claude.)
 
-An account is its identity plus its engine. Claude identities are emails; Grok
-and Antigravity accept a short name or email. ccc derives an isolated home
+An account is its identity plus its engine. The same email can be registered
+on more than one engine (a Claude profile and a Codex profile may share
+`you@example.com`). Claude identities are emails; Grok and Antigravity
+accept a short name or email. ccc derives an isolated home
 behind it (you never see or type that path). For Claude it runs
 `claude auth login` on a pseudo-terminal and posts the login URL. Open it on a
 device where you are signed in to the right account, and send the code it gives
@@ -261,7 +263,7 @@ the turn finishes — that is the ping you get — and your message gets a ✅.
 |---|---|
 | `/account` | Status card per account (engine + health), with buttons. |
 | `/account add <identity> <engine>` | Register an account for that engine and start its login. |
-| `/account login\|remove\|default <identity>` | Relogin, remove, or make default (new bots inherit that account's engine). |
+| `/account login\|remove\|default <identity> [engine]` | Relogin, remove, or make default (new bots inherit that account's engine). If the same email exists on several engines, pass `email/codex` or `email codex`. |
 | `/access` | Who may talk to ccc (see below). |
 | `/model [name]` | Show or set the model every bot runs on. `/model default` clears it. |
 | `/setgroup` | Bind ccc to the forum group the command was sent in. |
@@ -381,7 +383,8 @@ An approved user can talk to the bots. They cannot use `/account`, `/access`,
 
 Engine is a property of an **account**, set when you add it. One ccc process
 can mix several Claude emails, several Grok logins, several Antigravity
-logins and several Codex logins. A bot's turns pick a healthy account from
+logins and several Codex logins — including the **same email on different
+engines**. A bot's turns pick a healthy account from
 the pool that matches what that bot runs on. New bots inherit the default
 account's engine (or `default_engine` if you set one). `/engine` only assigns
 a bot onto another already-registered pool — it is not the way you introduce
@@ -400,10 +403,12 @@ the instance default for that engine. Empty means the CLI's own default.
 
 ```
 /account add you@example.com claude
+/account add you@example.com codex   # same email, different engine
 /account add work grok
 /account add lab antigravity
 /account add openai codex
 /account                         # mixed list: identity, engine, health
+/account login you@example.com/codex # required when that email is on several engines
 
 /engine                          # which pool this bot uses
 /engine grok                     # assign this bot to the Grok pool (secondary)

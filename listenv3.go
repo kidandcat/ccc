@@ -1145,7 +1145,7 @@ func (in *instance) renderStatus() string {
 		// Accounts are named by their email here too; the key is only what
 		// profile selection works with.
 		shown := s.Name
-		if p, ok := profileByName(cfg, s.Name); ok {
+		if p, ok := profileByKey(cfg, s.Name); ok {
 			shown = accountDisplay(p)
 		}
 		if s.Engine == engineClaude {

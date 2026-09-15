@@ -1088,7 +1088,7 @@ func (r *Runner) pickAccount(engine string, exclude map[string]bool) (Profile, b
 		return Profile{}, false
 	}
 	name := chooseProfile(open, now)
-	p, ok := profileByName(cfg, name)
+	p, ok := profileByKey(cfg, name)
 	return p, ok
 }
 
