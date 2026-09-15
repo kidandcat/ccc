@@ -61,7 +61,7 @@ type Turn struct {
 	BotID      int64 `gorm:"index;index:idx_turn_bot_created,priority:1;not null"`
 	SessionID  string
 	Profile    string
-	Source     string `gorm:"not null"` // user|bot|schedule|watch|system
+	Source     string `gorm:"not null"` // user|bot|schedule|watch|routine|system|background
 	Input      string
 	Output     string
 	Status     string `gorm:"index;not null"` // queued|running|done|failed
@@ -83,12 +83,13 @@ const (
 	turnDone    = "done"
 	turnFailed  = "failed"
 
-	sourceUser     = "user"
-	sourceBot      = "bot"
-	sourceSchedule = "schedule"
-	sourceWatch    = "watch"
-	sourceRoutine  = "routine"
-	sourceSystem   = "system"
+	sourceUser       = "user"
+	sourceBot        = "bot"
+	sourceSchedule   = "schedule"
+	sourceWatch      = "watch"
+	sourceRoutine    = "routine"
+	sourceSystem     = "system"
+	sourceBackground = "background"
 )
 
 // InboxMessage is a message addressed to a bot that has not been folded into a
@@ -212,6 +213,38 @@ type Access struct {
 
 func (Access) TableName() string { return "access" }
 
+// BackgroundJob is a long-running shell command owned by a bot (DESIGN §7).
+// It runs outside the conversational turn: status here is independent of
+// turns.status, so the topic stays responsive while the job works.
+type BackgroundJob struct {
+	ID              int64 `gorm:"primaryKey"`
+	BotID           int64 `gorm:"index;not null"`
+	Name            string
+	Status          string `gorm:"index;not null"` // queued|running|done|failed
+	Kind            string // "shell"
+	Command         string
+	PID             int
+	ExitCode        *int
+	Output          string
+	Error           string
+	CancelRequested bool
+	CreatedByTurnID *int64
+	StartedAt       *time.Time
+	EndedAt         *time.Time `gorm:"index"`
+	CreatedAt       time.Time
+}
+
+func (BackgroundJob) TableName() string { return "background_jobs" }
+
+// Background job statuses and the only kind v3 implements.
+const (
+	jobQueued    = "queued"
+	jobRunning   = "running"
+	jobDone      = "done"
+	jobFailed    = "failed"
+	jobKindShell = "shell"
+)
+
 // Setting is an instance setting editable from Telegram.
 type Setting struct {
 	Key   string `gorm:"column:key;primaryKey"`
@@ -223,7 +256,7 @@ type Setting struct {
 func allModels() []any {
 	return []any{
 		&Bot{}, &Turn{}, &InboxMessage{}, &Memory{}, &MemoryArchive{}, &Project{},
-		&Watch{}, &Schedule{}, &Question{}, &Access{}, &Setting{},
+		&Watch{}, &Schedule{}, &Question{}, &Access{}, &Setting{}, &BackgroundJob{},
 	}
 }
 
@@ -490,7 +523,7 @@ func resolveTopicIcon(db *gorm.DB, config *Config, emoji string) (iconID, note s
 }
 
 // maxBotNameLen caps a bot name, in characters. A name is a topic title, the
-// address send_to_bot/spawn_bot use, and part of the system prompt, so it stays
+// address send_to_bot/list_bots use, and part of the system prompt, so it stays
 // short enough to read in a topic list.
 const maxBotNameLen = 64
 
@@ -806,10 +839,10 @@ func botByCwd(db *gorm.DB, path string) (*Bot, error) {
 // ---------------------------------------------------------------------------
 
 // createBotRow creates a bot end to end: a unique name, a forum topic, a
-// workspace and the database row. Both the Telegram layer and the spawn_bot
-// MCP tool go through it, so a spawned bot is identical to one the owner made.
+// workspace and the database row. Only the owner creates bots (plain text in
+// General, or /bot); there is no MCP tool for it.
 // A cwd of "" means the bot gets its own workspace under <data_dir>/bots.
-func createBotRow(db *gorm.DB, config *Config, name, role, cwd string, parentBotID *int64) (*Bot, error) {
+func createBotRow(db *gorm.DB, config *Config, name, role, cwd string) (*Bot, error) {
 	name = uniqueBotName(db, sanitizeBotName(name))
 	topicID, err := createForumTopic(config, name)
 	if err != nil {
@@ -822,12 +855,7 @@ func createBotRow(db *gorm.DB, config *Config, name, role, cwd string, parentBot
 		return nil, err
 	}
 	engine := defaultEngine(config)
-	if parentBotID != nil {
-		if parent, err := botByID(db, *parentBotID); err == nil {
-			engine = botEngine(parent)
-		}
-	}
-	b := &Bot{Name: name, TopicID: topicID, Role: role, Cwd: cwd, Engine: engine, Status: botIdle, ParentBotID: parentBotID}
+	b := &Bot{Name: name, TopicID: topicID, Role: role, Cwd: cwd, Engine: engine, Status: botIdle}
 	if err := db.Create(b).Error; err != nil {
 		return nil, err
 	}
@@ -847,5 +875,14 @@ func archiveBotRow(db *gorm.DB, botID int64) error {
 		Updates(map[string]any{"status": turnFailed, "stop_reason": "bot archived"})
 	db.Model(&Watch{}).Where("bot_id = ?", botID).Update("enabled", false)
 	db.Model(&Schedule{}).Where("bot_id = ? AND fired_at IS NULL", botID).Update("fired_at", now)
+	var running []BackgroundJob
+	db.Where("bot_id = ? AND status IN ?", botID, []string{jobQueued, jobRunning}).Find(&running)
+	for i := range running {
+		if running[i].PID > 0 {
+			killProcessGroup(running[i].PID)
+		}
+	}
+	db.Model(&BackgroundJob{}).Where("bot_id = ? AND status IN ?", botID, []string{jobQueued, jobRunning}).
+		Updates(map[string]any{"status": jobFailed, "error": "bot archived", "ended_at": now, "cancel_requested": true})
 	return nil
 }

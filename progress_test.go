@@ -9,13 +9,14 @@ import (
 
 // fakeUI records what the runner would have sent to Telegram.
 type fakeUI struct {
-	posts     []string
-	edits     []string
-	deleted   []int64
-	editErr   error
-	postErr   error
-	deleteErr error
-	nextID    int64
+	posts       []string
+	silentPosts []bool
+	edits       []string
+	deleted     []int64
+	editErr     error
+	postErr     error
+	deleteErr   error
+	nextID      int64
 }
 
 func (f *fakeUI) Post(_ int64, html string) (int64, error) {
@@ -23,6 +24,17 @@ func (f *fakeUI) Post(_ int64, html string) (int64, error) {
 		return 0, f.postErr
 	}
 	f.posts = append(f.posts, html)
+	f.silentPosts = append(f.silentPosts, false)
+	f.nextID++
+	return f.nextID, nil
+}
+
+func (f *fakeUI) PostSilent(_ int64, html string) (int64, error) {
+	if f.postErr != nil {
+		return 0, f.postErr
+	}
+	f.posts = append(f.posts, html)
+	f.silentPosts = append(f.silentPosts, true)
 	f.nextID++
 	return f.nextID, nil
 }
@@ -54,18 +66,24 @@ func TestProgressFinishRendersModelMarkdown(t *testing.T) {
 
 	p.finish("Use `Authorization: Bearer <20>:<20>` with **<token_del_agente>**")
 
-	if len(ui.edits) != 1 {
-		t.Fatalf("expected the final reply to be edited in, got edits=%v posts=%v", ui.edits, ui.posts)
+	if len(ui.posts) != 2 {
+		t.Fatalf("expected progress + final reply, got posts=%v edits=%v", ui.posts, ui.edits)
 	}
-	final := ui.edits[len(ui.edits)-1]
+	if !ui.silentPosts[0] {
+		t.Fatal("the progress message must be posted silently")
+	}
+	if ui.silentPosts[1] {
+		t.Fatal("the final reply must notify")
+	}
+	final := ui.posts[1]
 	if strings.Contains(final, "<20>") || strings.Contains(final, "<token_del_agente>") {
 		t.Fatalf("raw angle brackets reached Telegram: %q", final)
 	}
 	if err := checkTelegramHTML(final); err != nil {
 		t.Fatalf("final reply is not valid Telegram HTML: %v (%q)", err, final)
 	}
-	if len(ui.posts) != 1 {
-		t.Fatalf("expected only the progress message to be posted, got %v", ui.posts)
+	if len(ui.deleted) != 1 {
+		t.Fatalf("the silent progress message should have been deleted, deleted=%v", ui.deleted)
 	}
 }
 
@@ -74,7 +92,6 @@ func TestProgressFinishDeletesTheStaleProgressMessage(t *testing.T) {
 	p := newProgress(ui, 7, time.Now())
 	p.set("writing a reply")
 	progressID := ui.nextID
-	ui.editErr = errors.New("telegram error: Bad Request: message to edit not found")
 
 	p.finish("done")
 
@@ -94,8 +111,6 @@ func TestProgressFinishFallsBackToEditingWhenDeleteFails(t *testing.T) {
 	p := newProgress(ui, 7, time.Now())
 	p.set("writing a reply")
 
-	// The first Edit (the final reply) fails; the retiring Edit must still run.
-	ui.editErr = errors.New("telegram error: can't parse entities")
 	p.finish("done")
 
 	ui.editErr = nil
@@ -121,6 +136,37 @@ func TestProgressFinishSplitsLongRepliesIntoValidChunks(t *testing.T) {
 		if err := checkTelegramHTML(c); err != nil {
 			t.Errorf("chunk %d is not valid Telegram HTML: %v", i+1, err)
 		}
+	}
+}
+
+func TestProgressMessagesAreSilentUntilFinish(t *testing.T) {
+	in, _, api := testInstance(t)
+	ui := telegramUI{in}
+	p := newProgress(ui, 7, time.Now())
+	p.set("running tests")
+
+	sends := api.since("sendMessage")
+	if len(sends) != 1 {
+		t.Fatalf("expected one progress send, got %d", len(sends))
+	}
+	if sends[0].Params.Get("disable_notification") != "true" {
+		t.Fatalf("progress create must set disable_notification, params=%v", sends[0].Params)
+	}
+
+	p.finish("all green")
+	sends = api.since("sendMessage")
+	if len(sends) < 2 {
+		t.Fatalf("expected progress + final, got %d sends", len(sends))
+	}
+	final := sends[len(sends)-1]
+	if got := final.Params.Get("text"); got != "all green" {
+		t.Fatalf("final text = %q", got)
+	}
+	if final.Params.Get("disable_notification") == "true" {
+		t.Fatal("the final answer must notify")
+	}
+	if len(api.since("deleteMessage")) != 1 {
+		t.Fatal("the silent progress message should have been deleted")
 	}
 }
 

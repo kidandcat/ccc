@@ -33,7 +33,7 @@ the Telegram UX.
                                   │        ccc mcp (stdio)             │
                                   └────────────────────────────────────┘
               remember · recall · ask_owner · send_to_bot · watch ·
-              schedule_wakeup · spawn_bot · set_name · get_project · send_file
+              schedule_wakeup · run_background · set_name · get_project · send_file
 ```
 
 ### Concepts
@@ -48,6 +48,7 @@ the Telegram UX.
 | **Memory** | Durable facts in three scopes: `user` (about you, shared by all bots), `project` (about one code base) and `bot` (private). |
 | **Watch** | A command re-run on an interval. The bot is woken **only when the output changes**, with a diff. Nothing changing costs nothing. |
 | **Schedule** | A wakeup at a time, or on a cron expression. |
+| **Background job** | A long shell command in the same topic. The bot stays responsive; it is woken when the job finishes. |
 
 ### What a bot sees
 
@@ -223,7 +224,8 @@ picks a fitting name and topic icon for itself — or set them yourself with
 | A reply to a question | Answers it. Any text while a bot is waiting counts as the answer too. |
 
 While a turn runs, one progress message in the topic is edited in place with
-what the bot is doing. It is replaced by the answer, and your message gets a ✅.
+what the bot is doing (no Telegram notification). The answer is posted when
+the turn finishes — that is the ping you get — and your message gets a ✅.
 
 ### Commands
 
@@ -279,8 +281,11 @@ Every bot has these tools, and uses them without being told:
 - `set_routine` / `list_routines` / `cancel_routine` — named recurring work,
   timezone-aware (default `Europe/Madrid`), ⏰ in the topic when it fires.
   Grok/agy: `ccc routine add <name> --cron "0 9 * * 1-5" <prompt>`.
-- `spawn_bot` / `archive_bot` — create a helper with its own topic, which
-  reports back with `send_to_bot`; archive it when the job is done.
+- `run_background` / `list_background` / `get_background` / `cancel_background`
+  — start a long shell command without blocking the turn (builds, installs,
+  waits). The bot is woken with the result when it finishes. Only the owner
+  creates bots (a message in General); bots cannot spawn teammates.
+- `archive_bot` — retire a bot (usually itself) and close its topic.
 - `get_project` / `set_project` — the team's shared notes about a code base.
 - `update_instructions` — rewrite its own role.
 - `set_name` — rename itself and set its topic icon. The icon must be one of the
@@ -293,8 +298,9 @@ Every bot has these tools, and uses them without being told:
 **One turn per burst, not per message.** When you send three lines in a row, an
 idle bot waits `debounce_ms` (default 2500) for you to stop typing and answers
 all of them in ONE `claude -p` run. Messages that arrive while a turn is running
-already queue and are delivered together on the next one. A watch, a schedule or
-another bot is never delayed. `ccc config set debounce_ms 0` turns the wait off.
+already queue and are delivered together on the next one. A watch, a schedule,
+a background job or another bot is never delayed. `ccc config set debounce_ms 0`
+turns the wait off.
 
 **Resumed turns are mostly cache reads.** The system prompt of a session is
 byte-stable from turn to turn (the roster and icon list are sorted, nothing that

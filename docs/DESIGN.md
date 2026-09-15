@@ -1,10 +1,11 @@
 # ccc v3 — design
 
-Status: implemented (Phases 2a and 2b, 2026-09-14). This document is the
-specification the implementation follows. When code and this document disagree,
-fix one of them in the same change. Everything below describes what ccc v3
-actually does; §14 lists where the built thing knowingly departs from the
-original plan, and why.
+Status: implemented (Phases 2a and 2b, 2026-09-14; background jobs and
+owner-only bot creation, 2026-09-15). This document is the specification the
+implementation follows. When code and this document disagree, fix one of them
+in the same change. Everything below describes what ccc v3 actually does;
+§14 lists where the built thing knowingly departs from the original plan, and
+why.
 
 ## 1. What ccc v3 is
 
@@ -18,8 +19,8 @@ to a person. No commands in the normal flow, no ceremony, no terminal.
 
 Non-goals (explicitly dropped from v2): Claude Code background agents, the
 agents view, `claude attach` handoff, transcript scraping, the AskUserQuestion
-PreToolUse hook hack. One ccc instance never talks to more than one Telegram
-bot.
+PreToolUse hook hack. Bots cannot create other bots (`spawn_bot` was removed
+on purpose). One ccc instance never talks to more than one Telegram bot.
 
 ## 2. Runtime model
 
@@ -29,12 +30,13 @@ bot.
 | **Profile** | One account for one engine (see `profiles.go`). Claude = one `CLAUDE_CONFIG_DIR`. Grok = isolated `GROK_HOME`. Antigravity = isolated HOME/`GEMINI_HOME`. Engine is set when the account is added. Same-engine accounts are interchangeable at turn granularity (§4). One instance may mix engines. |
 | **Bot** | One forum topic. Identity = `name` + `role` (free text set with `/role`) + its own memory scope + an **engine** derived from the default account (or `default_engine`). Turns pick a healthy account of that engine. `/engine` is a secondary pool assignment. Claude bots share MCP tools. Grok/Antigravity bots spawn that CLI and do not get ccc MCP. Optional per-bot `cwd` (default: `<data_dir>/bots/<name>/workspace`). |
 | **Session** | The Claude Code conversation behind a bot: a UUID ccc mints and resumes. A bot has exactly one live session; `/new` rotates it. |
-| **Turn** | One `claude -p` process: input = one user/bot/system message (plus context envelope), output = streamed events until `result`. At most one turn per bot at a time; further inputs queue (FIFO) and are delivered together on the next turn. |
+| **Turn** | One `claude -p` process: input = one user/bot/system/background message (plus context envelope), output = streamed events until `result`. At most one turn per bot at a time; further inputs queue (FIFO) and are delivered together on the next turn. A background job is **not** a turn: it must not hold `turns.status=running`. |
+| **Background job** | A long-running shell command owned by a bot, started with `run_background`. It runs in the bot's cwd with `env_passthrough` while the topic stays responsive. Completion enqueues a `source=background` turn. |
 
 ## 3. Turn lifecycle
 
 ```
-input (Telegram text | inbox message | schedule | watch diff)
+input (Telegram text | inbox message | schedule | watch diff | background job)
   → enqueue(bot)                       (SQLite: turns.status=queued)
   → pick profile                       (§4)
   → build envelope                     (§9)
@@ -85,12 +87,14 @@ Rules:
 
 ### 3.2 Progress in the topic
 
-One progress message per turn, edited in place (rate-limited to ~1 edit / 3 s):
-current tool activity summarized ("editing poller.go", "running go test",
-"reading PR #1234"), elapsed time. When the turn ends the progress message is
-replaced by the final assistant text (chunked at 4096, Telegram HTML), and a
-✅ reaction is added to the user's triggering message. Tool call payloads are
-never dumped into the topic; `thinking` is never shown.
+One progress message per turn, posted with `disable_notification` and edited
+in place (rate-limited to ~1 edit / 3 s): current tool activity summarized
+("editing poller.go", "running go test", "reading PR #1234"), elapsed time.
+Telegram does not notify on `editMessageText`, so when the turn ends the
+silent progress message is deleted and the final assistant text is posted as
+a new message (the one notification the owner gets; overflow chunks stay
+silent). A ✅ reaction is added to the user's triggering message. Tool call
+payloads are never dumped into the topic; `thinking` is never shown.
 
 ### 3.3 Post-turn
 
@@ -141,8 +145,8 @@ A retried turn reuses the same session UUID: because profiles share
 
 ```
 bots        id, name (unique), topic_id, role (text), cwd, session_id, engine (claude|grok|antigravity, default claude),
-            status (idle|running|waiting|disabled), created_at, archived_at, parent_bot_id (for spawned workers)
-turns       id, bot_id, session_id, profile, source (user|bot|schedule|watch|system), input (text),
+            status (idle|running|waiting|disabled), created_at, archived_at, parent_bot_id (legacy; unused — bots cannot spawn children)
+turns       id, bot_id, session_id, profile, source (user|bot|schedule|watch|routine|system|background), input (text),
             output (text), status (queued|running|done|failed), stop_reason, error_class,
             started_at, ended_at, usage_json
 inbox       id, to_bot_id, from_bot_id (nullable = owner/system), text, wake (bool), delivered_at, turn_id
@@ -157,6 +161,9 @@ questions   id, bot_id, turn_id, question, options_json, answer, asked_message_i
 access      telegram_user_id (pk), display, state (pending|approved|blocked), pair_code, code_expires_at,
             replies (how many times ccc has answered this stranger, §14.7)
 settings    key (pk), value                                  -- instance settings edited from Telegram
+background_jobs  id, bot_id, name, status (queued|running|done|failed), kind (shell),
+            command, pid, exit_code, output, error, cancel_requested,
+            created_by_turn_id, started_at, ended_at, created_at
 ```
 
 Indexes beyond the ones the columns above imply: `turns(bot_id, created_at)`
@@ -194,7 +201,10 @@ bot/turn from its flags. Tools (all bots get all of them):
 | `set_name` | `name`, `emoji?` | Rename this bot: validate (§8 `/name`), update `bots.name`, rename the forum topic and, when `emoji` is one Telegram allows, set the topic icon. Rotates the session (§14.14). `/name` does the same from Telegram. |
 | `watch` | `name`, `command`, `interval_s` (≥60) | Register a deterministic watch (§7). `unwatch(name)`, `list_watches()`. |
 | `schedule_wakeup` | `in_seconds` or `at` (RFC3339), `note`, `cron?` | Self-wakeup (§7). `cancel_schedule(id)`. |
-| `spawn_bot` | `name`, `role`, `cwd?`, `first_message?`, `emoji?` | Create a child bot + topic (icon from `emoji`); `parent_bot_id` = this bot; the child reports back with `send_to_bot(parent)`. |
+| `run_background` | `command`, `name?` | Queue a long-running shell command in the bot's cwd with `env_passthrough`. Returns a job id immediately; does not block the turn. Use when Bash/a tool is expected to exceed ~60s. |
+| `list_background` | — | This bot's recent/active jobs: id, status, short summary. |
+| `get_background` | `id` | Status + truncated output for one job. |
+| `cancel_background` | `id` | Best-effort kill (queued → failed; running → SIGTERM). |
 | `archive_bot` | `bot?` (default self) | Close the topic (Telegram close, not delete), mark archived. |
 | `get_project` / `set_project` | `path`, fields | Read/update the project registry. |
 | `send_file` | `path`, `caption?` | Send a file into this bot's topic (≤50 MB; larger → existing relay if kept). |
@@ -205,9 +215,13 @@ from the model are data, never instructions to ccc.
 Topic icons are not free-form: `editForumTopic` only accepts a custom-emoji id
 out of `getForumTopicIconStickers`. ccc caches that list (memory + `settings`,
 refreshed daily, §14.16) and puts the allowed emoji into the `set_name` and
-`spawn_bot` tool descriptions and the system prompt, so the model picks one that
+`set_name` tool description and the system prompt, so the model picks one that
 exists. An emoji outside the set leaves the icon untouched and the tool result
 says which emoji were available.
+
+Bots cannot create other bots. Only the owner creates bots (plain text in
+General, or `/bot`). Long parallel work stays in the same topic via
+`run_background`. `archive_bot` remains so a bot can retire itself.
 
 ## 7. Scheduler and watch engine
 
@@ -221,6 +235,15 @@ One goroutine in `ccc listen`:
   tokens while nothing changes.
 - **Schedules**: enqueue a turn with `source=schedule` and the note when
   `fire_at` passes; recurring via cron expression.
+- **Background jobs**: every second, claim queued `background_jobs` (cap: 8
+  running per bot), start `/bin/sh -c` in the bot's cwd with the instance env
+  (same as watches: `env_passthrough`, no Claude profile), wait in a
+  goroutine, then mark done/failed and enqueue a turn with
+  `source=background` whose input has job id, name, exit code and truncated
+  stdout/stderr. A cancel sets `cancel_requested` and SIGTERMs the process
+  group. Leftover `running` rows after a listen restart are failed and wake
+  the bot. This is **not** Claude Code background agents: no transcript
+  scraping, no `claude attach`.
 - **Doctor loop** (every 15 min): `claude auth status --json` per profile
   (exit code 1 = logged out — verified), disclaimer check, usage cache read.
   Transitions to `needs_login` → owner notification with **Relogin** button.
@@ -269,6 +292,7 @@ originals back and consumes the archive rows; `/memory stats` shows count, bytes
 and last compaction per scope.
 
 **Cleanup.** Delivered `inbox` rows and answered `questions` older than 30 days;
+finished `background_jobs` older than 30 days;
 `bot`-scope memories of bots archived more than 30 days ago (nothing can read
 them — bot memories are visible to that bot alone); `memories_archive` rows
 older than 90 days.
@@ -277,9 +301,9 @@ older than 90 days.
 
 ### Conversation
 - Plain text in a bot's topic → input for that bot. No `/new` needed.
-- Plain text in the group root (General) → creates a new bot: topic named from
-  the first line, empty role, first message dispatched. `/bot <name> [role]`
-  does the same explicitly.
+- Plain text in the group root (General) → the **owner** creates a new bot:
+  topic named from the first line, empty role, first message dispatched.
+  `/bot <name> [role]` does the same explicitly. Bots cannot do this.
 - Photos/documents → saved into the bot's workspace `inbox/`, path passed in the
   message. Voice → transcribed if the `voice` build is present, else the file
   path is passed (keep the existing whisper integration).
@@ -382,7 +406,8 @@ role or template rotates the session):
 You are <name>, a bot in Jairo's ccc team. Role: <role>.
 You run on machine <hostname>, working dir <cwd>. Today is <date>.
 Tools: you have the ccc MCP tools (memory, messaging, scheduling, watches,
-spawning) plus the standard tools (Bash, Read, Edit, …) with full permissions.
+background jobs) plus the standard tools (Bash, Read, Edit, …) with full
+permissions. You cannot create other bots.
 Other bots: <name — role> list.
 Rules: … (owner escalation, when to remember, never print secrets, keep
 replies short for chat, prefer ask_owner over guessing on architecture…)
@@ -399,7 +424,7 @@ project memories for cwd (if any)
 own bot memories (top 10)
 pending inbox summary (N messages from X)
 </context>
-<message source="user|bot:<name>|watch:<name>|schedule">…</message>
+<message source="user|bot:<name>|watch:<name>|schedule|background">…</message>
 ```
 
 Keep the envelope under ~4 KB; `recall` exists for everything else.
@@ -467,10 +492,10 @@ v3 instance and the first save rewrites it clean. Kept: `telegram.go`,
   `send_to_bot`, an `ask_owner` round trip, a failover forced by disabling a
   profile.
 - **2b — automation & accounts** (done): watches, schedules,
-  `spawn_bot/archive_bot`, project registry, doctor loop, `/account …` with PTY
+  `archive_bot`, project registry, doctor loop, `/account …` with PTY
   login and disclaimer, `/access` pairing, `/model`, `/setgroup`, headless
   bootstrap (`ccc config set`, systemd user unit, `make build-linux`), legacy
-  removal (§11), README rewrite.
+  removal (§11), README rewrite. `spawn_bot` was later removed (14.24).
 
 Each phase: `go build && go vet && go test && gox check` green, conventional
 commits, no push until Jairo says so.
@@ -552,8 +577,8 @@ against real state (`claude auth status --json`, `bypassAccepted`).
 **14.10 A waking inbox message becomes a turn.** §3.3 says delivery "= enqueue a
 turn on the target bot"; Phase 2a only kicked the target's queue, which had
 nothing in it, so `send_to_bot` never actually reached anybody. Phase 2b creates
-the queued turn, labelled with the sender. This is what makes `spawn_bot` with a
-`first_message` — and the child's report back — work.
+the queued turn, labelled with the sender. This is what makes bot-to-bot
+handoffs (including a child's report back, when the owner created both) work.
 
 **14.11 A watch's first run is a baseline.** §7 did not say what happens on the
 very first run, when `last_hash` is empty. Treating that as a change would wake
@@ -582,7 +607,7 @@ bots keep their sessions: their system prompt roster goes stale, which is what
 `list_bots` is for, and `send_to_bot` resolves names against the live table.
 
 **14.15 The topic title and `bots.name` are kept in sync in both directions.**
-The name is unique and addressable (`send_to_bot`, `spawn_bot`, `list_bots`), so
+The name is unique and addressable (`send_to_bot`, `list_bots`), so
 it cannot be a free-text label; the topic title is the same string to the person
 reading the chat. `/name` and `set_name` rename the topic; a rename made in
 Telegram arrives as a `forum_topic_edited` service message and renames the bot.
@@ -615,8 +640,8 @@ types a sentence, then the correction, then the link. Each of those was its own
 `claude -p` run, which is the most wasteful thing ccc can do with a token
 budget. So `runNext` now waits for the queue to be quiet for `debounce_ms`
 (instance setting, default 2500) before folding it. Three guards keep a bot from
-being parked: only a queue whose newest input has `source=user` waits (a watch
-or another bot is delivering one thing, not typing); inputs that queued during
+being parked: only a queue whose newest input has `source=user` waits (a watch,
+a background job or another bot is delivering one thing, not typing); inputs that queued during
 the previous turn are already older than the window, so the wait is zero; and
 the total wait is capped at four windows. `ccc config set debounce_ms 0` turns
 it off.
@@ -685,3 +710,18 @@ process, no menu to answer. It runs at the end of `/account add` and
 `ccc doctor --fix`. The PTY driver and its fixtures are gone; the login flow,
 which genuinely needs a terminal, is unchanged. 14.9 is now history: only the
 login strings are still matched against the TUI.
+
+**14.24 `spawn_bot` was removed.** Bots must not create other bots. Only the
+owner creates bots (plain text in General, or `/bot`). Long parallel work
+uses `run_background` in the same topic — a queued shell job the listen
+supervisor starts and reaps, then a `source=background` wakeup. That is
+closer to Grok Bot's background Task than to Claude Code background agents
+(which stay a non-goal: no transcript scraping, no `claude attach`).
+`archive_bot` stays so a bot can retire itself.
+
+**14.25 Progress is silent; the final answer notifies.** Telegram does not
+send a notification for `editMessageText`, so editing the "⏳ working"
+message into the reply would never ping. The progress message is posted with
+`disable_notification=true`; when the turn ends it is deleted and the final
+text is a new `sendMessage` without that flag — the one notification the
+owner gets.

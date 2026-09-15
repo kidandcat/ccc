@@ -568,7 +568,7 @@ func questionOptions(q *Question) []string {
 }
 
 // ---------------------------------------------------------------------------
-// Automation tools (DESIGN §6/§7): watches, schedules, spawning, projects
+// Automation tools (DESIGN §6/§7): watches, schedules, background jobs, projects
 // ---------------------------------------------------------------------------
 
 type watchIn struct {
@@ -603,12 +603,13 @@ type cancelRoutineIn struct {
 	Name string `json:"name" jsonschema:"the routine to remove"`
 }
 
-type spawnBotIn struct {
-	Name         string `json:"name" jsonschema:"name for the new bot; it becomes its Telegram topic"`
-	Role         string `json:"role" jsonschema:"what the new bot is for, in a sentence or two"`
-	Cwd          string `json:"cwd,omitempty" jsonschema:"absolute working directory (default: its own fresh workspace)"`
-	FirstMessage string `json:"first_message,omitempty" jsonschema:"the first thing to tell it; it replies to you with send_to_bot"`
-	Emoji        string `json:"emoji,omitempty" jsonschema:"icon for its Telegram topic; must be one of the emoji listed in this tool's description"`
+type runBackgroundIn struct {
+	Name    string `json:"name,omitempty" jsonschema:"short summary shown in list_background, e.g. go test or npm install"`
+	Command string `json:"command" jsonschema:"shell command run in your working directory with env_passthrough; returns a job id immediately and does not block this turn"`
+}
+
+type backgroundIDIn struct {
+	ID int64 `json:"id" jsonschema:"the job id from run_background or list_background"`
 }
 
 type archiveBotIn struct {
@@ -663,10 +664,21 @@ func (s *mcpServer) registerAutomation(server *mcp.Server) {
 		Description: "Remove one of your named routines.",
 	}, s.cancelRoutineTool)
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "spawn_bot",
-		Description: "Create a helper bot with its own Telegram topic. Give it a first_message; it reports back to you with send_to_bot. " +
-			s.iconEmojiHint(),
-	}, s.spawnBot)
+		Name:        "run_background",
+		Description: "Start a long-running shell command without blocking this turn. Use it when Bash (or any tool) is expected to take more than about 60 seconds: builds, installs, waits. You are woken with source=background when it finishes.",
+	}, s.runBackground)
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "list_background",
+		Description: "List your recent and active background jobs with status and a short summary.",
+	}, s.listBackground)
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "get_background",
+		Description: "Status and truncated output for one of your background jobs.",
+	}, s.getBackground)
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "cancel_background",
+		Description: "Best-effort kill of one of your background jobs.",
+	}, s.cancelBackground)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "archive_bot",
 		Description: "Close a bot's topic and retire it. Defaults to yourself; use it when your job is done.",
@@ -806,47 +818,36 @@ func (s *mcpServer) cancelRoutineTool(_ context.Context, _ *mcp.CallToolRequest,
 	return text("cancelled routine %q", sanitizeRoutineName(in.Name)), nil, nil
 }
 
-func (s *mcpServer) spawnBot(_ context.Context, _ *mcp.CallToolRequest, in spawnBotIn) (*mcp.CallToolResult, any, error) {
-	parent, err := s.bot()
+func (s *mcpServer) runBackground(_ context.Context, _ *mcp.CallToolRequest, in runBackgroundIn) (*mcp.CallToolResult, any, error) {
+	job, err := queueBackgroundJob(s.db, s.botID, s.turnID, in.Name, in.Command)
 	if err != nil {
-		return toolErr("unknown bot"), nil, nil
+		return toolErr("%v", err), nil, nil
 	}
-	name := sanitizeBotName(in.Name)
-	if strings.TrimSpace(name) == "" {
-		return toolErr("spawn_bot needs a name"), nil, nil
-	}
-	cwd := strings.TrimSpace(in.Cwd)
-	if cwd != "" {
-		cwd = expandPath(cwd)
-		if !filepath.IsAbs(cwd) {
-			return toolErr("cwd must be an absolute path"), nil, nil
-		}
-		if info, err := os.Stat(cwd); err != nil || !info.IsDir() {
-			return toolErr("%s is not a directory", cwd), nil, nil
-		}
-	}
-	child, err := createBotRow(s.db, s.config, name, strings.TrimSpace(in.Role), cwd, &parent.ID)
+	return text("started background job #%d %q; you will be woken with source=background when it finishes", job.ID, job.Name), nil, nil
+}
+
+func (s *mcpServer) listBackground(_ context.Context, _ *mcp.CallToolRequest, _ emptyIn) (*mcp.CallToolResult, any, error) {
+	jobs, err := listBackgroundJobs(s.db, s.botID)
 	if err != nil {
-		return toolErr("could not create the bot: %v", err), nil, nil
+		return toolErr("could not list background jobs: %v", err), nil, nil
 	}
-	first := strings.TrimSpace(in.FirstMessage)
-	if first != "" {
-		if _, _, err := queueBotMessage(s.db, s.config, parent, child.Name, first, true); err != nil {
-			return toolErr("the bot was created but its first message could not be queued: %v", err), nil, nil
-		}
+	return text("%s", formatBackgroundList(jobs)), nil, nil
+}
+
+func (s *mcpServer) getBackground(_ context.Context, _ *mcp.CallToolRequest, in backgroundIDIn) (*mcp.CallToolResult, any, error) {
+	j, err := getBackgroundJob(s.db, s.botID, in.ID)
+	if err != nil {
+		return toolErr("%v", err), nil, nil
 	}
-	iconID, iconNote := resolveTopicIcon(s.db, s.config, in.Emoji)
-	if iconID != "" {
-		if err := editForumTopic(s.config, child.TopicID, "", iconID); err != nil {
-			hookLog("set icon on topic %d: %v", child.TopicID, err)
-		}
+	return text("%s", formatBackgroundJob(j)), nil, nil
+}
+
+func (s *mcpServer) cancelBackground(_ context.Context, _ *mcp.CallToolRequest, in backgroundIDIn) (*mcp.CallToolResult, any, error) {
+	msg, err := cancelBackgroundJob(s.db, s.botID, in.ID, killProcessGroup)
+	if err != nil {
+		return toolErr("%v", err), nil, nil
 	}
-	s.post(parent.TopicID, fmt.Sprintf("🐣 <b>%s</b> spawned <b>%s</b>.", htmlEscape(parent.Name), htmlEscape(child.Name)))
-	out := fmt.Sprintf("created bot %q (topic %d). It will report back to you with send_to_bot.", child.Name, child.TopicID)
-	if iconNote != "" {
-		out += " " + iconNote
-	}
-	return text("%s", out), nil, nil
+	return text("%s", msg), nil, nil
 }
 
 func (s *mcpServer) archiveBot(_ context.Context, _ *mcp.CallToolRequest, in archiveBotIn) (*mcp.CallToolResult, any, error) {

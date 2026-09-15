@@ -62,7 +62,7 @@ func botEngine(b *Bot) string {
 }
 
 // defaultEngine is the engine assigned to a newly created bot (General text
-// or /bot). Spawned children inherit the parent instead (createBotRow).
+// or /bot). Only the owner creates bots.
 //
 // Priority: an explicit config default_engine, then the default account's
 // engine (engine is set when the account is added), then Claude. `/engine` is

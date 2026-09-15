@@ -14,9 +14,10 @@ import (
 )
 
 // scheduler.go is the one background goroutine of DESIGN §7: it runs watches,
-// fires schedules and keeps the account health up to date. Everything it does
-// is deterministic and model-free — a watch that sees no change costs nothing,
-// which is the whole point of watches existing instead of a bot polling.
+// fires schedules, starts/reaps background jobs and keeps the account health
+// up to date. Watches and schedules are deterministic and model-free; a
+// finished background job enqueues a source=background turn so the model can
+// report to the owner.
 
 const (
 	// schedulerTick is how often the loop looks for due work. Watch intervals
@@ -40,6 +41,7 @@ type scheduler struct {
 	in     *instance
 	stop   chan struct{}
 	doctor *doctorState
+	bg     bgRuntime
 }
 
 func newScheduler(in *instance) *scheduler {
@@ -47,6 +49,7 @@ func newScheduler(in *instance) *scheduler {
 }
 
 func (s *scheduler) Close() {
+	s.killAllBackground()
 	select {
 	case <-s.stop:
 	default:
@@ -60,10 +63,13 @@ func (s *scheduler) Run() {
 	// Probe the accounts once at boot so /status is meaningful immediately.
 	s.runDoctor(time.Now())
 	ticker := time.NewTicker(schedulerTick)
+	bgTicker := time.NewTicker(backgroundTick)
 	defer ticker.Stop()
+	defer bgTicker.Stop()
 	for {
 		select {
 		case <-s.stop:
+			s.killAllBackground()
 			return
 		case now := <-ticker.C:
 			s.runDueWatches(now)
@@ -72,6 +78,8 @@ func (s *scheduler) Run() {
 				s.runDoctor(now)
 			}
 			s.runMaintenanceIfDue(now)
+		case <-bgTicker.C:
+			s.tickBackground()
 		}
 	}
 }
@@ -140,9 +148,9 @@ func runWatchCommand(cfg *Config, b *Bot, command string) (string, error) {
 	return text, err
 }
 
-// instanceEnv is the environment deterministic subprocesses (watches) run
-// with: the same whitelist as a bot, plus env_passthrough, and never a
-// CLAUDE_CONFIG_DIR — nothing here talks to Claude.
+// instanceEnv is the environment deterministic subprocesses (watches,
+// background jobs) run with: the same whitelist as a bot, plus
+// env_passthrough, and never a CLAUDE_CONFIG_DIR — nothing here talks to Claude.
 func instanceEnv(cfg *Config) []string {
 	return botEnv(cfg, Profile{Name: defaultProfileName, Implicit: true})
 }

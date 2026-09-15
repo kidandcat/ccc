@@ -26,6 +26,12 @@ func TestRenderSystemPromptCarriesIdentityAndRoster(t *testing.T) {
 	if !strings.Contains(got, "set_routine") {
 		t.Error("system prompt does not describe routines")
 	}
+	if !strings.Contains(got, "run_background") {
+		t.Error("system prompt does not describe background jobs")
+	}
+	if strings.Contains(got, "spawn_bot") {
+		t.Error("system prompt must not offer spawn_bot")
+	}
 }
 
 func TestRenderSystemPromptWithoutRole(t *testing.T) {
@@ -192,6 +198,18 @@ func TestSystemPromptIsByteStableAcrossTurns(t *testing.T) {
 }
 
 // The prompt tells bots how to spend a teammate's tokens.
+func TestSystemPromptTeachesBackgroundInsteadOfSpawn(t *testing.T) {
+	got := renderSystemPrompt(promptBot{Name: "a", Cwd: "/tmp"}, "host", nil, nil)
+	for _, want := range []string{"run_background", "source=background", "60 seconds", "You cannot create other bots"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the system prompt does not teach background jobs (%q):\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Spawn a bot") || strings.Contains(got, "spawn_bot") {
+		t.Errorf("the system prompt still offers spawning bots:\n%s", got)
+	}
+}
+
 func TestSystemPromptTeachesWakeDiscipline(t *testing.T) {
 	got := renderSystemPrompt(promptBot{Name: "a", Cwd: "/tmp"}, "host", nil, nil)
 	for _, want := range []string{"wake=false", "wake=true", "ONE message"} {

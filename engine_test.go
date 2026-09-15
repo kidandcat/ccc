@@ -589,24 +589,6 @@ func TestCreateBotUsesDefaultEngine(t *testing.T) {
 	}
 }
 
-func TestSpawnedBotInheritsParentEngine(t *testing.T) {
-	in, _, _ := testInstance(t)
-	parent, err := in.createBot("lead", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := in.db.Model(&Bot{}).Where("id = ?", parent.ID).Update("engine", engineAntigravity).Error; err != nil {
-		t.Fatal(err)
-	}
-	child, err := createBotRow(in.db, in.cfg, "helper", "helps", "", &parent.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if botEngine(child) != engineAntigravity {
-		t.Errorf("child engine = %q, want the parent's antigravity", child.Engine)
-	}
-}
-
 func TestSessionForAntigravityMintsNothing(t *testing.T) {
 	r := &Runner{}
 	id, resume := r.sessionFor(&Bot{Engine: engineAntigravity})

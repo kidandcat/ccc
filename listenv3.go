@@ -93,6 +93,14 @@ func (t telegramUI) Post(topicID int64, html string) (int64, error) {
 	return sendMessageHTMLGetID(cfg, cfg.GroupID, topicID, html)
 }
 
+func (t telegramUI) PostSilent(topicID int64, html string) (int64, error) {
+	cfg := t.in.config()
+	if cfg.BotToken == "" || cfg.GroupID == 0 {
+		return 0, nil
+	}
+	return sendMessageHTMLGetIDSilent(cfg, cfg.GroupID, topicID, html)
+}
+
 func (t telegramUI) Edit(topicID, msgID int64, html string) error {
 	cfg := t.in.config()
 	if cfg.BotToken == "" || cfg.GroupID == 0 || msgID == 0 {
@@ -182,6 +190,7 @@ func listenV3() error {
 	db.Model(&Turn{}).Where("status = ?", turnRunning).
 		Updates(map[string]any{"status": turnFailed, "error_class": errFatal, "stop_reason": "ccc restarted"})
 	db.Model(&Bot{}).Where("status = ?", botRunning).Update("status", botIdle)
+	failOrphanedBackgroundJobs(db, runner)
 	// Re-arm queues that survived the restart, including bot-to-bot messages
 	// whose sender's turn ended as the process was going down.
 	runner.deliverInbox(0)
@@ -197,6 +206,7 @@ func listenV3() error {
 		sig := <-sigChan
 		listenLog("Shutting down (signal: %v)", sig)
 		runner.Close()
+		sched.Close()
 		os.Exit(0)
 	}()
 
@@ -523,7 +533,7 @@ func (in *instance) createBotFromText(msg *TelegramMessage, text string) {
 
 // createBot creates the forum topic, the workspace and the database row.
 func (in *instance) createBot(name, role string) (*Bot, error) {
-	return createBotRow(in.db, in.config(), name, role, "", nil)
+	return createBotRow(in.db, in.config(), name, role, "")
 }
 
 // botNameFromText derives a topic name from the first line of a message.
@@ -860,7 +870,7 @@ func (in *instance) handleMemoryRestore(msg *TelegramMessage, arg string) {
 }
 
 // handleNameCommand implements `/name [<name>] [emoji]` (DESIGN §8): show or
-// change the bot's name. The name is the address send_to_bot and spawn_bot use,
+// change the bot's name. The name is the address send_to_bot and list_bots use,
 // the topic title and part of the system prompt, so setting it renames the
 // topic and rotates the session exactly like /role does (DESIGN §14.14). A
 // trailing emoji also sets the topic icon.
@@ -1029,7 +1039,11 @@ func (in *instance) renderStatus() string {
 	var watches, schedules int64
 	in.db.Model(&Watch{}).Where("enabled = ?", true).Count(&watches)
 	in.db.Model(&Schedule{}).Where("fired_at IS NULL").Count(&schedules)
-	fmt.Fprintf(&sb, "watches: %d · schedules: %d\n", watches, schedules)
+	var bgRun, bgQ int64
+	in.db.Model(&BackgroundJob{}).Where("status = ?", jobRunning).Count(&bgRun)
+	in.db.Model(&BackgroundJob{}).Where("status = ?", jobQueued).Count(&bgQ)
+	fmt.Fprintf(&sb, "watches: %d · schedules: %d · background: %d running / %d queued\n",
+		watches, schedules, bgRun, bgQ)
 
 	// Passthrough secrets, by NAME only (DESIGN §12: ccc never posts a value).
 	// "missing" here almost always means `ccc env sync` was not run from a

@@ -54,10 +54,11 @@ const (
 	memCompactMinKeep = 0.4
 
 	// Cleanup retentions.
-	inboxRetentionDays        = 30
-	questionRetentionDays     = 30
-	archivedBotMemoryDays     = 30
-	memoryArchiveRetentionDay = 90
+	inboxRetentionDays         = 30
+	questionRetentionDays      = 30
+	archivedBotMemoryDays      = 30
+	memoryArchiveRetentionDay  = 90
+	backgroundJobRetentionDays = 30
 )
 
 // ---------------------------------------------------------------------------
@@ -80,6 +81,7 @@ type maintenanceReport struct {
 	QuestionsDeleted   int64
 	BotMemoriesDeleted int64
 	ArchivesDeleted    int64
+	JobsDeleted        int64
 	Compactions        []compactionResult
 	// Problems are the scopes whose compaction was abandoned, with the reason.
 	Problems []string
@@ -88,8 +90,8 @@ type maintenanceReport struct {
 func (r maintenanceReport) String() string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "turns: %d deleted, %d trimmed\n", r.TurnsDeleted, r.TurnsTrimmed)
-	fmt.Fprintf(&sb, "cleanup: %d inbox, %d questions, %d bot memories, %d archived memories\n",
-		r.InboxDeleted, r.QuestionsDeleted, r.BotMemoriesDeleted, r.ArchivesDeleted)
+	fmt.Fprintf(&sb, "cleanup: %d inbox, %d questions, %d bot memories, %d archived memories, %d background jobs\n",
+		r.InboxDeleted, r.QuestionsDeleted, r.BotMemoriesDeleted, r.ArchivesDeleted, r.JobsDeleted)
 	if len(r.Compactions) == 0 {
 		sb.WriteString("memories: nothing over the compaction threshold\n")
 	}
@@ -573,6 +575,8 @@ func runCleanup(db *gorm.DB, now time.Time, rep *maintenanceReport) {
 
 	rep.ArchivesDeleted = del("memory archive cleanup", db.Where("archived_at < ?",
 		now.AddDate(0, 0, -memoryArchiveRetentionDay)).Delete(&MemoryArchive{}))
+	rep.JobsDeleted = del("background job cleanup", db.Where("status IN ? AND ended_at IS NOT NULL AND ended_at < ?",
+		[]string{jobDone, jobFailed}, now.AddDate(0, 0, -backgroundJobRetentionDays)).Delete(&BackgroundJob{}))
 }
 
 // ---------------------------------------------------------------------------

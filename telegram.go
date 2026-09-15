@@ -182,7 +182,18 @@ func sendMessageHTMLGetID(config *Config, chatID int64, threadID int64, text str
 	return sendMessageWithMode(config, chatID, threadID, text, "HTML")
 }
 
+// sendMessageHTMLGetIDSilent posts HTML without a Telegram notification. Used
+// for the in-progress "⏳ working" message so the owner is only pinged when
+// the turn's final answer lands.
+func sendMessageHTMLGetIDSilent(config *Config, chatID int64, threadID int64, text string) (int64, error) {
+	return sendMessageOpts(config, chatID, threadID, text, "HTML", true)
+}
+
 func sendMessageWithMode(config *Config, chatID int64, threadID int64, text string, parseMode string) (int64, error) {
+	return sendMessageOpts(config, chatID, threadID, text, parseMode, false)
+}
+
+func sendMessageOpts(config *Config, chatID int64, threadID int64, text string, parseMode string, silent bool) (int64, error) {
 	messages := splitForMode(text, parseMode)
 	var lastMsgID int64
 
@@ -194,6 +205,9 @@ func sendMessageWithMode(config *Config, chatID int64, threadID int64, text stri
 		}
 		if threadID > 0 {
 			params.Set("message_thread_id", fmt.Sprintf("%d", threadID))
+		}
+		if silent {
+			params.Set("disable_notification", "true")
 		}
 
 		result, err := telegramAPI(config, "sendMessage", params)

@@ -10,7 +10,8 @@ import (
 
 // progress is the single per-turn Telegram message that is edited in place
 // while the turn runs (DESIGN §3.2): current activity plus elapsed time, at
-// most one edit every progressInterval, then replaced by the final text.
+// most one edit every progressInterval. It is posted silently; when the turn
+// ends it is deleted and the final text is a new notifying message.
 
 const progressInterval = 3 * time.Second
 
@@ -22,6 +23,23 @@ const telegramTextLimit = 4096
 // of its own messages. Telegram can; the test doubles need not.
 type messageDeleter interface {
 	Delete(topicID, msgID int64) error
+}
+
+// silentPoster posts without a Telegram notification. Progress uses it so the
+// "⏳ working" message does not ping; the final answer goes through Post.
+type silentPoster interface {
+	PostSilent(topicID int64, html string) (int64, error)
+}
+
+func postProgress(ui botUI, topicID int64, html string) (int64, error) {
+	if s, ok := ui.(silentPoster); ok {
+		return s.PostSilent(topicID, html)
+	}
+	return ui.Post(topicID, html)
+}
+
+func postOverflow(ui botUI, topicID int64, html string) (int64, error) {
+	return postProgress(ui, topicID, html)
 }
 
 // Delete retracts a message from the bot's topic. It lives next to the only
@@ -86,7 +104,7 @@ func (p *progress) flush(force bool) {
 	p.mu.Unlock()
 
 	if !created {
-		id, err := p.ui.Post(p.topicID, text)
+		id, err := postProgress(p.ui, p.topicID, text)
 		if err != nil {
 			return
 		}
@@ -122,25 +140,18 @@ func (p *progress) finish(final string) {
 	created := p.created
 	p.mu.Unlock()
 
-	edited := false
-	if created {
-		if err := p.ui.Edit(p.topicID, msgID, chunks[0]); err != nil {
-			log.Printf("progress: could not edit the final reply into message %d: %v", msgID, err)
-		} else {
-			edited = true
-		}
-	}
-	if !edited {
-		if _, err := p.ui.Post(p.topicID, chunks[0]); err != nil {
-			log.Printf("progress: reply chunk 1/%d (%d bytes) could not be delivered: %v", len(chunks), len(chunks[0]), err)
-		}
+	// Telegram does not notify on editMessageText, so the final answer is a
+	// new sendMessage (the one ping the owner gets). The silent progress
+	// message is then deleted. Overflow chunks stay silent.
+	if _, err := p.ui.Post(p.topicID, chunks[0]); err != nil {
+		log.Printf("progress: reply chunk 1/%d (%d bytes) could not be delivered: %v", len(chunks), len(chunks[0]), err)
 	}
 	for i, c := range chunks[1:] {
-		if _, err := p.ui.Post(p.topicID, c); err != nil {
+		if _, err := postOverflow(p.ui, p.topicID, c); err != nil {
 			log.Printf("progress: reply chunk %d/%d (%d bytes) could not be delivered: %v", i+2, len(chunks), len(c), err)
 		}
 	}
-	if created && !edited {
+	if created {
 		p.retireProgress(msgID)
 	}
 }
