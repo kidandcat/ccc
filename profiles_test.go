@@ -516,6 +516,9 @@ func TestAccountKeysAndSharedEmailLookup(t *testing.T) {
 	if got := accountMapKey(legacy, "jairo@x.com", engineClaude); got != "jairo@x.com/claude" {
 		t.Errorf("claude key when email is taken = %q", got)
 	}
+	if isAccountEmail("jairo@x.com/codex") {
+		t.Error("a composite key must not parse as an email")
+	}
 }
 
 func TestClaudeEnvScrubsInheritedState(t *testing.T) {

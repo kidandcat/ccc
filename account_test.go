@@ -622,16 +622,17 @@ func TestAccountLoginDisambiguation(t *testing.T) {
 
 	n := len(api.texts(""))
 	in.handleAccountCommand(dmMessage(42, ""), "login jairo@example.com/codex")
+	waitForLogin(t, in)
 	slash := strings.Join(api.texts("")[n:], "\n")
-	if !strings.Contains(slash, "Starting") || !strings.Contains(slash, "Codex") {
+	if !strings.Contains(slash, "Starting") || !strings.Contains(strings.ToLower(slash), "codex") {
 		t.Errorf("email/codex should start the Codex login:\n%s", slash)
 	}
 
-	waitForLogin(t, in)
 	n = len(api.texts(""))
 	in.handleAccountCommand(dmMessage(42, ""), "login jairo@example.com claude")
+	waitForLogin(t, in)
 	words := strings.Join(api.texts("")[n:], "\n")
-	if !strings.Contains(words, "Starting") || !strings.Contains(words, "Claude") {
+	if !strings.Contains(words, "Starting") || !strings.Contains(strings.ToLower(words), "claude") {
 		t.Errorf("email claude should start the Claude login:\n%s", words)
 	}
 

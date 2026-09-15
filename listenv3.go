@@ -757,7 +757,7 @@ func (in *instance) handleCommand(msg *TelegramMessage, text string, inGroup boo
 	case "/model":
 		var b *Bot
 		if inGroup && topicID != 0 {
-			b, _ = botByTopic(in.db, topicID)
+			b, _ = botByTopic(in.db, topicID) // safe-ignore: /model in a topic with no bot is instance-level
 		}
 		in.handleModelCommand(msg, rest, b)
 		return

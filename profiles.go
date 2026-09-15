@@ -253,9 +253,10 @@ func profileIdentity(p Profile) string {
 // ---------------------------------------------------------------------------
 
 // accountEmailRe is the shape /account accepts. It is deliberately loose (one
-// @, a dotted domain, no spaces): the authority on whether an address is real
-// is `claude auth status`, not a regexp.
-var accountEmailRe = regexp.MustCompile(`^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$`)
+// @, a dotted domain, no spaces or slashes): the authority on whether an
+// address is real is `claude auth status`, not a regexp. Slashes are reserved
+// for composite keys (`you@x.com/codex`).
+var accountEmailRe = regexp.MustCompile(`^[^\s@/]+@[^\s@./]+(?:\.[^\s@./]+)+$`)
 
 // isAccountEmail reports whether s is plausibly an email address.
 func isAccountEmail(s string) bool { return accountEmailRe.MatchString(strings.TrimSpace(s)) }
@@ -448,6 +449,18 @@ func profileDirName(email string) string {
 // short identity the owner typed). The engine is shown separately via
 // engineLabel; composite keys like `you@x.com/codex` are never the title.
 func accountDisplay(p Profile) string {
+	if id, _, ok := splitAccountKey(p.Name); ok {
+		if isAccountEmail(p.Label) {
+			return normalizeEmail(p.Label)
+		}
+		if isAccountEmail(id) {
+			return id
+		}
+		if label := strings.TrimSpace(p.Label); label != "" {
+			return label
+		}
+		return id
+	}
 	if isAccountEmail(p.Name) {
 		return p.Name
 	}
@@ -456,9 +469,6 @@ func accountDisplay(p Profile) string {
 	}
 	if label := strings.TrimSpace(p.Label); label != "" {
 		return label
-	}
-	if id, _, ok := splitAccountKey(p.Name); ok {
-		return id
 	}
 	return p.Name
 }
