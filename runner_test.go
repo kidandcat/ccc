@@ -85,9 +85,15 @@ func TestClassifyFailure(t *testing.T) {
 		{"Claude AI usage limit reached|1788000000", errRateLimited},
 		{"API Error: 429 rate_limit_error", errRateLimited},
 		{"No conversation found with session ID abc", errSessionLost},
+		{`Session "e014ee51-aaaa-4bbb-8ccc-ddddeeeeffff" not found locally, restoring conversation from remote...
+Error: Failed to restore session from remote: fetching session record: session get failed: 404 Not Found`, errSessionLost},
+		{"not found locally", errSessionLost},
+		{"Failed to restore session from remote", errSessionLost},
+		{"session get failed: 404 Not Found", errSessionLost},
 		{"fetch failed: ECONNRESET", errTransient},
 		{"API Error: 503 upstream overloaded", errTransient},
 		{"TypeError: undefined is not a function", errFatal},
+		{"HTTP 404 Not Found", errFatal},
 	}
 	for _, c := range cases {
 		if got := classifyFailure(c.text, 1); got != c.want {

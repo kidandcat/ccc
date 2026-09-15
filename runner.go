@@ -978,7 +978,10 @@ func classifyFailure(text string, exitCode int) string {
 		strings.Contains(l, "429"):
 		return errRateLimited
 	case strings.Contains(l, "no conversation found") || strings.Contains(l, "session not found") ||
-		strings.Contains(l, "no such session") || strings.Contains(l, "could not find session"):
+		strings.Contains(l, "no such session") || strings.Contains(l, "could not find session") ||
+		strings.Contains(l, "not found locally") || strings.Contains(l, "failed to restore session") ||
+		strings.Contains(l, "session get failed") ||
+		(strings.Contains(l, "404 not found") && strings.Contains(l, "session")):
 		return errSessionLost
 	case strings.Contains(l, "econnreset") || strings.Contains(l, "etimedout") ||
 		strings.Contains(l, "enotfound") || strings.Contains(l, "socket hang up") ||
