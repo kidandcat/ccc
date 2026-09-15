@@ -113,8 +113,6 @@ func TestProgressFinishFallsBackToEditingWhenDeleteFails(t *testing.T) {
 
 	p.finish("done")
 
-	ui.editErr = nil
-	p.retireProgress(1)
 	if len(ui.edits) != 1 || ui.edits[0] != "✅ replied below" {
 		t.Fatalf("expected the progress message to be retired by an edit, got %v", ui.edits)
 	}

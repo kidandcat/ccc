@@ -373,6 +373,10 @@ func (s *scheduler) finishBackgroundJob(j *BackgroundJob, status string, exit in
 		Updates(map[string]any{
 			"status": status, "ended_at": now, "output": output, "error": errText, "pid": 0, "exit_code": code,
 		})
+	if res.Error != nil {
+		hookLog("background %d: finish update: %v", j.ID, res.Error)
+		return
+	}
 	if res.RowsAffected == 0 {
 		return
 	}

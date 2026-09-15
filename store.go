@@ -223,7 +223,7 @@ type BackgroundJob struct {
 	Status          string `gorm:"index;not null"` // queued|running|done|failed
 	Kind            string // "shell"
 	Command         string
-	PID             int
+	PID             int `gorm:"column:pid"`
 	ExitCode        *int
 	Output          string
 	Error           string
