@@ -541,7 +541,7 @@ func downloadTelegramFile(config *Config, fileID string, destPath string) error 
 //
 //	topicID == 0  General: the owner's 1:1 DM
 //	topicID != 0  a backend worker: no Telegram destination
-//	              (the hub still sees the event; owner-facing pings use 0)
+//	              (owner-facing pings use topic 0)
 func destForTopic(cfg *Config, topicID int64) (chatID, threadID int64, ok bool) {
 	if cfg == nil || cfg.BotToken == "" || cfg.ChatID == 0 || topicID != 0 {
 		return 0, 0, false

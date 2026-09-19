@@ -781,7 +781,7 @@ func mapQuestionAnswer(q *Question, answer string) (string, bool) {
 
 // applyQuestionAnswer records the answer on q, then the same answer on every
 // similar pending ask whose options can take it. Each resolved row is returned
-// so the caller can tick Telegram and emit hub events. The primary error is
+// so the caller can tick Telegram. The primary error is
 // the only hard failure; siblings are best-effort.
 func applyQuestionAnswer(db *gorm.DB, runner turnRunner, q *Question, answer string) ([]Question, error) {
 	if err := resolveQuestionAnswer(db, runner, q, answer); err != nil {

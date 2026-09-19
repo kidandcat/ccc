@@ -19,10 +19,21 @@ func TestKillActiveTurnEscalatesToSIGKILL(t *testing.T) {
 	killGrace = 150 * time.Millisecond
 	defer func() { killGrace = old }()
 
-	cmd := exec.Command("/bin/sh", "-c", "trap '' TERM; sleep 30")
+	cmd := exec.Command("/bin/sh", "-c", `trap '' TERM; printf ready\n; while :; do sleep 1; done`)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
+	}
+	buf := make([]byte, 8)
+	if _, err := stdout.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(buf), "ready") {
+		t.Fatalf("child did not install the TERM trap: %q", buf)
 	}
 	exited := make(chan struct{})
 	errc := make(chan error, 1)
@@ -39,7 +50,7 @@ func TestKillActiveTurnEscalatesToSIGKILL(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("process did not die after SIGKILL escalation")
 	}
-	err := <-errc
+	err = <-errc
 	if err == nil {
 		t.Fatal("want a signal death")
 	}

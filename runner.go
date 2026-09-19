@@ -336,17 +336,18 @@ func killActiveTurn(at *activeTurn) bool {
 	}
 	signalGroup(pid, syscall.SIGTERM)
 	exited := at.exited
+	grace := killGrace
 	go func() {
 		if exited == nil {
 			// No waiter: always escalate. Tests that only Start+Wait
 			// from the test goroutine still get a TERM first.
-			time.Sleep(killGrace)
+			time.Sleep(grace)
 			signalGroup(pid, syscall.SIGKILL)
 			return
 		}
 		select {
 		case <-exited:
-		case <-time.After(killGrace):
+		case <-time.After(grace):
 			signalGroup(pid, syscall.SIGKILL)
 		}
 	}()
@@ -374,7 +375,9 @@ func (r *Runner) watchArchive(botID int64, stop <-chan struct{}) {
 	if r == nil || r.db == nil {
 		return
 	}
-	tick := time.NewTicker(archiveWatchInterval)
+	// Snapshot: tests restore the global when the watcher exits.
+	interval := archiveWatchInterval
+	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	for {
 		select {

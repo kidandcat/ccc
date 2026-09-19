@@ -942,6 +942,55 @@ func TestCommandsInDM(t *testing.T) {
 	if len(runner.stops) != 1 || runner.stops[0] != g.ID {
 		t.Errorf("/stop did not reach the runner: %v", runner.stops)
 	}
+
+	in.handleMessage(ownerMessage("/cwd /definitely/not/here"))
+	after, _ = botByID(in.db, g.ID)
+	if after.Cwd == "/definitely/not/here" {
+		t.Error("/cwd accepted a directory that does not exist")
+	}
+	dir := t.TempDir()
+	in.handleMessage(ownerMessage("/cwd " + dir))
+	after, _ = botByID(in.db, g.ID)
+	if after.Cwd != dir {
+		t.Errorf("cwd = %q, want %q", after.Cwd, dir)
+	}
+
+	if err := upsertMemory(in.db, scopeUser, "", "deploy-target", "vps3", g.ID); err != nil {
+		t.Fatal(err)
+	}
+	in.handleMessage(ownerMessage("/memory deploy"))
+	found := false
+	for _, txt := range api.texts("") {
+		if strings.Contains(txt, "deploy-target") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("/memory did not show the stored memory")
+	}
+
+	in.db.Model(&Bot{}).Where("id = ?", g.ID).Update("session_id", "eng-789")
+	in.handleMessage(ownerMessage("/engine"))
+	in.handleMessage(ownerMessage("/engine grok"))
+	after, _ = botByID(in.db, g.ID)
+	if after.Engine != engineGrok {
+		t.Errorf("engine = %q after /engine grok", after.Engine)
+	}
+	if after.SessionID != "" {
+		t.Error("/engine must rotate the session: the conversation id is per CLI")
+	}
+	in.handleMessage(ownerMessage("/engine not-a-cli"))
+	after, _ = botByID(in.db, g.ID)
+	if after.Engine != engineGrok {
+		t.Error("a bad /engine argument must not change the stored engine")
+	}
+
+	in.handleMessage(ownerMessage("/forget user deploy-target"))
+	var n int64
+	in.db.Model(&Memory{}).Where("key = ?", "deploy-target").Count(&n)
+	if n != 0 {
+		t.Error("/forget did not delete the memory")
+	}
 }
 
 func TestStopCommandReachesWorkers(t *testing.T) {
@@ -1007,13 +1056,14 @@ func TestStopCommandReachesWorkers(t *testing.T) {
 	runner.setRunning(deployer.ID, true)
 	runner.setRunning(analyst.ID, true)
 	in.db.Model(&Bot{}).Where("id IN ?", []int64{g.ID, deployer.ID, analyst.ID}).Update("status", botRunning)
+	beforeAll := len(api.texts(""))
 	in.handleMessage(ownerMessage("/stop all"))
 	if len(runner.stops) != 3 {
 		t.Errorf("/stop all stops = %v, want 3", runner.stops)
 	}
-	joined = strings.Join(api.texts(""), "\n")
-	if strings.Contains(joined, "Still running") {
-		t.Errorf("/stop all should not say Still running:\n%s", joined)
+	allReply := strings.Join(api.texts("")[beforeAll:], "\n")
+	if strings.Contains(allReply, "Still running") {
+		t.Errorf("/stop all should not say Still running:\n%s", allReply)
 	}
 
 	runner.stops = nil
@@ -1046,55 +1096,6 @@ func TestStopCommandReachesWorkers(t *testing.T) {
 	joined = strings.ToLower(strings.Join(api.texts(""), "\n"))
 	if !strings.Contains(joined, "dropped") || !strings.Contains(joined, "1 queued") {
 		t.Errorf("want dropped 1 queued:\n%s", joined)
-	}
-
-	in.handleMessage(ownerMessage("/cwd /definitely/not/here"))
-	after, _ = botByID(in.db, g.ID)
-	if after.Cwd == "/definitely/not/here" {
-		t.Error("/cwd accepted a directory that does not exist")
-	}
-	dir := t.TempDir()
-	in.handleMessage(ownerMessage("/cwd " + dir))
-	after, _ = botByID(in.db, g.ID)
-	if after.Cwd != dir {
-		t.Errorf("cwd = %q, want %q", after.Cwd, dir)
-	}
-
-	if err := upsertMemory(in.db, scopeUser, "", "deploy-target", "vps3", g.ID); err != nil {
-		t.Fatal(err)
-	}
-	in.handleMessage(ownerMessage("/memory deploy"))
-	found := false
-	for _, txt := range api.texts("") {
-		if strings.Contains(txt, "deploy-target") {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("/memory did not show the stored memory")
-	}
-
-	in.db.Model(&Bot{}).Where("id = ?", g.ID).Update("session_id", "eng-789")
-	in.handleMessage(ownerMessage("/engine"))
-	in.handleMessage(ownerMessage("/engine grok"))
-	after, _ = botByID(in.db, g.ID)
-	if after.Engine != engineGrok {
-		t.Errorf("engine = %q after /engine grok", after.Engine)
-	}
-	if after.SessionID != "" {
-		t.Error("/engine must rotate the session: the conversation id is per CLI")
-	}
-	in.handleMessage(ownerMessage("/engine not-a-cli"))
-	after, _ = botByID(in.db, g.ID)
-	if after.Engine != engineGrok {
-		t.Error("a bad /engine argument must not change the stored engine")
-	}
-
-	in.handleMessage(ownerMessage("/forget user deploy-target"))
-	var n int64
-	in.db.Model(&Memory{}).Where("key = ?", "deploy-target").Count(&n)
-	if n != 0 {
-		t.Error("/forget did not delete the memory")
 	}
 }
 

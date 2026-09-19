@@ -347,7 +347,7 @@ func buildEnvelope(db *gorm.DB, b *Bot, source, message string, now time.Time) s
 	return renderEnvelope(in)
 }
 
-// botRoster lists the other live sessions. Kept for tests and the hub; the
+// botRoster lists the other live sessions. Kept for tests; the
 // system prompt no longer includes a crew roster.
 func botRoster(db *gorm.DB, exceptID int64) []otherBot {
 	bots, err := liveBots(db)

@@ -87,8 +87,7 @@ func (in *instance) config() *Config {
 }
 
 // telegramUI is the runner's view of Telegram. General (topic 0) lands in
-// the owner's DM. Any other topic id is a backend worker: no Telegram send
-// (the hub still sees the event).
+// the owner's DM. Any other topic id is a backend worker: no Telegram send.
 type telegramUI struct{ in *instance }
 
 func (t telegramUI) Post(topicID int64, html string) (int64, error) {
