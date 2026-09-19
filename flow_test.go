@@ -164,6 +164,24 @@ func (f *fakeRunner) last() (fakeTurn, bool) {
 	return f.enqueued[len(f.enqueued)-1], true
 }
 
+func (f *fakeRunner) queued() []fakeTurn {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]fakeTurn, len(f.enqueued))
+	copy(out, f.enqueued)
+	return out
+}
+
+func waitEnqueued(t *testing.T, r *fakeRunner, n int) []fakeTurn {
+	t.Helper()
+	var got []fakeTurn
+	waitUntil(t, 2*time.Second, func() bool {
+		got = r.queued()
+		return len(got) >= n
+	})
+	return got
+}
+
 // testInstance wires an instance against a temp database and the fake API.
 // isolateConfigEnv drops CCC_CONFIG/CCC_DB inherited from a ccc turn so tests
 // that pin HOME actually read the temp config, not the instance's.

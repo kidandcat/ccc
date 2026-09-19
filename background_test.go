@@ -134,10 +134,11 @@ func TestBackgroundJobWakesTheBotOnSuccess(t *testing.T) {
 	if !strings.Contains(got.Output, "hello-from-bg") {
 		t.Errorf("output = %q", got.Output)
 	}
-	if len(runner.enqueued) != 1 {
-		t.Fatalf("enqueued %d, want 1 wakeup: %+v", len(runner.enqueued), runner.enqueued)
+	queued := waitEnqueued(t, runner, 1)
+	if len(queued) != 1 {
+		t.Fatalf("enqueued %d, want 1 wakeup: %+v", len(queued), queued)
 	}
-	wake := runner.enqueued[0]
+	wake := queued[0]
 	if wake.BotID != b.ID || wake.Source != sourceBackground {
 		t.Errorf("wakeup = %+v", wake)
 	}
@@ -190,11 +191,12 @@ func TestBackgroundJobWakesTheBotOnFailure(t *testing.T) {
 	if got.ExitCode == nil || *got.ExitCode != 7 {
 		t.Errorf("exit = %v, want 7", got.ExitCode)
 	}
-	if len(runner.enqueued) != 1 || runner.enqueued[0].Source != sourceBackground {
-		t.Fatalf("wakeup = %+v", runner.enqueued)
+	queued := waitEnqueued(t, runner, 1)
+	if len(queued) != 1 || queued[0].Source != sourceBackground {
+		t.Fatalf("wakeup = %+v", queued)
 	}
-	if !strings.Contains(runner.enqueued[0].Text, "failed") || !strings.Contains(runner.enqueued[0].Text, "Exit code: 7") {
-		t.Errorf("failure wakeup:\n%s", runner.enqueued[0].Text)
+	if !strings.Contains(queued[0].Text, "failed") || !strings.Contains(queued[0].Text, "Exit code: 7") {
+		t.Errorf("failure wakeup:\n%s", queued[0].Text)
 	}
 	ping := waitSendContaining(t, api, "Background job")
 	if ping.Params.Get("disable_notification") == "true" {
@@ -242,8 +244,9 @@ func TestCancelRunningBackground(t *testing.T) {
 	if got.Status != jobFailed {
 		t.Errorf("cancelled job status = %q error=%q", got.Status, got.Error)
 	}
-	if len(runner.enqueued) != 1 || runner.enqueued[0].Source != sourceBackground {
-		t.Errorf("expected a failed wakeup, got %+v", runner.enqueued)
+	queued := waitEnqueued(t, runner, 1)
+	if len(queued) != 1 || queued[0].Source != sourceBackground {
+		t.Errorf("expected a failed wakeup, got %+v", queued)
 	}
 	if _, ok := sendContaining(api, "Background job"); ok {
 		t.Fatalf("a cancel the owner asked for must not ping: %v", api.texts(""))
@@ -287,11 +290,12 @@ func TestReattachFinishedWhileDownWakesTheBot(t *testing.T) {
 	if !strings.Contains(got.Output, "hello-from-disk") {
 		t.Errorf("output = %q", got.Output)
 	}
-	if len(runner.enqueued) != 1 || runner.enqueued[0].Source != sourceBackground {
-		t.Fatalf("wakeup = %+v", runner.enqueued)
+	queued := waitEnqueued(t, runner, 1)
+	if len(queued) != 1 || queued[0].Source != sourceBackground {
+		t.Fatalf("wakeup = %+v", queued)
 	}
-	if !strings.Contains(runner.enqueued[0].Text, "finished") || !strings.Contains(runner.enqueued[0].Text, "hello-from-disk") {
-		t.Errorf("wakeup:\n%s", runner.enqueued[0].Text)
+	if !strings.Contains(queued[0].Text, "finished") || !strings.Contains(queued[0].Text, "hello-from-disk") {
+		t.Errorf("wakeup:\n%s", queued[0].Text)
 	}
 }
 
@@ -311,8 +315,9 @@ func TestReattachDeadPIDWithoutExitFileFailsAndWakes(t *testing.T) {
 	if got.Status != jobFailed || !strings.Contains(got.Error, "without writing an exit status") {
 		t.Errorf("dead orphan = %+v", got)
 	}
-	if len(runner.enqueued) != 1 || runner.enqueued[0].Source != sourceBackground {
-		t.Fatalf("orphan wakeup = %+v", runner.enqueued)
+	queued := waitEnqueued(t, runner, 1)
+	if len(queued) != 1 || queued[0].Source != sourceBackground {
+		t.Fatalf("orphan wakeup = %+v", queued)
 	}
 	ping := waitSendContaining(t, api, "Background job")
 	if ping.Params.Get("disable_notification") == "true" {
@@ -347,8 +352,8 @@ func TestReattachAlivePIDKeepsRunning(t *testing.T) {
 	if job.Status != jobRunning {
 		t.Fatalf("alive reattach marked the job %q error=%q", job.Status, job.Error)
 	}
-	if len(runner.enqueued) != 0 {
-		t.Fatalf("alive reattach woke the bot early: %+v", runner.enqueued)
+	if queued := runner.queued(); len(queued) != 0 {
+		t.Fatalf("alive reattach woke the bot early: %+v", queued)
 	}
 	if _, ok := sendContaining(api, "Resumed"); !ok {
 		t.Fatalf("alive reattach must ping that the job was resumed, texts=%v", api.texts(""))
@@ -410,8 +415,8 @@ func TestBackgroundJobSurvivesSchedulerRestart(t *testing.T) {
 	if job.Status != jobRunning {
 		t.Fatalf("reattach changed status to %q error=%q", job.Status, job.Error)
 	}
-	if len(runner.enqueued) != 0 {
-		t.Fatalf("reattach of a live job woke the bot: %+v", runner.enqueued)
+	if queued := runner.queued(); len(queued) != 0 {
+		t.Fatalf("reattach of a live job woke the bot: %+v", queued)
 	}
 	if err := os.WriteFile(flag, []byte("go\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -423,8 +428,9 @@ func TestBackgroundJobSurvivesSchedulerRestart(t *testing.T) {
 	if !strings.Contains(got.Output, "survived") {
 		t.Errorf("output = %q", got.Output)
 	}
-	if len(runner.enqueued) != 1 || runner.enqueued[0].Source != sourceBackground {
-		t.Fatalf("expected the normal background wakeup, got %+v", runner.enqueued)
+	queued := waitEnqueued(t, runner, 1)
+	if len(queued) != 1 || queued[0].Source != sourceBackground {
+		t.Fatalf("expected the normal background wakeup, got %+v", queued)
 	}
 }
 
@@ -467,8 +473,9 @@ func TestCancelAfterReattach(t *testing.T) {
 	if got.Status != jobFailed || !strings.Contains(got.Error, "cancel") {
 		t.Errorf("cancelled after reattach = %+v", got)
 	}
-	if len(runner.enqueued) != 1 || runner.enqueued[0].Source != sourceBackground {
-		t.Errorf("expected a failed wakeup, got %+v", runner.enqueued)
+	queued := waitEnqueued(t, runner, 1)
+	if len(queued) != 1 || queued[0].Source != sourceBackground {
+		t.Errorf("expected a failed wakeup, got %+v", queued)
 	}
 }
 
