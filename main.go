@@ -13,10 +13,12 @@ const version = "3.0.0"
 
 // Config is the bootstrap configuration (<config_dir>/config.json). Everything
 // that changes at runtime lives in SQLite instead (DESIGN §5); this file only
-// holds what ccc needs before the database exists.
+// holds what ccc needs before the database exists, plus the Telegram user
+// whitelist (loaded at process start; restart listen to change it).
 type Config struct {
 	BotToken          string              `json:"bot_token"`
 	ChatID            int64               `json:"chat_id"`                      // the owner's Telegram user id — also their DM chat
+	AllowedUserIDs    []int64             `json:"allowed_user_ids,omitempty"`   // extra Telegram user ids allowed to talk (not owner commands)
 	TranscriptionLang string              `json:"transcription_lang,omitempty"` // language code for whisper (e.g. "es")
 	RelayURL          string              `json:"relay_url,omitempty"`          // relay server for files over 50 MB
 	HubURL            string              `json:"hub_url,omitempty"`            // public ccc hub (default wss://hub.getccc.dev; "-" disables)
@@ -302,7 +304,7 @@ func withDefaultNote(value string, isDefault bool) string {
 
 // configKeys are the keys `ccc config` understands. Secrets are never printed
 // back (DESIGN §12): the bot token reads as "configured".
-var configKeys = []string{"bot_token", "chat_id", "model", "data_dir", "env_passthrough", "relay_url",
+var configKeys = []string{"bot_token", "chat_id", "allowed_user_ids", "model", "data_dir", "env_passthrough", "relay_url",
 	"hub_url", "instance_name", "transcription_lang", "default_profile", "default_engine", "debounce_ms",
 	"compaction_model", "maintenance_hour", "idle_compact_s", "watch_ttl_s"}
 
@@ -315,6 +317,8 @@ func configGet(config *Config, key string) (string, error) {
 		return "configured", nil
 	case "chat_id":
 		return fmt.Sprint(config.ChatID), nil
+	case "allowed_user_ids":
+		return formatAllowedUserIDs(config.AllowedUserIDs), nil
 	case "model":
 		return renderInstanceModels(config), nil
 	case "data_dir":
@@ -365,6 +369,12 @@ func configSet(config *Config, key, value string) error {
 			return err
 		}
 		config.ChatID = n
+	case "allowed_user_ids":
+		ids, err := parseAllowedUserIDs(value)
+		if err != nil {
+			return err
+		}
+		config.AllowedUserIDs = ids
 	case "model":
 		config.Model = value
 	case "data_dir":

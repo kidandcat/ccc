@@ -287,7 +287,7 @@ summary so you are never left with only a status line.
 | `/account` | Status card per account (engine + health), with buttons. |
 | `/account add <identity> <engine>` | Register an account for that engine and start its login. |
 | `/account login\|remove\|default <identity> [engine]` | Relogin, remove, or make default (new sessions inherit that account's engine). If the same email exists on several engines, pass `email/codex` or `email codex`. |
-| `/access` | Who may talk to ccc (see below). |
+| `/access` | Show who may talk to ccc (config whitelist; see below). |
 | `/model [name]` | Show or set the model every session runs on. `/model default` clears it. |
 | `/secret add <name>` | Prompt for a vault value. The next message is captured by ccc and never sent to a session. Names only in replies. |
 | `/secret list` | Vault names. |
@@ -401,16 +401,20 @@ ccc config set watch_ttl_s 14400
 ### Access control
 
 ccc is **default-deny by Telegram user id**. The owner (`chat_id`) is always
-allowed; nobody else can do anything until you approve them.
+allowed. Extra ids live in `config.json` as `allowed_user_ids`, loaded when
+listen starts. Restart the service to change the list.
 
-- A stranger's message **in a group** is dropped in silence.
-- A stranger's **DM** gets one reply with a 6-hex pairing code (valid an hour;
-  at most 3 pending requests, at most 2 replies per person and then silence).
-  You also get a DM with **Allow** / **Block** buttons.
-- You approve with the button or `/access pair <code>`.
-- `/access list`, `/access add <id>`, `/access remove <id>`, `/access block <id>`.
+```bash
+ccc config set allowed_user_ids 123456789,987654321
+# then restart listen (launchd / systemd --user)
+ccc config set allowed_user_ids ""    # owner only again
+```
 
-An approved user can talk in the DM (the orchestrator). They cannot use `/account`, `/access`,
+- A stranger's message — **group or DM** — is dropped in silence. No pairing
+  code, no "this bot is private", no owner ping.
+- `/access` lists the config whitelist. It does not add or remove anyone.
+
+An allowed user can talk in the DM (the orchestrator). They cannot use `/account`, `/access`,
 `/model`, `/secret` — those stay yours.
 
 > Sessions run with bypassed permissions on your machine. **The chat is the trust
@@ -567,8 +571,9 @@ $USER` is on. See the Linux notes in the bootstrap.
 `chat_id` that is not your user id, or the bot token.
 
 **A message got no reply and no error.** You are probably not the owner and not
-approved — access control drops group messages from unknown users silently. Ask
-the owner for `/access add <your id>`.
+on `allowed_user_ids` — unknown DMs and group messages are dropped in silence.
+Ask the owner to add your Telegram user id (`ccc config set allowed_user_ids …`)
+and restart listen.
 
 **A watch never fires.** Its first run is a baseline, not a change. Check it
 with `/watches`; the interval floor is 60 s.

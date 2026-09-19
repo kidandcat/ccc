@@ -134,6 +134,9 @@ func TestConfigCommandSetAndGet(t *testing.T) {
 	if err := configCommand([]string{"set", "env_passthrough", "GH_TOKEN, LINEAR_API_KEY"}); err != nil {
 		t.Fatalf("config set env_passthrough: %v", err)
 	}
+	if err := configCommand([]string{"set", "allowed_user_ids", "4242, 99"}); err != nil {
+		t.Fatalf("config set allowed_user_ids: %v", err)
+	}
 
 	config, err := loadConfig()
 	if err != nil {
@@ -144,6 +147,9 @@ func TestConfigCommandSetAndGet(t *testing.T) {
 	}
 	if len(config.EnvPassthrough) != 2 || config.EnvPassthrough[1] != "LINEAR_API_KEY" {
 		t.Errorf("env_passthrough = %v", config.EnvPassthrough)
+	}
+	if len(config.AllowedUserIDs) != 2 || config.AllowedUserIDs[0] != 4242 || config.AllowedUserIDs[1] != 99 {
+		t.Errorf("allowed_user_ids = %v", config.AllowedUserIDs)
 	}
 
 	// The token is never echoed back.
@@ -157,6 +163,9 @@ func TestConfigCommandSetAndGet(t *testing.T) {
 
 	if err := configCommand([]string{"set", "chat_id", "not-a-number"}); err == nil {
 		t.Error("a non-numeric chat_id should be rejected")
+	}
+	if err := configCommand([]string{"set", "allowed_user_ids", "nope"}); err == nil {
+		t.Error("a non-numeric allowed_user_ids should be rejected")
 	}
 	if err := configCommand([]string{"set", "nonsense", "x"}); err == nil {
 		t.Error("an unknown key should be rejected")

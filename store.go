@@ -209,22 +209,6 @@ type MemoryArchive struct {
 
 func (MemoryArchive) TableName() string { return "memories_archive" }
 
-// Access is the pairing/allowlist table (DESIGN §5/§8). Replies is not in
-// DESIGN's column list: it is what implements "at most two replies to a
-// stranger, then silence", which otherwise has nowhere to live.
-type Access struct {
-	TelegramUserID int64 `gorm:"primaryKey"`
-	Display        string
-	State          string `gorm:"index"` // pending|approved|blocked
-	PairCode       string `gorm:"index"`
-	CodeExpiresAt  *time.Time
-	Replies        int
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-}
-
-func (Access) TableName() string { return "access" }
-
 // BackgroundJob is a long-running shell command owned by a bot (DESIGN §7).
 // It runs outside the conversational turn: status here is independent of
 // turns.status, so the topic stays responsive while the job works.
@@ -274,7 +258,7 @@ type Setting struct {
 func allModels() []any {
 	return []any{
 		&Bot{}, &Turn{}, &InboxMessage{}, &Memory{}, &MemoryArchive{}, &Project{},
-		&Watch{}, &Schedule{}, &Question{}, &Access{}, &Setting{}, &BackgroundJob{},
+		&Watch{}, &Schedule{}, &Question{}, &Setting{}, &BackgroundJob{},
 		&HubDevice{}, &HubPairCode{}, &HubFile{},
 	}
 }
@@ -323,6 +307,9 @@ func openStore(path string) (*gorm.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
+	if err := dropLegacyAccessTable(db); err != nil {
+		return nil, fmt.Errorf("drop legacy access table: %w", err)
+	}
 	if err := db.AutoMigrate(allModels()...); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
@@ -333,6 +320,13 @@ func openStore(path string) (*gorm.DB, error) {
 		ftsAvailable = true
 	}
 	return db, nil
+}
+
+// dropLegacyAccessTable removes the pairing/allowlist table. Access is a
+// config.json whitelist now (DESIGN §8); leaving the table would be a second
+// gate. Existing rows are discarded — anyone not in allowed_user_ids is denied.
+func dropLegacyAccessTable(db *gorm.DB) error {
+	return db.Exec("DROP TABLE IF EXISTS access").Error
 }
 
 // ensureMemoryFTS creates the FTS5 index over memories. AutoMigrate cannot

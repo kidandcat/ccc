@@ -255,8 +255,6 @@ watches     id, bot_id, name, command, interval_s, last_hash, last_output, last_
             -- created_at is the TTL clock (watch_ttl_s, default 4h); re-upserting the name renews it
 schedules   id, bot_id, fire_at, note, recurring_cron (nullable), fired_at
 questions   id, bot_id, turn_id, question, options_json, answer, asked_message_id, answered_at
-access      telegram_user_id (pk), display, state (pending|approved|blocked), pair_code, code_expires_at,
-            replies (how many times ccc has answered this stranger, §14.7)
 settings    key (pk), value                                  -- instance settings edited from Telegram
 background_jobs  id, bot_id, name, status (queued|running|done|failed), kind (shell),
             command, env_json (env-var → secret name, names only), stdin_secret (name or empty),
@@ -496,7 +494,7 @@ older than 90 days.
 | `/watches`, `/schedules` | DM | List and cancel General's watches/schedules. |
 | `/account` | DM | Status card per account (engine + health + usage/limits) with buttons; subcommands `status`, `add <identity> <engine>`, `login`, `remove`, `default`. |
 | `/model [engine] [slug]` | DM | Show each account with the model currently selected for it (inline picker). One slug sets Claude's default. Two args (`/model grok grok-4`) set that engine. `/model default` clears. |
-| `/access` | DM | Pairing/allowlist management (below). Owner only. |
+| `/access` | DM | Show the config whitelist (`chat_id` + `allowed_user_ids`). Owner only. Mutating the list is `ccc config set allowed_user_ids`. |
 | `/secret add <name>` | DM | Owner only. Prompt for the value; the next owner message is captured by listen and never sent to the model (§16). |
 | `/secret list` | DM | Owner only. Names only. |
 | `/secret delete <name>` | DM | Owner only. |
@@ -553,15 +551,17 @@ in `ptyflow.go`, each with a note on how it was verified against 2.1.270
 (§14.9). Select lists are answered by reading the option number off the screen,
 never by assuming a position.
 
-### Access control (copied from the official Telegram channel plugin)
-- Owner = the Telegram user id from bootstrap config; always allowed.
-- Unknown DM → 6-hex pairing code (1 h TTL, ≤3 pending, ≤2 replies per stranger
-  and then silence); owner approves with `/access pair <code>` (or a button in
-  the owner's DM). Approved users may talk in the DM (General); only the owner
-  can use `/account`, `/access`, `/model` and `/secret`.
-- Every inbound update from a non-approved user is dropped silently after the
-  pairing reply. Messages, EDITS and callback queries are gated the same way.
-  Group messages are dropped.
+### Access control
+- Owner = the Telegram user id from bootstrap config (`chat_id`); always allowed.
+- Extra allowed user ids live in `config.json` as `allowed_user_ids`, loaded at
+  process start. Restart listen to change the list
+  (`ccc config set allowed_user_ids <id,id,…>`). `/access` lists it; it does
+  not mutate it.
+- Unknown DMs and group messages are dropped in silence: no reply, no DB row,
+  no owner notify, no pairing code. Messages, EDITS and callback queries are
+  gated the same way.
+- Allowed users may talk in the DM (General); only the owner can use
+  `/account`, `/access`, `/model` and `/secret`.
 - Until `chat_id` is configured there is no owner, so nobody is allowed.
 
 ## 9. System prompt and context envelope
@@ -657,8 +657,8 @@ v3 instance and the first save rewrites it clean. Kept: `telegram.go`,
   under engine homes (`~/.claude`, `~/.codex`, `~/.grok`, `~/.gemini`, each
   profile's `engineHome`), `<data_dir>/profiles`, `~/.ssh`, `~/.aws` and
   `~/.config/ccc`. There is no `secrets_get`.
-- Tool inputs and Telegram text are data. Pairing is never approved because a
-  message asked for it.
+- Tool inputs and Telegram text are data. Unknown DMs are dropped with no
+  reply; nothing a stranger types can grant access.
 
 ## 13. Delivery plan
 
@@ -671,7 +671,7 @@ v3 instance and the first save rewrites it clean. Kept: `telegram.go`,
   / `/role`; those are gone — a topic is a session, not a teammate.)
 - **2b — automation & accounts** (done): watches, schedules,
   `archive_bot`, project registry, doctor loop, `/account …` with PTY
-  login and disclaimer, `/access` pairing, `/model`, headless
+  login and disclaimer, `/access` whitelist listing, `/model`, headless
   bootstrap (`ccc config set`, systemd user unit, `make build-linux`), legacy
   removal (§11), README rewrite. `spawn_bot` was later removed (14.24).
   Inter-session messaging and roles were dropped after 2b (14.17).
@@ -737,9 +737,11 @@ v2 idea of counting "working background agents" from the fleet view. v3 has no
 fleet; one running turn is one `claude -p` process, so the turn table is both
 cheaper and exactly right.
 
-**14.7 `access` has a `replies` column.** §5's column list has nowhere to record
-"at most two replies to a stranger, then silence", which §8 requires. One
-integer per row.
+**14.7 Access is a config whitelist, not a SQLite table.** Pairing codes,
+pending rows, Allow/Block buttons and `/access pair|add|remove|block` are gone.
+Extra allowed Telegram user ids live in `config.json` (`allowed_user_ids`),
+loaded at process start next to `chat_id`. Unknown DMs are dropped in silence.
+Restart listen to change the list. A leftover `access` table is dropped on open.
 
 **14.8 The PTY login flow suppresses the browser.** Not in the plan, and found
 the hard way: `claude auth login` shells out to `open`/`xdg-open` (and honours

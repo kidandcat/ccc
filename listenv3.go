@@ -286,8 +286,7 @@ func listenV3() error {
 				// The gate applies to an edit like to anything else — a
 				// stranger's edit must not slip past — hence the explicit call
 				// before handleEditedMessage decides what to do with it.
-				if in.gate(u.EditedMessage.From.ID, senderName(u.EditedMessage.From.Username, u.EditedMessage.From.FirstName),
-					u.EditedMessage.Chat.ID, u.EditedMessage.Chat.Type == "private") == roleDenied {
+				if in.gate(u.EditedMessage.From.ID) == roleDenied {
 					continue
 				}
 				in.handleEditedMessage(u.EditedMessage)
@@ -446,10 +445,10 @@ func setBotCommandsV3(botToken string) {
 
 // handleMessage routes one inbound Telegram message (DESIGN §8 "Conversation").
 // Nothing happens before the access gate: an update from a user who is neither
-// the owner nor approved is dropped here, group or DM (DESIGN §12).
+// the owner nor on allowed_user_ids is dropped here, group or DM (DESIGN §12).
 func (in *instance) handleMessage(msg *TelegramMessage) {
 	isDM := msg.Chat.Type == "private"
-	role := in.gate(msg.From.ID, senderName(msg.From.Username, msg.From.FirstName), msg.Chat.ID, isDM)
+	role := in.gate(msg.From.ID)
 	if role == roleDenied {
 		return
 	}
@@ -652,12 +651,12 @@ func (in *instance) listPendingAsks() {
 }
 
 // handleCallback processes an inline button tap. Callback data is ccc's own
-// (`q:`, `access:`, `account:`), but the TAP is an inbound update like any
+// (`q:`, `account:`, `model:`), but the TAP is an inbound update like any
 // other, so it goes through the same gate — and the owner-only namespaces are
 // checked again here.
 func (in *instance) handleCallback(cb *CallbackQuery) {
 	cfg := in.config()
-	role := in.gate(cb.From.ID, senderName(cb.From.Username, cb.From.FirstName), callbackChatID(cb), callbackIsDM(cb))
+	role := in.gate(cb.From.ID)
 	if role == roleDenied {
 		return
 	}
@@ -667,11 +666,6 @@ func (in *instance) handleCallback(cb *CallbackQuery) {
 		return
 	}
 	switch parts[0] {
-	case "access":
-		if role == roleOwner {
-			in.handleAccessCallback(cb, parts)
-		}
-		return
 	case "account":
 		if role == roleOwner {
 			in.handleAccountCallback(cb, parts)
@@ -1261,25 +1255,14 @@ func (in *instance) reply(msg *TelegramMessage, html string) {
 	}
 }
 
-// senderName is the human label ccc stores for a Telegram user: @username when
-// there is one, else the first name. Display only — access is always decided on
-// the numeric id, which the user cannot change.
-func senderName(username, firstName string) string {
-	if u := strings.TrimSpace(username); u != "" {
-		return "@" + u
+// editCallbackMessage rewrites the message a button lived on, which both shows
+// the result and retires the buttons.
+func (in *instance) editCallbackMessage(cb *CallbackQuery, html string) {
+	cfg := in.config()
+	if cb.Message == nil || cfg.BotToken == "" {
+		return
 	}
-	return strings.TrimSpace(firstName)
-}
-
-func callbackChatID(cb *CallbackQuery) int64 {
-	if cb.Message == nil {
-		return 0
-	}
-	return cb.Message.Chat.ID
-}
-
-func callbackIsDM(cb *CallbackQuery) bool {
-	return cb.Message != nil && cb.Message.Chat.Type == "private"
+	_ = editMessageHTML(cfg, cb.Message.Chat.ID, int64(cb.Message.MessageID), cb.Message.MessageThreadID, html) // safe-ignore: cosmetic
 }
 
 // handleEngineCommand assigns a bot to an engine's account pool. Engine itself

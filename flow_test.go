@@ -1173,9 +1173,7 @@ func TestMemoryStatsAndRestoreCommands(t *testing.T) {
 	}
 
 	// A non-owner may look, but not undo.
-	if err := in.db.Create(&Access{TelegramUserID: 4242, State: accessApproved}).Error; err != nil {
-		t.Fatal(err)
-	}
+	allowUsers(in, 4242)
 	in.handleMessage(dmMessage(4242, fmt.Sprintf("/memory restore %d", id)))
 	if !strings.Contains(last(), "owner-only") {
 		t.Errorf("restore is owner-only: %q", last())

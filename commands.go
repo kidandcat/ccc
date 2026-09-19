@@ -303,7 +303,8 @@ USAGE:
 COMMANDS:
     setup <bot_token>       Interactive bootstrap (owner DM, service)
     config set <key> <val>  Non-interactive bootstrap; keys: bot_token, chat_id,
-                            model, default_engine, data_dir, env_passthrough
+                            allowed_user_ids, model, default_engine, data_dir,
+                            env_passthrough
     config get <key>        Show one value
     config                  Show the whole configuration
     install                 Install the background service (launchd / systemd --user)
