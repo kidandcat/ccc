@@ -543,6 +543,242 @@ func TestQuestionsSimilarNormalized(t *testing.T) {
 	if _, ok := mapQuestionAnswer(&Question{OptionsJSON: `["Yes","No"]`}, "later"); ok {
 		t.Fatal("unknown option must not map")
 	}
+	mapped, ok := mapQuestionAnswer(&Question{OptionsJSON: `["Yes","No"]`}, "skip")
+	if !ok || mapped != skipOptionLabel {
+		t.Fatalf("skip on a sibling without Omitir must still map, got %q ok=%v", mapped, ok)
+	}
+	mapped, ok = mapQuestionAnswer(&Question{OptionsJSON: `["Yes","No","Omitir"]`}, "SKIP")
+	if !ok || mapped != skipOptionLabel {
+		t.Fatalf("skip should match the Omitir button, got %q ok=%v", mapped, ok)
+	}
+}
+
+func TestEnsureSkipOptionAlwaysLast(t *testing.T) {
+	cases := []struct {
+		in   []string
+		want []string
+	}{
+		{nil, []string{skipOptionLabel}},
+		{[]string{}, []string{skipOptionLabel}},
+		{[]string{"yes", "no"}, []string{"yes", "no", skipOptionLabel}},
+		{[]string{"a", "b", "c"}, []string{"a", "b", "c", skipOptionLabel}},
+		{[]string{"a", "b", "c", "d"}, []string{"a", "b", "c", skipOptionLabel}},
+		{[]string{"yes", "Omitir", "no"}, []string{"yes", "no", skipOptionLabel}},
+		{[]string{"Skip", "yes"}, []string{"yes", skipOptionLabel}},
+		{[]string{skipOptionLabel}, []string{skipOptionLabel}},
+	}
+	for _, tc := range cases {
+		got := ensureSkipOption(tc.in)
+		if len(got) != len(tc.want) {
+			t.Errorf("ensureSkipOption(%v) = %v, want %v", tc.in, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("ensureSkipOption(%v) = %v, want %v", tc.in, got, tc.want)
+				break
+			}
+		}
+		if got[len(got)-1] != skipOptionLabel {
+			t.Errorf("last option must be Omitir, got %v", got)
+		}
+		if len(got) > maxQuestionOptions {
+			t.Errorf("too many options: %v", got)
+		}
+	}
+}
+
+func TestAskOwnerAlwaysAddsOmitir(t *testing.T) {
+	in, _, api := testInstance(t)
+	b, err := in.createBot("deployer", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &mcpServer{db: in.db, config: in.cfg, botID: b.ID}
+	res, _, err := s.askOwner(t.Context(), nil, askOwnerIn{
+		Question: "Deploy to prod?",
+		Options:  []string{"ship it", "hold"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("ask_owner failed: %+v", res.Content)
+	}
+	var q Question
+	if err := in.db.Where("bot_id = ?", b.ID).First(&q).Error; err != nil {
+		t.Fatal(err)
+	}
+	opts := questionOptions(&q)
+	if len(opts) != 3 || opts[0] != "ship it" || opts[1] != "hold" || opts[2] != skipOptionLabel {
+		t.Fatalf("stored options = %v, want ship it / hold / Omitir", opts)
+	}
+	kb := lastKeyboard(t, api)
+	if len(kb) != 3 || kb[2][0].Text != skipOptionLabel {
+		t.Fatalf("keyboard = %+v, want Omitir last", kb)
+	}
+}
+
+func TestAskOwnerReplacesFourthWithOmitir(t *testing.T) {
+	in, _, _ := testInstance(t)
+	b, err := in.createBot("deployer", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &mcpServer{db: in.db, config: in.cfg, botID: b.ID}
+	if _, _, err := s.askOwner(t.Context(), nil, askOwnerIn{
+		Question: "Which host?",
+		Options:  []string{"vps2", "vps3", "fecha", "mac"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var q Question
+	if err := in.db.Where("bot_id = ?", b.ID).First(&q).Error; err != nil {
+		t.Fatal(err)
+	}
+	opts := questionOptions(&q)
+	if len(opts) != 4 || opts[3] != skipOptionLabel || opts[2] != "fecha" {
+		t.Fatalf("options = %v, want first 3 kept and Omitir last", opts)
+	}
+	for _, o := range opts {
+		if o == "mac" {
+			t.Fatal("the 4th content option must be replaced by Omitir")
+		}
+	}
+}
+
+func TestAskOwnerSkipUnblocksWithoutChoosing(t *testing.T) {
+	in, runner, api := testInstance(t)
+	b, err := in.createBot("deployer", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setBotStatus(in.db, b.ID, botWaiting)
+	s := &mcpServer{db: in.db, config: in.cfg, botID: b.ID}
+	if _, _, err := s.askOwner(t.Context(), nil, askOwnerIn{
+		Question: "Deploy to prod?",
+		Options:  []string{"ship it", "hold"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var q Question
+	if err := in.db.Where("bot_id = ?", b.ID).First(&q).Error; err != nil {
+		t.Fatal(err)
+	}
+	kb := lastKeyboard(t, api)
+	if len(kb) < 1 {
+		t.Fatal("no keyboard")
+	}
+	skip := kb[len(kb)-1][0]
+	if skip.Text != skipOptionLabel {
+		t.Fatalf("last button = %q", skip.Text)
+	}
+	cb := &CallbackQuery{ID: "skip", Data: skip.CallbackData}
+	cb.From.ID = 42
+	cb.Message = ownerMessage("")
+	in.handleCallback(cb)
+
+	if err := in.db.First(&q, q.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if q.AnsweredAt == nil || !isSkipOption(q.Answer) {
+		t.Fatalf("skip did not close the question: %+v", q)
+	}
+	last, ok := runner.last()
+	if !ok || last.BotID != b.ID {
+		t.Fatal("skip must unblock the worker")
+	}
+	if strings.Contains(last.Text, "ship it") || strings.Contains(last.Text, "hold") {
+		t.Errorf("skip must not pick A or B: %q", last.Text)
+	}
+	if !strings.Contains(last.Text, "skipped") || !strings.Contains(last.Text, "without choosing") {
+		t.Errorf("skip envelope = %q", last.Text)
+	}
+	after, err := botByID(in.db, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != botIdle {
+		t.Errorf("bot status = %q, want idle after skip", after.Status)
+	}
+}
+
+func TestSkipFansOutToSimilarWithoutOmitirButton(t *testing.T) {
+	in, runner, _ := testInstance(t)
+	a, err := in.createBot("one", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := in.createBot("two", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := json.Marshal([]string{"ship it", "hold", skipOptionLabel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q1 := Question{BotID: a.ID, Question: "Deploy to prod?", OptionsJSON: string(opts), AskedMessageID: 1}
+	q2 := Question{BotID: b.ID, Question: "deploy to prod", OptionsJSON: `["ship it","hold"]`, AskedMessageID: 2}
+	if err := in.db.Create(&q1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := in.db.Create(&q2).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	cb := &CallbackQuery{ID: "cb", Data: fmt.Sprintf("q:%d:2", q1.ID)}
+	cb.From.ID = 42
+	cb.Message = ownerMessage("")
+	cb.Message.MessageID = 1
+	in.handleCallback(cb)
+
+	var first, second Question
+	if err := in.db.First(&first, q1.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := in.db.First(&second, q2.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if first.AnsweredAt == nil || !isSkipOption(first.Answer) {
+		t.Fatalf("tapped skip not recorded: %+v", first)
+	}
+	if second.AnsweredAt == nil || !isSkipOption(second.Answer) {
+		t.Fatalf("similar question must be skipped too: %+v", second)
+	}
+	runner.mu.Lock()
+	n := len(runner.enqueued)
+	runner.mu.Unlock()
+	if n != 2 {
+		t.Errorf("want 2 skip turns, got %d: %+v", n, runner.enqueued)
+	}
+}
+
+func TestAskOwnerFreeTextStillGetsOmitir(t *testing.T) {
+	in, _, api := testInstance(t)
+	b, err := in.createBot("writer", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &mcpServer{db: in.db, config: in.cfg, botID: b.ID}
+	if _, _, err := s.askOwner(t.Context(), nil, askOwnerIn{Question: "What should the title be?"}); err != nil {
+		t.Fatal(err)
+	}
+	var q Question
+	if err := in.db.Where("bot_id = ?", b.ID).First(&q).Error; err != nil {
+		t.Fatal(err)
+	}
+	opts := questionOptions(&q)
+	if len(opts) != 1 || opts[0] != skipOptionLabel {
+		t.Fatalf("free-text options = %v, want only Omitir", opts)
+	}
+	joined := strings.Join(api.texts(""), "\n")
+	if !strings.Contains(joined, "Reply to this message") {
+		t.Errorf("free-text question must keep the reply hint, got %q", joined)
+	}
+	kb := lastKeyboard(t, api)
+	if len(kb) != 1 || kb[0][0].Text != skipOptionLabel {
+		t.Fatalf("free-text keyboard = %+v", kb)
+	}
 }
 
 func TestSendToBotDoesNotDumpIntoTelegram(t *testing.T) {

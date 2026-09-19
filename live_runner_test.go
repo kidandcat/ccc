@@ -202,8 +202,8 @@ func TestLiveAskOwner(t *testing.T) {
 		t.Error("the question should still be unanswered")
 	}
 	opts := questionOptions(&q)
-	if len(opts) != 2 {
-		t.Errorf("options = %v, want two", opts)
+	if len(opts) == 0 || opts[len(opts)-1] != skipOptionLabel {
+		t.Errorf("options = %v, want Omitir last", opts)
 	}
 
 	// The turn ended, and the bot is parked waiting for the answer.

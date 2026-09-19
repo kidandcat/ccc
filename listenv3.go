@@ -622,8 +622,10 @@ func (in *instance) listPendingAsks() {
 	for _, item := range shown {
 		fmt.Fprintf(&body, "\n\n<b>%s</b>\n%s", htmlEscape(item.Name), renderTelegramHTML(item.Q.Question))
 		opts := questionOptions(&item.Q)
-		if len(opts) == 0 {
+		if questionIsFreeText(opts) {
 			body.WriteString("\n<i>Reply to the original question.</i>")
+		}
+		if len(opts) == 0 {
 			continue
 		}
 		var row []InlineKeyboardButton

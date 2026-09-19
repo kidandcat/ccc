@@ -128,7 +128,7 @@ type notifyOwnerIn struct {
 
 type askOwnerIn struct {
 	Question string   `json:"question" jsonschema:"the question, one sentence"`
-	Options  []string `json:"options,omitempty" jsonschema:"up to 4 Telegram button labels; put the recommended answer first. Omit only when the answer cannot be a button"`
+	Options  []string `json:"options,omitempty" jsonschema:"up to 4 Telegram button labels; put the recommended answer first. Prefer 3 content options; the last button is always Omitir (skip). Omit only when the answer cannot be a button"`
 }
 
 type updateInstructionsIn struct {
@@ -181,7 +181,7 @@ func (s *mcpServer) register(server *mcp.Server) {
 	}, s.notifyOwner)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "ask_owner",
-		Description: "Ask the owner a question via Telegram native buttons and END YOUR TURN. Mandatory for every decision (yes/no, pick one, architectural fork). Never ask in chat or transcript prose. Pass up to 4 options as buttons, recommended first; omit options only when the answer cannot be a button. The answer arrives as your next message.",
+		Description: "Ask the owner a question via Telegram native buttons and END YOUR TURN. Mandatory for every decision (yes/no, pick one, architectural fork). Never ask in chat or transcript prose. Pass up to 3 content options as buttons, recommended first; Omitir is always added as the last button (skip without choosing, unblocks you). If you pass 4, the last is replaced. Omit options only when the answer cannot be a button. The answer arrives as your next message.",
 	}, s.askOwner)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "set_name",
@@ -435,7 +435,42 @@ func (s *mcpServer) notifyOwner(_ context.Context, _ *mcp.CallToolRequest, in no
 }
 
 // maxQuestionOptions is Telegram-friendly and matches DESIGN §6 (≤4 options).
+// The last slot is always Omitir (skip without choosing).
 const maxQuestionOptions = 4
+
+// skipOptionLabel is the last ask_owner button. Tapping it closes the
+// question without picking a content option and unblocks the worker.
+const skipOptionLabel = "Omitir"
+
+func isSkipOption(s string) bool {
+	s = strings.TrimSpace(s)
+	return strings.EqualFold(s, skipOptionLabel) || strings.EqualFold(s, "Skip")
+}
+
+// ensureSkipOption puts Omitir last. Four content options lose the last slot
+// (DESIGN §6: 3 of substance + Omitir, or the 4th is always Omitir).
+func ensureSkipOption(opts []string) []string {
+	content := make([]string, 0, len(opts)+1)
+	for _, o := range opts {
+		if isSkipOption(o) {
+			continue
+		}
+		content = append(content, o)
+	}
+	if len(content) >= maxQuestionOptions {
+		content = content[:maxQuestionOptions-1]
+	}
+	return append(content, skipOptionLabel)
+}
+
+func questionIsFreeText(opts []string) bool {
+	for _, o := range opts {
+		if !isSkipOption(o) {
+			return false
+		}
+	}
+	return true
+}
 
 func (s *mcpServer) askOwner(_ context.Context, _ *mcp.CallToolRequest, in askOwnerIn) (*mcp.CallToolResult, any, error) {
 	q := strings.TrimSpace(in.Question)
@@ -457,6 +492,7 @@ func (s *mcpServer) askOwner(_ context.Context, _ *mcp.CallToolRequest, in askOw
 		}
 		opts = append(opts, truncate(o, 60))
 	}
+	opts = ensureSkipOption(opts)
 	optionsJSON, err := json.Marshal(opts)
 	if err != nil {
 		return toolErr("invalid options"), nil, nil
@@ -644,8 +680,10 @@ func (s *mcpServer) postQuestion(topicID, questionID int64, question string, opt
 		return 0
 	}
 	body := "❓ " + renderTelegramHTML(question)
-	if len(options) == 0 {
+	if questionIsFreeText(options) {
 		body += "\n<i>Reply to this message with your answer.</i>"
+	}
+	if len(options) == 0 {
 		id, _ := sendMessageHTMLGetID(s.config, chat, thread, body) // safe-ignore: a question with no message id can still be answered by reply
 		return id
 	}
@@ -729,6 +767,14 @@ func mapQuestionAnswer(q *Question, answer string) (string, bool) {
 	if len(opts) == 0 {
 		return answer, true
 	}
+	if isSkipOption(answer) {
+		for _, o := range opts {
+			if isSkipOption(o) {
+				return o, true
+			}
+		}
+		return skipOptionLabel, true
+	}
 	for _, o := range opts {
 		if strings.EqualFold(strings.TrimSpace(o), answer) {
 			return o, true
@@ -778,6 +824,9 @@ func answerQuestion(db *gorm.DB, q *Question, answer string) string {
 	now := time.Now()
 	db.Model(&Question{}).Where("id = ?", q.ID).
 		Updates(map[string]any{"answer": answer, "answered_at": now})
+	if isSkipOption(answer) {
+		return fmt.Sprintf("The owner skipped the question %q without choosing. Continue without that decision; do not re-ask the same question.", q.Question)
+	}
 	return fmt.Sprintf("Answer to %q: %s", q.Question, answer)
 }
 

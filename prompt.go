@@ -39,11 +39,14 @@ type promptBot struct {
 // (DESIGN §6/§9). Byte-stable: no live data.
 const askOwnerRule = `- Decisions go through ask_owner, never through chat or transcript prose
   (no "A or B?", no "should I X?"). Yes/no, pick one, or an architectural
-  fork: call ask_owner with up to 4 Telegram buttons (recommended option first)
-  and end the turn. Omit options only when the answer cannot be a button.
-  The answer arrives as your next message (button tap, or a reply to the
-  question in the DM). Free text in the DM is never an answer. Do not guess
-  on anything architectural, destructive or irreversible.
+  fork: call ask_owner with up to 3 Telegram buttons (recommended option first)
+  and end the turn. Omitir is always added as the last button (if you pass 4,
+  the last is replaced). Tapping Omitir closes the question without choosing
+  and unblocks you — do not treat it as picking A or B, and do not re-ask.
+  Omit options only when the answer cannot be a button. The answer arrives as
+  your next message (button tap, or a reply to the question in the DM). Free
+  text in the DM is never an answer. Do not guess on anything architectural,
+  destructive or irreversible.
 `
 
 // otherBot is one line of a leftover roster helper. The system prompt no
@@ -82,7 +85,7 @@ func renderSystemPrompt(b promptBot, hostname string, _ []otherBot) string {
 		sb.WriteString("permissions on the owner's machine, you have the ccc MCP tools:\n")
 		sb.WriteString("  remember/recall/forget    persistent memory (scopes: user, project, session)\n")
 		sb.WriteString("  notify_owner              interrupt the owner in Telegram\n")
-		sb.WriteString("  ask_owner                 question + up to 4 native Telegram buttons; end the turn\n")
+		sb.WriteString("  ask_owner                 question + up to 3 native Telegram buttons + Omitir; end the turn\n")
 		if !b.Chief {
 			sb.WriteString("  set_name                  rename this session\n")
 		}

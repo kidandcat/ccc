@@ -244,7 +244,7 @@ ssh host
 | `/session <prompt>` | Starts a backend worker named after the first line, first turn = that prompt. |
 | A photo or document | Saved into the orchestrator's `inbox/`, with the path passed in the message. |
 | A voice note | Transcribed if the `voice` build is installed, else the file path is passed. |
-| A reply to a question / a button | Answers that session's `ask_owner`. Free text in the DM is always the orchestrator, never an answer; if anything is still pending it is listed (no timeout). Tapping one also answers similar pending questions. |
+| A reply to a question / a button | Answers that session's `ask_owner`. **Omitir** skips without choosing and unblocks the session. Free text in the DM is always the orchestrator, never an answer; if anything is still pending it is listed (no timeout). Tapping one also answers similar pending questions. |
 
 While an orchestrator turn runs, one progress message in the DM is edited in place
 (no Telegram notification). The answer is posted when the turn finishes — that
@@ -302,8 +302,10 @@ use `ccc routine` there). Grok calls them through `search_tool` / `use_tool`.
   (plus a leftover per-session scope).
 - `notify_owner` / `ask_owner` — reach you (interruptions, not report dumps);
   `ask_owner` is how a session asks you to decide: Telegram inline buttons
-  (≤4, recommended first) or a reply-to for free text. The turn ends until you
-  answer. Sessions must not ask in chat or transcript prose.
+  (≤3 content options, recommended first; last is always **Omitir**, which
+  skips without choosing and unblocks the session) or a reply-to for free
+  text. The turn ends until you answer or skip. Sessions must not ask in chat
+  or transcript prose.
 - `watch` / `unwatch` / `list_watches` — poll a command; wake only when output
   changes (no change = zero tokens). Lasts `watch_ttl_s` (default 4 h), then
   it is cancelled and the session is woken to re-set it. Standing jobs are
