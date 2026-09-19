@@ -681,6 +681,73 @@ func TestIdleSessionStaysForOpenQuestion(t *testing.T) {
 	}
 }
 
+func TestGeneralIsRotatedAfterIdle(t *testing.T) {
+	s, in, runner, api := testScheduler(t)
+	g, err := in.ensureGeneralBot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := in.db.Model(&Bot{}).Where("id = ?", g.ID).Updates(map[string]any{
+		"session_id": "fat-general", "status": botIdle,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	seedEndedTurn(t, in.db, g.ID, now.Add(-2*time.Hour))
+	s.compactIdleSessions(now)
+
+	var got Bot
+	in.db.First(&got, g.ID)
+	if got.SessionID != "" {
+		t.Errorf("General session_id = %q, want empty after idle compact", got.SessionID)
+	}
+	if len(runner.enqueued) != 0 {
+		t.Errorf("rotating General must not spend a turn: %+v", runner.enqueued)
+	}
+	joined := strings.Join(api.texts(""), "\n")
+	if !strings.Contains(joined, "Fresh conversation") {
+		t.Errorf("General rotation should post a silent DM, got %q", api.texts(""))
+	}
+
+	in.db.Model(&Bot{}).Where("id = ?", g.ID).Update("session_id", "warm-general")
+	seedEndedTurn(t, in.db, g.ID, now.Add(-10*time.Minute))
+	before := len(api.texts(""))
+	s.compactIdleSessions(now)
+	in.db.First(&got, g.ID)
+	if got.SessionID != "warm-general" {
+		t.Errorf("warm General was rotated: %q", got.SessionID)
+	}
+	if len(api.texts("")) != before {
+		t.Error("a warm General must not post another rotation")
+	}
+}
+
+func TestSessionForTurnRotatesAColdGeneral(t *testing.T) {
+	in, _, _ := testInstance(t)
+	g, err := in.ensureGeneralBot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.db.Model(&Bot{}).Where("id = ?", g.ID).Update("session_id", "fat-general")
+	seedEndedTurn(t, in.db, g.ID, time.Now().Add(-2*time.Hour))
+	live, _ := botByID(in.db, g.ID)
+	r := &Runner{db: in.db, cfg: in.cfg}
+	id, resume := r.sessionForTurn(live)
+	if resume || id == "fat-general" {
+		t.Errorf("cold General was resumed: id=%q resume=%v", id, resume)
+	}
+
+	zero := 0
+	in.cfg.IdleCompactS = &zero
+	in.db.Model(&Bot{}).Where("id = ?", g.ID).Update("session_id", "fat-general")
+	live, _ = botByID(in.db, g.ID)
+	r.cfg = in.cfg
+	id, resume = r.sessionForTurn(live)
+	if !resume || id != "fat-general" {
+		t.Errorf("idle_compact_s=0 should still resume General: id=%q resume=%v", id, resume)
+	}
+}
+
 func TestSessionForTurnRotatesAColdSession(t *testing.T) {
 	in, _, _ := testInstance(t)
 	b, err := in.createBot("analyst", "")
@@ -870,7 +937,7 @@ func TestWatchExpiryLabel(t *testing.T) {
 	}
 }
 
-func TestIdleRemindWakesGeneralEveryTenMinutes(t *testing.T) {
+func TestIdleRemindWakesGeneralOncePerIdleSpell(t *testing.T) {
 	s, in, runner, api := testScheduler(t)
 	chief, err := in.ensureGeneralBot()
 	if err != nil {
@@ -894,6 +961,9 @@ func TestIdleRemindWakesGeneralEveryTenMinutes(t *testing.T) {
 	if !strings.Contains(got.Text, "deployer") || !strings.Contains(got.Text, "ask_owner") {
 		t.Errorf("General input missing the idle nag:\n%s", got.Text)
 	}
+	if !strings.Contains(got.Text, "only reminder") {
+		t.Errorf("idle nag must say this is the only reminder:\n%s", got.Text)
+	}
 	if !strings.Contains(got.Text, "Message from deployer") {
 		t.Errorf("idle nag must look like a worker report:\n%s", got.Text)
 	}
@@ -905,16 +975,57 @@ func TestIdleRemindWakesGeneralEveryTenMinutes(t *testing.T) {
 		t.Fatalf("want one delivered inbox row, got %+v", inbox)
 	}
 
-	s.remindIdleSessions(now.Add(time.Minute))
-	if n := len(runner.enqueued); n != 1 {
-		t.Errorf("reminded again after 1m (%d turns); cadence is 10m", n)
-	}
-
-	s.remindIdleSessions(now.Add(idleRemindInterval + time.Minute))
-	if n := len(runner.enqueued); n != 2 {
-		t.Errorf("after 10m more, want a second General turn, got %d", n)
+	live, _ := botByID(in.db, b.ID)
+	for _, later := range []time.Time{now.Add(time.Minute), now.Add(11 * time.Minute), now.Add(3 * time.Hour), now.Add(24 * time.Hour)} {
+		s.remindIdleSessions(later)
+		if n := len(runner.enqueued); n != 1 {
+			t.Errorf("after %s still idle, want 1 General turn, got %d", later.Sub(now), n)
+		}
+		if err := in.db.First(live, b.ID).Error; err != nil {
+			t.Fatal(err)
+		}
 	}
 	assertIdleRemindNotOnTelegram(t, api)
+}
+
+func TestIdleRemindFiresAgainAfterANewSpell(t *testing.T) {
+	s, in, runner, _ := testScheduler(t)
+	if _, err := in.ensureGeneralBot(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := in.createBot("deployer", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	seedEndedTurn(t, in.db, b.ID, now.Add(-15*time.Minute))
+	s.remindIdleSessions(now)
+	if n := len(runner.enqueued); n != 1 {
+		t.Fatalf("want the first remind, got %d", n)
+	}
+
+	in.db.Model(&Bot{}).Where("id = ?", b.ID).Updates(map[string]any{
+		"status": botRunning, "idle_reminded_at": nil,
+	})
+	s.remindIdleSessions(now.Add(time.Minute))
+	if n := len(runner.enqueued); n != 1 {
+		t.Errorf("a running worker must not be reminded, got %d", n)
+	}
+
+	in.db.Model(&Bot{}).Where("id = ?", b.ID).Update("status", botIdle)
+	seedEndedTurn(t, in.db, b.ID, now.Add(2*time.Minute))
+	s.remindIdleSessions(now.Add(5 * time.Minute))
+	if n := len(runner.enqueued); n != 1 {
+		t.Errorf("a new spell must wait 10m, got %d", n)
+	}
+	s.remindIdleSessions(now.Add(13 * time.Minute))
+	if n := len(runner.enqueued); n != 2 {
+		t.Errorf("want a second remind after a new 10m spell, got %d", n)
+	}
+	s.remindIdleSessions(now.Add(40 * time.Minute))
+	if n := len(runner.enqueued); n != 2 {
+		t.Errorf("no third remind in the same spell, got %d", n)
+	}
 }
 
 func assertIdleRemindNotOnTelegram(t *testing.T, api *fakeBotAPI) {

@@ -99,6 +99,9 @@ type fakeRunner struct {
 	mu       sync.Mutex
 	enqueued []fakeTurn
 	stops    []int64
+	// running, when non-nil, makes Stop return true only for those ids
+	// (and clears the flag). Nil keeps the old "always true" behaviour.
+	running map[int64]bool
 }
 
 type fakeTurn struct {
@@ -123,9 +126,33 @@ func (f *fakeRunner) Enqueue(botID int64, source, text string, trigger int64) (*
 
 func (f *fakeRunner) Stop(botID int64) bool {
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.stops = append(f.stops, botID)
-	f.mu.Unlock()
-	return true
+	if f.db != nil {
+		f.db.Model(&Turn{}).Where("bot_id = ? AND status = ?", botID, turnQueued).
+			Updates(map[string]any{"status": turnFailed, "stop_reason": "dropped by /stop"})
+	}
+	if f.running == nil {
+		return true
+	}
+	if f.running[botID] {
+		delete(f.running, botID)
+		return true
+	}
+	return false
+}
+
+func (f *fakeRunner) setRunning(id int64, on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.running == nil {
+		f.running = map[int64]bool{}
+	}
+	if on {
+		f.running[id] = true
+	} else {
+		delete(f.running, id)
+	}
 }
 
 func (f *fakeRunner) last() (fakeTurn, bool) {
@@ -914,6 +941,111 @@ func TestCommandsInDM(t *testing.T) {
 	in.handleMessage(ownerMessage("/stop"))
 	if len(runner.stops) != 1 || runner.stops[0] != g.ID {
 		t.Errorf("/stop did not reach the runner: %v", runner.stops)
+	}
+}
+
+func TestStopCommandReachesWorkers(t *testing.T) {
+	in, runner, api := testInstance(t)
+	g, err := in.ensureGeneralBot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployer, err := in.createBot("deployer", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	analyst, err := in.createBot("analyst", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	in.db.Model(&Bot{}).Where("id = ?", deployer.ID).Update("status", botRunning)
+	runner.setRunning(deployer.ID, true)
+	in.handleMessage(ownerMessage("/stop"))
+	if len(runner.stops) < 2 || runner.stops[0] != g.ID || runner.stops[1] != deployer.ID {
+		t.Errorf("bare /stop with idle General = %v, want [General, deployer, …]", runner.stops)
+	}
+	joined := strings.Join(api.texts(""), "\n")
+	if !strings.Contains(joined, "deployer") || !strings.Contains(joined, "🛑") {
+		t.Errorf("reply missing deployer stop:\n%s", joined)
+	}
+	var after Bot
+	in.db.First(&after, deployer.ID)
+	if after.Status != botIdle {
+		t.Errorf("deployer status = %s, want idle", after.Status)
+	}
+
+	runner.stops = nil
+	runner.setRunning(g.ID, true)
+	runner.setRunning(deployer.ID, true)
+	in.db.Model(&Bot{}).Where("id IN ?", []int64{g.ID, deployer.ID}).Update("status", botRunning)
+	in.handleMessage(ownerMessage("/stop"))
+	if len(runner.stops) != 1 || runner.stops[0] != g.ID {
+		t.Errorf("both running: stops = %v, want only General", runner.stops)
+	}
+	joined = strings.Join(api.texts(""), "\n")
+	if !strings.Contains(joined, "Still running") || !strings.Contains(strings.ToLower(joined), "deployer") ||
+		!strings.Contains(joined, "/stop all") {
+		t.Errorf("want Still running + /stop all:\n%s", joined)
+	}
+
+	runner.stops = nil
+	runner.setRunning(deployer.ID, true)
+	runner.setRunning(analyst.ID, true)
+	in.db.Model(&Bot{}).Where("id IN ?", []int64{deployer.ID, analyst.ID}).Update("status", botRunning)
+	in.handleMessage(ownerMessage("/stop DEPLOYER"))
+	if len(runner.stops) != 1 || runner.stops[0] != deployer.ID {
+		t.Errorf("/stop DEPLOYER stops = %v", runner.stops)
+	}
+	joined = strings.Join(api.texts(""), "\n")
+	if !strings.Contains(joined, "analyst") || !strings.Contains(joined, "Still running") {
+		t.Errorf("should list analyst still running:\n%s", joined)
+	}
+
+	runner.stops = nil
+	runner.setRunning(g.ID, true)
+	runner.setRunning(deployer.ID, true)
+	runner.setRunning(analyst.ID, true)
+	in.db.Model(&Bot{}).Where("id IN ?", []int64{g.ID, deployer.ID, analyst.ID}).Update("status", botRunning)
+	in.handleMessage(ownerMessage("/stop all"))
+	if len(runner.stops) != 3 {
+		t.Errorf("/stop all stops = %v, want 3", runner.stops)
+	}
+	joined = strings.Join(api.texts(""), "\n")
+	if strings.Contains(joined, "Still running") {
+		t.Errorf("/stop all should not say Still running:\n%s", joined)
+	}
+
+	runner.stops = nil
+	in.handleMessage(ownerMessage("/stop nope"))
+	if len(runner.stops) != 0 {
+		t.Errorf("unknown name stopped %v", runner.stops)
+	}
+	if !strings.Contains(strings.Join(api.texts(""), "\n"), "No live session") {
+		t.Error("unknown name should say No live session")
+	}
+
+	runner.stops = nil
+	in.db.Model(&Bot{}).Where("id IN ?", []int64{g.ID, deployer.ID, analyst.ID}).Update("status", botIdle)
+	in.handleMessage(ownerMessage("/stop"))
+	if !strings.Contains(strings.Join(api.texts(""), "\n"), "Nothing was running") {
+		t.Errorf("quiet /stop:\n%s", strings.Join(api.texts(""), "\n"))
+	}
+
+	runner.stops = nil
+	in.db.Model(&Bot{}).Where("id = ?", analyst.ID).Update("status", botWaiting)
+	if err := in.db.Create(&Turn{BotID: deployer.ID, Source: sourceUser, Input: "x", Status: turnQueued}).Error; err != nil {
+		t.Fatal(err)
+	}
+	in.handleMessage(ownerMessage("/stop all"))
+	var a Bot
+	in.db.First(&a, analyst.ID)
+	if a.Status != botWaiting {
+		t.Errorf("waiting analyst became %s", a.Status)
+	}
+	joined = strings.ToLower(strings.Join(api.texts(""), "\n"))
+	if !strings.Contains(joined, "dropped") || !strings.Contains(joined, "1 queued") {
+		t.Errorf("want dropped 1 queued:\n%s", joined)
 	}
 
 	in.handleMessage(ownerMessage("/cwd /definitely/not/here"))

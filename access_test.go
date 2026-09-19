@@ -157,8 +157,12 @@ func TestAccessListShowsConfigWhitelist(t *testing.T) {
 	if classifyAccess(in.config(), 7777) != roleDenied {
 		t.Error("/access add must not mutate the whitelist")
 	}
-	if !strings.Contains(strings.Join(api.texts(""), "\n"), "allowed_user_ids") {
+	joined = strings.Join(api.texts(""), "\n")
+	if !strings.Contains(joined, "allowed_user_ids") {
 		t.Error("/access add should point at ccc config set allowed_user_ids")
+	}
+	if !strings.Contains(joined, "does not grant") && !strings.Contains(joined, "Remote grant") {
+		t.Errorf("/access add must refuse a remote grant:\n%s", joined)
 	}
 }
 
@@ -218,5 +222,31 @@ func TestLegacyAccessTableIsDropped(t *testing.T) {
 	}
 	if n != 0 {
 		t.Error("the access table is still there")
+	}
+}
+
+func TestLegacyTablesAreDropped(t *testing.T) {
+	in, _, _ := testInstance(t)
+	for _, table := range []string{
+		"CREATE TABLE access (telegram_user_id INTEGER PRIMARY KEY, state TEXT)",
+		"CREATE TABLE hub_devices (id INTEGER PRIMARY KEY, pub_key TEXT)",
+		"CREATE TABLE hub_pair_codes (code TEXT PRIMARY KEY)",
+		"CREATE TABLE hub_files (id INTEGER PRIMARY KEY, path TEXT)",
+	} {
+		if err := in.db.Exec(table).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := dropLegacyTables(in.db); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"access", "hub_devices", "hub_pair_codes", "hub_files"} {
+		var n int64
+		if err := in.db.Raw(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&n).Error; err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Errorf("%s is still there", name)
+		}
 	}
 }

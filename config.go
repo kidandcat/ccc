@@ -126,10 +126,14 @@ const (
 	defaultMaintenanceHour = 4
 	defaultIdleCompactS    = 3600  // 1h: Claude's prompt-cache TTL, so we rotate before a cold rewrite
 	defaultWatchTTLS       = 14400 // 4h: same safety cap as background jobs
+	// defaultWorkerTurnTimeoutS caps a hung worker (or General report) CLI.
+	// Owner work on General stays on the 60s chief cap.
+	defaultWorkerTurnTimeoutS = 1800
 	// maxDebounceMS keeps a typo (debounce_ms = 250000) from parking every bot.
-	maxDebounceMS   = 60000
-	maxIdleCompactS = 24 * 3600
-	maxWatchTTLS    = 7 * 24 * 3600
+	maxDebounceMS         = 60000
+	maxIdleCompactS       = 24 * 3600
+	maxWatchTTLS          = 7 * 24 * 3600
+	maxWorkerTurnTimeoutS = 24 * 3600
 )
 
 // debounceMS is how long an idle bot waits for more messages before it starts a
@@ -206,6 +210,22 @@ func watchTTL(c *Config) time.Duration {
 	}
 	if n > maxWatchTTLS {
 		n = maxWatchTTLS
+	}
+	return time.Duration(n) * time.Second
+}
+
+// workerTurnTimeout caps one worker CLI turn (and General turns that are
+// not the owner's). 0 disables. The 60s General owner cap is separate.
+func workerTurnTimeout(c *Config) time.Duration {
+	n := defaultWorkerTurnTimeoutS
+	if c != nil && c.WorkerTurnTimeoutS != nil {
+		n = *c.WorkerTurnTimeoutS
+	}
+	if n <= 0 {
+		return 0
+	}
+	if n > maxWorkerTurnTimeoutS {
+		n = maxWorkerTurnTimeoutS
 	}
 	return time.Duration(n) * time.Second
 }

@@ -308,7 +308,7 @@ func TestInterruptActiveTimesOutWithoutLookingLikeStop(t *testing.T) {
 	defer syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // safe-ignore: test teardown
 
 	r := &Runner{active: map[int64]*activeTurn{}}
-	r.active[1] = &activeTurn{cmd: cmd}
+	r.active[1] = &activeTurn{cmd: cmd, pid: cmd.Process.Pid}
 	if !r.interruptActive(1, true) {
 		t.Fatal("timeout should have signalled the process")
 	}
@@ -337,7 +337,7 @@ func TestInterruptArchivedDoesNotLookLikeStop(t *testing.T) {
 	defer syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // safe-ignore: test teardown
 
 	r := &Runner{active: map[int64]*activeTurn{}}
-	r.active[1] = &activeTurn{cmd: cmd}
+	r.active[1] = &activeTurn{cmd: cmd, pid: cmd.Process.Pid}
 	if !r.interruptArchived(1) {
 		t.Fatal("archive should have signalled the process")
 	}
@@ -372,7 +372,7 @@ func TestWatchArchiveKillsRunningTurn(t *testing.T) {
 	defer func() { archiveWatchInterval = prev }()
 
 	r := newRunner(in.db, in.cfg, nil)
-	r.active[w.ID] = &activeTurn{cmd: cmd}
+	r.active[w.ID] = &activeTurn{cmd: cmd, pid: cmd.Process.Pid}
 	stop := make(chan struct{})
 	defer close(stop)
 	go r.watchArchive(w.ID, stop)

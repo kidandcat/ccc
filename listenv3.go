@@ -205,11 +205,9 @@ func listenV3() error {
 	}
 	in := &instance{db: db, cfg: cfg, dataDir: dataDir(cfg)}
 	tg := telegramUI{in}
-	ui := &muxUI{tg: tg}
-	runner := newRunner(db, cfg, ui)
+	runner := newRunner(db, cfg, tg)
 	in.runner = runner
 	in.panel = runner.panel
-	ui.hub = startHubClient(in)
 	defer runner.Close()
 
 	sched := newScheduler(in)
@@ -839,56 +837,6 @@ func (in *instance) handleAttachment(msg *TelegramMessage) bool {
 	}
 }
 
-// ingestOwnerBytes writes bytes the owner sent (phone app image, etc.) into
-// the session inbox and enqueues a turn the same way a Telegram photo does.
-func (in *instance) ingestOwnerBytes(b *Bot, data []byte, filename, caption string) error {
-	cfg := in.config()
-	inbox := filepath.Join(botCwd(cfg, b), "inbox")
-	if err := os.MkdirAll(inbox, 0o755); err != nil {
-		return err
-	}
-	name := sanitizeFileName(filename)
-	path := filepath.Join(inbox, name)
-	if _, err := os.Stat(path); err == nil {
-		ext := filepath.Ext(name)
-		base := strings.TrimSuffix(name, ext)
-		name = fmt.Sprintf("%s_%d%s", base, time.Now().UnixNano(), ext)
-		path = filepath.Join(inbox, name)
-	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return err
-	}
-	caption = strings.TrimSpace(caption)
-	if caption == "" {
-		if strings.HasPrefix(mimeForName(name), "image/") {
-			caption = "The owner sent an image."
-		} else {
-			caption = "The owner sent a file."
-		}
-	}
-	turn, err := in.runner.Enqueue(b.ID, sourceUser, fmt.Sprintf("%s It is saved at %s", caption, path), 0)
-	if err != nil {
-		return err
-	}
-	turnID := int64(0)
-	if turn != nil {
-		turnID = turn.ID
-	}
-	_ = in.db.Create(&HubFile{
-		BotID:     b.ID,
-		TurnID:    turnID,
-		Name:      name,
-		MIME:      mimeForName(name),
-		Size:      int64(len(data)),
-		Path:      path,
-		Direction: "in",
-		PushedAt:  ptrTime(time.Now()),
-	}).Error
-	return nil
-}
-
-func ptrTime(t time.Time) *time.Time { return &t }
-
 // sanitizeFileName strips path separators from a Telegram-provided file name:
 // the name comes from the world, and it is used to build a path.
 func sanitizeFileName(name string) string {
@@ -975,12 +923,8 @@ func (in *instance) handleCommand(msg *TelegramMessage, text string, role access
 		in.reply(msg, "🆕 Fresh conversation. Memories are kept.")
 
 	case "/stop":
-		if in.runner.Stop(b.ID) {
-			in.reply(msg, "🛑 Stopping.")
-		} else {
-			in.reply(msg, "Nothing was running; the queue is now empty.")
-		}
-		setBotStatus(in.db, b.ID, botIdle)
+		in.handleStopCommand(msg, rest)
+		return
 
 	case "/engine":
 		in.handleEngineCommand(msg, b, rest)
@@ -1073,6 +1017,135 @@ func (in *instance) handleCommand(msg *TelegramMessage, text string, role access
 	}
 }
 
+// handleStopCommand implements `/stop [name|all]`. Bare `/stop` kills
+// General's turn if one is running (or drops its queue). If that did
+// nothing, it stops every live worker — so a hung session is reachable
+// without naming it. `/stop <name>` is case-insensitive; `orchestrator`
+// is an alias for General. Waiting (ask_owner) sessions stay parked.
+func (in *instance) handleStopCommand(msg *TelegramMessage, rest string) {
+	arg := strings.TrimSpace(rest)
+	bots, err := liveBots(in.db)
+	if err != nil {
+		in.reply(msg, "Could not list sessions.")
+		return
+	}
+	var targets []int64
+	switch {
+	case strings.EqualFold(arg, "all"):
+		for i := range bots {
+			targets = append(targets, bots[i].ID)
+		}
+	case arg == "":
+		if g, err := generalBot(in.db); err == nil {
+			killed, dropped := in.stopSessions([]int64{g.ID})
+			if len(killed) > 0 || dropped > 0 {
+				in.reply(msg, renderStopReply(killed, dropped, stillRunningAfterStop(in.db, killed)))
+				return
+			}
+		}
+		for i := range bots {
+			if !isGeneralBot(&bots[i]) {
+				targets = append(targets, bots[i].ID)
+			}
+		}
+	default:
+		b := findLiveSession(bots, arg)
+		if b == nil {
+			in.reply(msg, "No live session named "+htmlEscape(arg)+".")
+			return
+		}
+		targets = []int64{b.ID}
+	}
+	if len(targets) == 0 {
+		in.reply(msg, "Nothing was running.")
+		return
+	}
+	killed, dropped := in.stopSessions(targets)
+	in.reply(msg, renderStopReply(killed, dropped, stillRunningAfterStop(in.db, killed)))
+}
+
+func findLiveSession(bots []Bot, name string) *Bot {
+	want := strings.ToLower(strings.TrimSpace(name))
+	if want == "orchestrator" {
+		want = strings.ToLower(generalBotName)
+	}
+	for i := range bots {
+		if strings.ToLower(bots[i].Name) == want {
+			return &bots[i]
+		}
+	}
+	return nil
+}
+
+func (in *instance) stopSessions(ids []int64) (killed []string, dropped int) {
+	for _, id := range ids {
+		b, err := botByID(in.db, id)
+		if err != nil || b == nil {
+			continue
+		}
+		var queued int64
+		in.db.Model(&Turn{}).Where("bot_id = ? AND status = ?", id, turnQueued).Count(&queued)
+		dropped += int(queued)
+		if in.runner == nil {
+			continue
+		}
+		if in.runner.Stop(id) {
+			killed = append(killed, b.Name)
+			if b.Status == botRunning {
+				setBotStatus(in.db, id, botIdle)
+			}
+		}
+	}
+	return killed, dropped
+}
+
+func stillRunningAfterStop(db *gorm.DB, killed []string) []string {
+	gone := map[string]bool{}
+	for _, n := range killed {
+		gone[n] = true
+	}
+	bots, err := liveBots(db)
+	if err != nil {
+		return nil
+	}
+	var still []string
+	for i := range bots {
+		b := &bots[i]
+		if gone[b.Name] || b.Status != botRunning {
+			continue
+		}
+		still = append(still, b.Name)
+	}
+	return still
+}
+
+func renderStopReply(killed []string, dropped int, still []string) string {
+	if len(killed) == 0 && dropped == 0 {
+		return "Nothing was running."
+	}
+	var sb strings.Builder
+	if len(killed) > 0 {
+		fmt.Fprintf(&sb, "🛑 Stopped %s.", strings.Join(killed, ", "))
+	}
+	if dropped > 0 {
+		if sb.Len() > 0 {
+			sb.WriteByte(' ')
+		}
+		if dropped == 1 {
+			sb.WriteString("Dropped 1 queued.")
+		} else {
+			fmt.Fprintf(&sb, "Dropped %d queued.", dropped)
+		}
+	}
+	if len(still) > 0 {
+		if sb.Len() > 0 {
+			sb.WriteByte('\n')
+		}
+		fmt.Fprintf(&sb, "Still running: %s. /stop %s or /stop all", strings.Join(still, ", "), still[0])
+	}
+	return sb.String()
+}
+
 // handleMemoryRestore implements `/memory restore <compaction_id>`: put back
 // the memories one compaction replaced. The archive rows are consumed, so the
 // compaction id stops existing once it has been undone.
@@ -1094,7 +1167,7 @@ func (in *instance) handleMemoryRestore(msg *TelegramMessage, arg string) {
 // handleNameCommand implements `/name [<name>]` (DESIGN §8): show or change
 // the session name. The name is part of the system prompt, so setting it
 // rotates the conversation (DESIGN §14.14). Workers are renamed via set_name
-// or the phone; in the DM this only ever hits General, which refuses.
+// ; in the DM this only ever hits General, which refuses.
 func (in *instance) handleNameCommand(msg *TelegramMessage, b *Bot, rest string) {
 	raw := strings.TrimSpace(rest)
 	if raw == "" {

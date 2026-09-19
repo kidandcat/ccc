@@ -37,8 +37,9 @@ func markBackendTopic(db *gorm.DB, b *Bot) error {
 	return nil
 }
 
-// chiefTurnTimeout caps one General turn. Workers have no such cap. Tests may
-// shorten it so they do not wait 60s.
+// chiefTurnTimeout caps one General owner turn. Workers (and General
+// non-owner turns) use worker_turn_timeout_s instead. Tests may shorten
+// this so they do not wait 60s.
 var chiefTurnTimeout = 60 * time.Second
 
 const (
@@ -169,7 +170,9 @@ func chiefHandedOffSince(db *gorm.DB, chiefID int64, since time.Time) bool {
 }
 
 func idleRemindText(name string) string {
-	return fmt.Sprintf("Idle session %q is still waiting on the owner. Decide: ask_owner, tell_session, archive it, or ignore.", name)
+	return fmt.Sprintf("Idle session %q has been waiting on the owner for %s with nothing keeping it alive. "+
+		"This is the only reminder for this idle spell. Decide: ask_owner, tell_session, archive it, or ignore. "+
+		"Do not tell_session just to keep it busy.", name, humanDuration(idleRemindInterval))
 }
 
 func generalBot(db *gorm.DB) (*Bot, error) {

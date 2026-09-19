@@ -119,9 +119,9 @@ finished with last-message output, listen wakes General with that inbox
 General cannot (60s cap, crash, empty reply), listen posts a short fallback
 from the worker's last message — not the full transcript, not only a status
 line. `notify_owner`, `ask_owner` and job pings still reach the owner.
-Idle-session reminders wake General via inbox + enqueue (same path as
-`report_to_general`); they are not posted to the DM and do not use the
-fallback. The phone hub still sees every turn.
+Idle-session reminders wake General via inbox + enqueue once per idle spell
+(same path as `report_to_general`); they are not posted to the DM and do not
+use the fallback.
 
 ### 3.3 Post-turn
 
@@ -355,19 +355,20 @@ One goroutine in `ccc listen`:
   `ask_owner`) and running bots are skipped. The runner also checks this at
   the start of a turn, so a watch that fires after the cache TTL does not
   rebuild a cold fat session. A silent 🧹 lands in the topic when the
-  scheduler rotates. `idle_compact_s=0` disables it. General is never rotated.
+  scheduler rotates. `idle_compact_s=0` disables it. General is rotated too
+  (same horizon); the DM gets a silent 🧹 so the owner knows the dispatcher
+  started a fresh conversation.
 - **Idle-session reminder**: a live worker that is **idle** (not `waiting`),
   has no watch / schedule / routine / background job keeping it alive, and
-  has no queued work, is waiting on the owner. Every **10 minutes** of that
-  state, ccc queues an inbox message from the worker to General (`wake=true`)
-  and immediately `Enqueue`s a `source=bot` turn on General so the
-  dispatcher actually runs — the same path as `report_to_general`. Nothing
-  is posted to Telegram. General then decides: `ask_owner`, `tell_session`,
-  archive, or ignore. A parked `ask_owner` (`waiting`) is not reminded: the
-  question is already in the DM, and the owner's next free-text message lists
-  pending asks. Stop when the session is working again, gains a keepalive,
-  gets a user message, or is archived. `idle_reminded_at` on the bot row is
-  the anti-spam clock.
+  has no queued work, is waiting on the owner. After **10 minutes** of that
+  state, ccc queues **one** inbox message from the worker to General
+  (`wake=true`) and immediately `Enqueue`s a `source=bot` turn on General —
+  the same path as `report_to_general`. Nothing is posted to Telegram.
+  `idle_reminded_at` latches until the worker leaves idle-waiting (run,
+  keepalive, `ask_owner`, archive). A new spell after more work can remind
+  once more. General then decides: `ask_owner`, `tell_session`, archive, or
+  ignore. A parked `ask_owner` (`waiting`) is not reminded: the question is
+  already in the DM.
 - **Schedules**: unnamed `schedule_wakeup` enqueues a turn with
   `source=schedule` and the note on the owning bot when `fire_at` passes;
   recurring via cron expression. Polling a command is a watch, not a
@@ -486,9 +487,9 @@ older than 90 days.
 | Command | Where | Effect |
 |---|---|---|
 | `/sessions` | DM | List of open sessions (name, status, last turn). `/bots` is an alias. The live card (pinned while there is work) is a separate silent message, not this command. |
-| `/name [text]` | DM | Show General's name. Rename is refused (General stays General). Workers rename via `set_name` or the phone. |
+| `/name [text]` | DM | Show General's name. Rename is refused (General stays General). Workers rename via `set_name`. |
 | `/new` | DM | Rotate General's conversation (fresh transcript, memory kept). |
-| `/stop` | DM | Kill General's running turn, drop the queue. |
+| `/stop [name\|all]` | DM | Kill the named session's running turn and drop its queue. Bare `/stop` kills General if it is running (or has queued work); if that did nothing, it stops every live worker. `/stop all` stops every live session. Waiting (`ask_owner`) sessions stay parked. A hung CLI is SIGTERM, then SIGKILL after 5s. Workers (and General non-owner turns) also have `worker_turn_timeout_s` (default 30m, 0 disables). |
 | `/cwd [path]` | DM | Show or set General's working dir. |
 | `/engine [name]` | DM | Assign General to an engine's account pool (`claude`, `grok`/`grok-build`, `antigravity`/`agy`). Rotates the conversation. Engine itself is set at `/account add`. |
 | `/memory [query]` | DM | List/search memories visible to General; `/forget <scope> <key>`. |
@@ -798,13 +799,13 @@ wrote back after the tool cleared it. Other open sessions are unaffected:
 there is no roster in their prompts.
 
 **14.15 Session names are unique labels, not Telegram titles.** The name is
-unique so it cannot collide. Workers rename via `set_name` or the phone
-hub; `/name` in the DM only hits General, which refuses. There is no
+unique so it cannot collide. Workers rename via `set_name`; `/name` in the DM only hits General, which refuses. There is no
 Telegram forum topic to keep in sync.
 
 **14.16 Topic icons are gone.** They were a status indicator on the old
 forum topic (and a large, order-unstable blob in the system prompt).
-General's 60s cap and the 10-minute idle reminder in General replace that.
+General's 60s cap and a single idle reminder per spell (after 10 minutes)
+in General replace that.
 
 **14.17 Sessions have no role onboarding.** A session is a backend worker.
 General is the dispatcher (not a launcher). `/session <prompt>` (and
@@ -825,8 +826,8 @@ the previous turn are already older than the window, so the wait is zero; and
 the total wait is capped at four windows. `ccc config set debounce_ms 0` turns
 it off.
 
-`debounce_ms`, `compaction_model`, `maintenance_hour`, `idle_compact_s` and
-`watch_ttl_s` are **config.json keys, not a Telegram command**. An earlier
+`debounce_ms`, `compaction_model`, `maintenance_hour`, `idle_compact_s`,
+`watch_ttl_s` and `worker_turn_timeout_s` are **config.json keys, not a Telegram command**. An earlier
 draft added `/set` for them; it was removed because a knob nobody remembers
 is worse than a default that is right. `ccc config` prints each one with the
 default in force; `ccc config set` validates the range.
@@ -953,8 +954,8 @@ monitors. After `watch_ttl_s` (default 4h) the watch is deleted and the
 bot that set it is woken (`source=system`) to re-set it, except General
 (silent delete — a dispatcher turn to re-set a watch is a no-op wakeup).
 Re-upserting the same name restarts the clock. Routines do not expire. Both
-knobs are config.json keys; 0 disables. General is never idle-rotated: the
-dispatcher keeps its transcript.
+knobs are config.json keys; 0 disables. General is idle-rotated on the same
+horizon so the dispatcher transcript cannot grow without bound.
 
 **14.30 Grok and Codex get ccc MCP.** Claude already had `--mcp-config`.
 Grok/Codex have no inline equivalent; ccc writes `[mcp_servers.ccc]`
@@ -1013,52 +1014,15 @@ chooseProfile is 5h then 7d then load, spawn picks the engine with most
 headroom, auto-spawn is `source=user` only, watch TTL on General is silent.
 Not per-machine hygiene.
 
-## 15. Public hub
+## 15. Public hub (removed)
 
-Paired clients talk to `ccc listen` through an untrusted relay (`ccc hub`,
-default `wss://hub.mentasystems.com`). This is a DERP-style pipe, not a VPN: the
-instance opens an outbound websocket (so a Mac behind NAT is reachable), the
-client does the same, and the hub forwards NaCl boxes keyed by Curve25519
-public keys. The hub stores pairing codes and connected sockets. It never
-sees Telegram tokens, prompts, or plaintext RPC.
-
-`ccc pair` mints a 10-minute code and prints `ccc://pair/v1?h=&i=&k=&n=`.
-The `k` is the instance public key (TOFU). The client encrypts its identity
-to that key; the hub only routes. Paired devices live in SQLite on the
-instance (`hub_devices`). `ccc unpair` revokes them. `hub_url` `-` disables
-the client.
-
-Client RPC (plaintext inside the box, instance `hubClient.dispatch`):
-
-| Method | Params | Behavior |
-|---|---|---|
-| `hello` | — | Instance name + live session count. |
-| `bots` | — | Live sessions, most recently active first (`last`, `last_text`, `status`, pending `question`). General is marked `general: true` / `topic_id: 0`. |
-| `archived` | — | Sessions with `archived_at` set. |
-| `history` | `bot_id`, `limit?` | Turns, oldest first. |
-| `send` | `bot_id`, `text?`, `image?` (`mime`, `name`, `data` base64) | Enqueue a user turn. Sending to General is the DM (never an `ask_owner` answer). Sending to a worker is `tell_session`. An image is written to the session `inbox/` (≤512 KiB) the same way a Telegram photo is. A send to a worker with an unanswered `ask_owner` is the answer (same as a Telegram reply) and fans out to similar pending questions. |
-| `rename` | `bot_id`, `name` | `validateBotName` + `renameBot`. Refused for General. |
-| `archive` | `bot_id` | `archiveBotRow`. Drops off `bots`. Refused for General. |
-| `unarchive` | `bot_id` | `unarchiveBotRow`. |
-| `questions` | — | Unanswered `ask_owner` rows on live sessions (options are the same buttons Telegram shows). |
-| `answer` | `question_id`, `option?` (0-based index), `text?` | Resolve that question and enqueue `Answer to "…": …` (or the skip envelope if the option is Omitir). |
-
-Listen also pushes events (same box as `post`/`progress`/`file`):
-
-| Event | When |
-|---|---|
-| `session` | Live roster changed (spawn, rename, status, archive). Client reloads `bots`. |
-| `archive` | A session left the live list. |
-| `question` | New unanswered `ask_owner`. Client reloads `questions`. |
-| `answered` | That question was answered or its session was archived. |
-
-Keepalive: clients send `{v:1,t:ping}` every ~30s; the hub replies `{t:pong}`.
-The hub's 2-minute read deadline resets on any data frame. A paired client
-keeps one websocket per machine and surfaces General `post`, `file`, and
-`question` events — the same pings Telegram would send. Worker transcripts
-still emit `post`/`progress` so a client can show a log, but they do not
-notify. `post`/`file` events include `general: true` when the session is
-General.
+The phone companion (`ccc-app`), pairing URI (`ccc pair` / `ccc unpair`),
+and public websocket hub (`ccc hub`, default `wss://hub.getccc.dev`) are
+gone. Hub-on-by-default was a trust surface: a `hub_devices` row meant full
+RPC, and `send` to General is a shell with bypass permissions. Access is the
+config whitelist (`chat_id` + `allowed_user_ids`). Leftover
+`hub_devices` / `hub_pair_codes` / `hub_files` / `access` tables are dropped
+on open. File relay (`ccc relay`) for Telegram uploads over 50 MB stays.
 
 ## 16. Owner secrets vault
 

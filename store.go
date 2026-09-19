@@ -259,7 +259,6 @@ func allModels() []any {
 	return []any{
 		&Bot{}, &Turn{}, &InboxMessage{}, &Memory{}, &MemoryArchive{}, &Project{},
 		&Watch{}, &Schedule{}, &Question{}, &Setting{}, &BackgroundJob{},
-		&HubDevice{}, &HubPairCode{}, &HubFile{},
 	}
 }
 
@@ -307,8 +306,8 @@ func openStore(path string) (*gorm.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
-	if err := dropLegacyAccessTable(db); err != nil {
-		return nil, fmt.Errorf("drop legacy access table: %w", err)
+	if err := dropLegacyTables(db); err != nil {
+		return nil, fmt.Errorf("drop legacy tables: %w", err)
 	}
 	if err := db.AutoMigrate(allModels()...); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -322,11 +321,21 @@ func openStore(path string) (*gorm.DB, error) {
 	return db, nil
 }
 
-// dropLegacyAccessTable removes the pairing/allowlist table. Access is a
-// config.json whitelist now (DESIGN §8); leaving the table would be a second
-// gate. Existing rows are discarded — anyone not in allowed_user_ids is denied.
+// dropLegacyTables removes pairing/allowlist and phone-hub tables. Access is a
+// config.json whitelist (DESIGN §8). The mobile hub is gone; leftover rows
+// must not stay as a trust surface.
+func dropLegacyTables(db *gorm.DB) error {
+	for _, table := range []string{"access", "hub_devices", "hub_pair_codes", "hub_files"} {
+		if err := db.Exec("DROP TABLE IF EXISTS " + table).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// dropLegacyAccessTable is the old name; tests and callers use dropLegacyTables.
 func dropLegacyAccessTable(db *gorm.DB) error {
-	return db.Exec("DROP TABLE IF EXISTS access").Error
+	return dropLegacyTables(db)
 }
 
 // ensureMemoryFTS creates the FTS5 index over memories. AutoMigrate cannot
@@ -383,32 +392,6 @@ func botByName(db *gorm.DB, name string) (*Bot, error) {
 		return nil, err
 	}
 	return &b, nil
-}
-
-// HubDevice is a phone (or other client) the owner paired with this instance
-// through the public hub. The hub itself stores no devices — only this row
-// authorises RPC.
-type HubDevice struct {
-	ID       int64  `gorm:"primaryKey"`
-	PubKey   string `gorm:"uniqueIndex;not null"`
-	Name     string
-	PairedAt time.Time
-	LastSeen *time.Time
-}
-
-// HubFile is a file the phone sent or that send_file offered to paired phones.
-// The bytes live on disk at Path; the hub only forwards chunks.
-type HubFile struct {
-	ID        int64 `gorm:"primaryKey"`
-	BotID     int64 `gorm:"index;not null"`
-	TurnID    int64 `gorm:"index"`
-	Name      string
-	MIME      string
-	Size      int64
-	Path      string
-	Direction string `gorm:"index"` // in (phone→machine) | out (machine→phone)
-	PushedAt  *time.Time
-	CreatedAt time.Time
 }
 
 func liveBots(db *gorm.DB) ([]Bot, error) {

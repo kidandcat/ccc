@@ -89,7 +89,7 @@ func renderSystemPrompt(b promptBot, hostname string, _ []otherBot) string {
 		if !b.Chief {
 			sb.WriteString("  set_name                  rename this session\n")
 		}
-		sb.WriteString("  send_file                 send a file to the owner (Telegram DM and paired phones)\n")
+		sb.WriteString("  send_file                 send a file to the owner via Telegram\n")
 		sb.WriteString("  watch/unwatch/list_watches  re-run a command and wake this session only when its output changes\n")
 		sb.WriteString("  schedule_wakeup/cancel_schedule  one-off (or unnamed cron) wakeup\n")
 		sb.WriteString("  set_routine/list_routines/cancel_routine  named recurring work; each fire is a fresh worker, ⏰ in General\n")

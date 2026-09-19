@@ -62,8 +62,10 @@ func (in *instance) handleAccessCommand(msg *TelegramMessage, rest string) {
 	switch strings.ToLower(sub) {
 	case "", "list":
 		in.reply(msg, in.renderAccessList())
+	case "add", "approve", "allow", "remove", "rm", "block":
+		in.reply(msg, "/access "+htmlEscape(sub)+" does not grant anyone. Remote grant is disabled. The allowlist is whitelist-only: <code>ccc config set allowed_user_ids &lt;id,id,…&gt;</code> (restart listen).")
 	default:
-		in.reply(msg, "Usage: /access [list]\nThe allowlist is <code>ccc config set allowed_user_ids &lt;id,id,…&gt;</code> (restart listen).")
+		in.reply(msg, "Usage: /access [list]\nRemote grant is disabled. The allowlist is <code>ccc config set allowed_user_ids &lt;id,id,…&gt;</code> (restart listen).")
 	}
 }
 

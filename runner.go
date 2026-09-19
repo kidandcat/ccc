@@ -178,11 +178,16 @@ type turnRunner interface {
 	Stop(botID int64) bool
 }
 
-// activeTurn is a turn with a live `claude` process behind it.
+// activeTurn is a turn with a live engine process behind it.
 type activeTurn struct {
 	cmd      *exec.Cmd
+	pid      int
 	stopped  bool
 	timedOut bool
+	capped   bool
+	// exited is closed after cmd.Wait returns. The SIGKILL escalator
+	// waits on it so it never signals *exec.Cmd after Wait (that races).
+	exited chan struct{}
 }
 
 // Runner owns the per-bot turn queues.
@@ -257,9 +262,22 @@ func (r *Runner) Enqueue(botID int64, source, text string, triggerMessageID int6
 // tools it spawned (a long `go test`, say) and not just the claude wrapper.
 func (r *Runner) Stop(botID int64) bool {
 	killed := r.interruptActive(botID, false)
-	r.db.Model(&Turn{}).Where("bot_id = ? AND status = ?", botID, turnQueued).
-		Updates(map[string]any{"status": turnFailed, "stop_reason": "dropped by /stop"})
+	if r.db != nil {
+		r.db.Model(&Turn{}).Where("bot_id = ? AND status = ?", botID, turnQueued).
+			Updates(map[string]any{"status": turnFailed, "stop_reason": "dropped by /stop"})
+	}
 	return killed
+}
+
+// Running reports whether this bot currently has a live engine process.
+func (r *Runner) Running(botID int64) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	at := r.active[botID]
+	return at != nil && at.pid != 0
 }
 
 // interruptActive SIGTERMs a running turn. timedOut is General's 60s cap;
@@ -279,6 +297,18 @@ func (r *Runner) interruptActive(botID int64, timedOut bool) bool {
 	return killActiveTurn(at)
 }
 
+// interruptCapped SIGTERMs a turn that hit worker_turn_timeout_s. Distinct
+// from the 60s General owner cap (timedOut) and from /stop (stopped).
+func (r *Runner) interruptCapped(botID int64) bool {
+	r.mu.Lock()
+	at := r.active[botID]
+	if at != nil {
+		at.capped = true
+	}
+	r.mu.Unlock()
+	return killActiveTurn(at)
+}
+
 // interruptArchived SIGTERMs a running turn because the session was archived
 // mid-turn (archive_bot). It does not set stopped: that would skip the
 // last-message relay, and the owner would only see "session ended".
@@ -289,15 +319,49 @@ func (r *Runner) interruptArchived(botID int64) bool {
 	return killActiveTurn(at)
 }
 
+// killGrace is how long killActiveTurn waits after SIGTERM before SIGKILL.
+// Tests shorten it. Production is 5s so a polite CLI can flush.
+var killGrace = 5 * time.Second
+
 func killActiveTurn(at *activeTurn) bool {
-	if at == nil || at.cmd == nil || at.cmd.Process == nil {
+	if at == nil {
 		return false
 	}
-	pid := at.cmd.Process.Pid
-	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
-		_ = at.cmd.Process.Signal(syscall.SIGTERM) // safe-ignore: best-effort fallback when the group kill fails
+	pid := at.pid
+	if pid == 0 && at.cmd != nil && at.cmd.Process != nil {
+		pid = at.cmd.Process.Pid
 	}
+	if pid <= 0 {
+		return false
+	}
+	signalGroup(pid, syscall.SIGTERM)
+	exited := at.exited
+	go func() {
+		if exited == nil {
+			// No waiter: always escalate. Tests that only Start+Wait
+			// from the test goroutine still get a TERM first.
+			time.Sleep(killGrace)
+			signalGroup(pid, syscall.SIGKILL)
+			return
+		}
+		select {
+		case <-exited:
+		case <-time.After(killGrace):
+			signalGroup(pid, syscall.SIGKILL)
+		}
+	}()
 	return true
+}
+
+// signalGroup sends sig to the process group (-pid). It never touches
+// *exec.Cmd — Wait and Signal on the same Cmd race under -race.
+func signalGroup(pid int, sig syscall.Signal) {
+	if pid <= 0 {
+		return
+	}
+	if err := syscall.Kill(-pid, sig); err != nil {
+		_ = syscall.Kill(pid, sig)
+	}
 }
 
 // archiveWatchInterval is how often spawn checks whether the bot archived
@@ -690,6 +754,11 @@ func (r *Runner) execute(b *Bot, t *Turn, input string, triggers []int64) {
 			lastErr = chiefTimeoutInput()
 			break
 		}
+		if res.capped {
+			class = errTurnTimeout
+			lastErr = turnTimeoutReason(workerTurnTimeout(r.config()))
+			break
+		}
 		lastErr = res.failureText()
 		class = classifyFailure(lastErr, res.exitCode)
 		who := p.Name
@@ -768,6 +837,8 @@ func (r *Runner) execute(b *Bot, t *Turn, input string, triggers []int64) {
 	r.postOwnerSessionStatus(b, class, waiting)
 	if isGeneralBot(b) {
 		r.fulfillOwnerRelay(t, class, output)
+	} else if class == errTurnTimeout {
+		r.relayTurnTimeout(b, workerTurnTimeout(r.config()), output)
 	} else {
 		r.ensureWorkerRelayToGeneral(b, class, waiting, output)
 	}
@@ -781,6 +852,8 @@ func ownerSessionStatus(class string, waiting bool) (status string, ok bool) {
 	switch class {
 	case "stopped", chiefTimeoutClass:
 		return "", false
+	case errTurnTimeout:
+		return "timed out", true
 	case "":
 		if waiting {
 			return "waiting", true
@@ -834,7 +907,7 @@ func (r *Runner) ensureWorkerRelayToGeneral(b *Bot, class string, waiting bool, 
 	if r == nil || b == nil || isGeneralBot(b) {
 		return
 	}
-	if waiting || class == "stopped" || class == chiefTimeoutClass {
+	if waiting || class == "stopped" || class == chiefTimeoutClass || class == errTurnTimeout {
 		return
 	}
 	chief, err := generalBot(r.db)
@@ -851,6 +924,47 @@ func (r *Runner) ensureWorkerRelayToGeneral(b *Bot, class string, waiting bool, 
 	if _, _, err := queueOwnerRelay(r.db, b, truncate(body, workerLastMessageRelayMax)); err != nil {
 		hookLog("worker relay: %v", err)
 	}
+}
+
+func turnTimeoutReason(cap time.Duration) string {
+	return fmt.Sprintf("killed by ccc after %s (worker_turn_timeout_s)", humanDuration(cap))
+}
+
+func turnTimeoutRelay(cap time.Duration, partial string) string {
+	msg := fmt.Sprintf("My turn was killed by ccc after %s (worker_turn_timeout_s): it did not finish. "+
+		"The conversation is kept. Tell the owner, then decide: tell_session to continue or archive the session.",
+		humanDuration(cap))
+	if p := strings.TrimSpace(partial); p != "" {
+		msg += "\n\nLast output before the kill:\n" + truncate(p, turnTimeoutRelayOutputMax)
+	}
+	return msg
+}
+
+func (r *Runner) relayTurnTimeout(b *Bot, cap time.Duration, partial string) {
+	if r == nil || b == nil || isGeneralBot(b) {
+		return
+	}
+	chief, err := generalBot(r.db)
+	if err != nil {
+		return
+	}
+	body := turnTimeoutRelay(cap, partial)
+	_, msg, err := queueBotMessage(r.db, b, chief.Name, body, true)
+	if err != nil {
+		hookLog("timeout relay: %v", err)
+		return
+	}
+	r.db.Model(&InboxMessage{}).Where("id = ?", msg.ID).Update("relay", true)
+	turn, err := r.Enqueue(chief.ID, sourceBot, inboxInput(r.db, *msg), 0)
+	if err != nil {
+		hookLog("timeout relay enqueue: %v", err)
+		return
+	}
+	updates := map[string]any{"delivered_at": time.Now()}
+	if turn != nil {
+		updates["turn_id"] = turn.ID
+	}
+	r.db.Model(&InboxMessage{}).Where("id = ?", msg.ID).Updates(updates)
 }
 
 func hasPendingOwnerRelay(db *gorm.DB, fromID, toID int64) bool {
@@ -1091,7 +1205,7 @@ func inboxInput(db *gorm.DB, m InboxMessage) string {
 // sat unused past idle_compact_s starts fresh (DESIGN §7). The runner is
 // already `running`, so status is not part of the check.
 func (r *Runner) sessionForTurn(b *Bot) (string, bool) {
-	if !isGeneralBot(b) && strings.TrimSpace(b.SessionID) != "" && sessionIdleTooLong(r.db, b.ID, time.Now(), idleCompact(r.config())) {
+	if strings.TrimSpace(b.SessionID) != "" && sessionIdleTooLong(r.db, b.ID, time.Now(), idleCompact(r.config())) {
 		r.db.Model(&Bot{}).Where("id = ?", b.ID).Update("session_id", "")
 		b.SessionID = ""
 	}
@@ -1153,6 +1267,7 @@ type streamResult struct {
 	spawnErr  error
 	stopped   bool
 	timedOut  bool
+	capped    bool
 }
 
 func (s *streamResult) ok() bool {
@@ -1225,8 +1340,9 @@ func (r *Runner) spawn(p Profile, b *Bot, t *Turn, sessionID string, resume bool
 		return res
 	}
 
+	exited := make(chan struct{})
 	r.mu.Lock()
-	r.active[b.ID] = &activeTurn{cmd: cmd}
+	r.active[b.ID] = &activeTurn{cmd: cmd, pid: cmd.Process.Pid, exited: exited}
 	r.mu.Unlock()
 
 	stopWatch := make(chan struct{})
@@ -1235,6 +1351,9 @@ func (r *Runner) spawn(p Profile, b *Bot, t *Turn, sessionID string, resume bool
 
 	if d := chiefTimeoutFor(b, t); d > 0 {
 		timer := time.AfterFunc(d, func() { r.interruptActive(b.ID, true) })
+		defer timer.Stop()
+	} else if cap := workerTurnTimeout(cfg); cap > 0 {
+		timer := time.AfterFunc(cap, func() { r.interruptCapped(b.ID) })
 		defer timer.Stop()
 	}
 
@@ -1258,12 +1377,14 @@ func (r *Runner) spawn(p Profile, b *Bot, t *Turn, sessionID string, resume bool
 		res.Text = strings.TrimSpace(raw.String())
 	}
 	waitErr := cmd.Wait()
+	close(exited)
 
 	r.mu.Lock()
 	at := r.active[b.ID]
 	if at != nil {
 		res.stopped = at.stopped
 		res.timedOut = at.timedOut && !at.stopped
+		res.capped = at.capped && !at.stopped && !at.timedOut
 	}
 	delete(r.active, b.ID)
 	r.mu.Unlock()
@@ -1477,6 +1598,9 @@ const (
 	errTransient   = "transient"
 	errSessionLost = "session_lost"
 	errFatal       = "fatal"
+	errTurnTimeout = "turn_timeout"
+
+	turnTimeoutRelayOutputMax = 1500
 
 	// maxFailoverAttempts covers a couple of accounts per engine plus a
 	// cross-engine hop. pickAccount stays inside one engine; execute may
@@ -1530,6 +1654,11 @@ func failureMessage(class, detail string) string {
 	switch class {
 	case "stopped":
 		return "🛑 Stopped."
+	case errTurnTimeout:
+		if strings.TrimSpace(detail) == "" {
+			detail = "turn timed out"
+		}
+		return "⏱ " + htmlEscape(detail) + "."
 	case errAuthStale:
 		return "🔑 That account needs a new login and no other account could take the turn.\n<code>" +
 			htmlEscape(truncate(detail, 400)) + "</code>"

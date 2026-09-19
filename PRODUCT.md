@@ -41,7 +41,9 @@ Confirmed (README / `docs/DESIGN.md`):
 
 - Orchestrator 60s cap; longer work goes to a session. If the cap fires and the orchestrator does not spawn, ccc starts the session itself. `/session <prompt>` starts a worker without the orchestrator.
 - Live session card in the Telegram DM (one block per working session), pinned while a worker is running, waiting, or on a background job. `/sessions` is the full list.
-- Idle sessions waiting on the owner (no pending `ask_owner`) wake the orchestrator every 10 minutes (inbox, not a chat ping). Parked questions stay in the DM; the next free-text message lists them. Tapping one answers similar pending questions. Every `ask_owner` keyboard ends with **Omitir** (skip without choosing, unblocks the session).
+- Idle sessions waiting on the owner (no pending `ask_owner`) wake the orchestrator **once per idle spell** after 10 minutes (inbox, not a chat ping). The orchestrator conversation is rotated after `idle_compact_s` like any other session. Parked questions stay in the DM; the next free-text message lists them. Tapping one answers similar pending questions. Every `ask_owner` keyboard ends with **Omitir** (skip without choosing, unblocks the session).
+- `/stop` kills the active turn (orchestrator or a named worker). Hung CLIs get SIGTERM, then SIGKILL. Workers have a 30m cap (`worker_turn_timeout_s`).
+- `/access add` does not grant anyone. Extra users are config whitelist only (`allowed_user_ids`). There is no phone pairing hub.
 - Tools sessions actually have: `remember` / `recall` / `forget`; `notify_owner` / `ask_owner`; `watch` / `schedule_wakeup` / `set_routine`; `run_background` / `run` with vault inject; `secrets_list` / `secrets_delete` (no `secrets_get`); orchestrator-only `spawn_session` / `tell_session`; workers-only `report_to_general`; `send_file`; `get_project` / `set_project`; `set_name`; `archive_bot`.
 - Engines: Claude Code, Grok Build, Antigravity, Codex. Failover stays inside the same engine.
 - Owner vault (`/secret add`); values never shown; sessions inject via env/stdin.
@@ -76,7 +78,7 @@ Undecided / do not fabricate: user counts, testimonials, pricing (there is none 
 
 1. **The DM is the orchestrator.** If a sentence implies the owner chats with a worker, it is wrong.
 2. **Facts over atmosphere.** Friendliness is tone and craft, not extra capabilities.
-3. **Self-hosted is the product.** The public hub is an encrypted pipe, not a cloud that runs your agents.
+3. **Self-hosted is the product.** Telegram is the interface. There is no public phone hub.
 4. **Quiet by default.** Progress is silent; the ping is the answer; `ask_owner` is how decisions happen.
 5. **One instance, one bot.** Do not draw a mesh of bots talking to each other.
 

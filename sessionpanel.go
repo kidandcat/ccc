@@ -24,8 +24,7 @@ const (
 )
 
 // panelSurface is the Telegram half the live card needs. Production uses
-// telegramUI (not muxUI) so the panel is not mistaken for General's thinking
-// on the phone hub. Tests use fakeUI.
+// telegramUI. Tests use fakeUI.
 type panelSurface interface {
 	PostSilent(topicID int64, html string) (int64, error)
 	Edit(topicID, msgID int64, html string) error
@@ -67,15 +66,27 @@ func newSessionPanel(db *gorm.DB, ui panelSurface) *sessionPanel {
 
 func panelSurfaceOf(ui botUI) panelSurface {
 	switch v := ui.(type) {
-	case *muxUI:
-		return v.tg
-	case muxUI:
-		return v.tg
 	case panelSurface:
 		return v
 	default:
 		return nil
 	}
+}
+
+// pendingQuestionsByBot returns the first unanswered ask_owner per session.
+func pendingQuestionsByBot(db *gorm.DB) map[int64]Question {
+	if db == nil {
+		return nil
+	}
+	var rows []Question
+	db.Where("answered_at IS NULL").Order("id").Find(&rows)
+	out := map[int64]Question{}
+	for i := range rows {
+		if _, ok := out[rows[i].BotID]; !ok {
+			out[rows[i].BotID] = rows[i]
+		}
+	}
+	return out
 }
 
 func (p *sessionPanel) setActivity(botID int64, activity string) {
@@ -292,7 +303,7 @@ func cardRank(status string) int {
 		return 1
 	case "job":
 		return 2
-	case "error":
+	case "error", "timed out":
 		return 3
 	default:
 		return 4
@@ -346,6 +357,8 @@ func cardGlyph(status string) string {
 		return "✅"
 	case "error":
 		return "❌"
+	case "timed out":
+		return "⏱"
 	default:
 		return "⏳"
 	}
@@ -363,6 +376,8 @@ func cardStatusLabel(status string) string {
 		return "done"
 	case "error":
 		return "error"
+	case "timed out":
+		return "timed out"
 	case "started":
 		return "started"
 	default:
