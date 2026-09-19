@@ -242,12 +242,13 @@ func (s *scheduler) compactIdleSessions(now time.Time) {
 	}
 }
 
-// remindIdleSessions wakes General about live workers that are idle, have
-// nothing keeping them alive, and have been waiting on the owner for
-// idleRemindInterval. Cadence is wall-clock 10 minutes, not every turn.
-// The nag is an inbox row plus an immediate Enqueue on General — the same
-// path as report_to_general — so the dispatcher actually runs. Nothing is
-// posted to Telegram.
+// remindIdleSessions wakes General about live workers that are idle (not
+// parked on ask_owner), have nothing keeping them alive, and have been
+// waiting on the owner for idleRemindInterval. Cadence is wall-clock 10
+// minutes, not every turn. The nag is an inbox row plus an immediate Enqueue
+// on General — the same path as report_to_general — so the dispatcher
+// actually runs. Nothing is posted to Telegram. Waiting bots already asked;
+// the owner sees them on the next DM message.
 func (s *scheduler) remindIdleSessions(now time.Time) {
 	if s.in.runner == nil {
 		return
@@ -306,15 +307,16 @@ func (s *scheduler) enqueueIdleRemind(chief, worker *Bot, now time.Time) error {
 }
 
 // sessionIdleWaitingOnUser is the idle-remind predicate: a live worker that
-// is not working, has no watch/schedule/routine/background keeping it alive,
-// and has no queued work — so it is waiting on the owner.
+// is idle, has no watch/schedule/routine/background keeping it alive, and has
+// no queued work — so it is waiting on the owner. Parked ask_owner
+// (botWaiting) is not reminded: the question is already in the DM, and the
+// owner sees the list again when they next write. Nagging General would make
+// it re-ask.
 func sessionIdleWaitingOnUser(db *gorm.DB, b *Bot) bool {
 	if b == nil || b.ArchivedAt != nil || isGeneralBot(b) {
 		return false
 	}
-	switch b.Status {
-	case botIdle, botWaiting:
-	default:
+	if b.Status != botIdle {
 		return false
 	}
 	if sessionHasKeepalive(db, b.ID) {

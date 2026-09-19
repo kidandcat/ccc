@@ -490,6 +490,24 @@ func (r *Runner) loop(botID int64, wake chan struct{}) {
 	}
 }
 
+// sessionSkipsTurns is the runNext gate: archived and disabled never run.
+// Workers parked on ask_owner stay parked until a button or reply-to. General
+// keeps taking DM turns while a question is pending — free text is never the
+// answer, so blocking the dispatcher would swallow the owner's next message.
+func sessionSkipsTurns(b *Bot) bool {
+	if b == nil || b.ArchivedAt != nil {
+		return true
+	}
+	switch b.Status {
+	case botDisabled:
+		return true
+	case botWaiting:
+		return !isGeneralBot(b)
+	default:
+		return false
+	}
+}
+
 // runNext runs at most one turn for a bot and reports whether it did. All
 // inputs queued at this moment are folded into that single turn (DESIGN §2:
 // "further inputs queue (FIFO) and are delivered together on the next turn").
@@ -498,7 +516,7 @@ func (r *Runner) runNext(botID int64) bool {
 	if err != nil {
 		return false
 	}
-	if b.Status == botWaiting || b.Status == botDisabled || b.ArchivedAt != nil {
+	if sessionSkipsTurns(b) {
 		return false
 	}
 	// Give a burst of chat messages the chance to arrive before the turn that

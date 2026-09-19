@@ -41,7 +41,7 @@ Confirmed (README / `docs/DESIGN.md`):
 
 - Orchestrator 60s cap; longer work goes to a session. If the cap fires and the orchestrator does not spawn, ccc starts the session itself. `/session <prompt>` starts a worker without the orchestrator.
 - Live session card in the Telegram DM (one block per working session), pinned while a worker is running, waiting, or on a background job. `/sessions` is the full list.
-- Idle sessions waiting on the owner wake the orchestrator every 10 minutes (inbox, not a chat ping).
+- Idle sessions waiting on the owner (no pending `ask_owner`) wake the orchestrator every 10 minutes (inbox, not a chat ping). Parked questions stay in the DM; the next free-text message lists them. Tapping one answers similar pending questions.
 - Tools sessions actually have: `remember` / `recall` / `forget`; `notify_owner` / `ask_owner`; `watch` / `schedule_wakeup` / `set_routine`; `run_background` / `run` with vault inject; `secrets_list` / `secrets_delete` (no `secrets_get`); orchestrator-only `spawn_session` / `tell_session`; workers-only `report_to_general`; `send_file`; `get_project` / `set_project`; `set_name`; `archive_bot`.
 - Engines: Claude Code, Grok Build, Antigravity, Codex. Failover stays inside the same engine.
 - Owner vault (`/secret add`); values never shown; sessions inject via env/stdin.

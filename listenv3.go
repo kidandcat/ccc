@@ -485,7 +485,7 @@ func (in *instance) handleMessage(msg *TelegramMessage) {
 	}
 
 	// Reply-to a pending ask_owner question: the owner is answering that
-	// session, not chatting with General.
+	// session, not chatting with General. Free text never answers.
 	if b, ok := in.botForQuestionReply(msg); ok {
 		in.deliver(b, msg, text)
 		return
@@ -496,6 +496,7 @@ func (in *instance) handleMessage(msg *TelegramMessage) {
 		in.reply(msg, "Could not start General: "+err.Error())
 		return
 	}
+	in.listPendingAsks()
 	in.deliver(b, msg, text)
 }
 
@@ -550,10 +551,10 @@ func (in *instance) handleEditedMessage(msg *TelegramMessage) {
 }
 
 // deliver turns a plain message into an input for a bot: either the answer to a
-// pending question or a new turn.
+// pending question (reply-to only) or a new turn. Free text never answers.
 func (in *instance) deliver(b *Bot, msg *TelegramMessage, text string) {
 	if q, ok := in.matchQuestion(b, msg); ok {
-		if err := resolveQuestionAnswer(in.db, in.runner, q, text); err != nil {
+		if err := in.answerOwnerQuestion(q, text); err != nil {
 			in.reply(msg, "Could not queue that: "+err.Error())
 		}
 		return
@@ -563,22 +564,89 @@ func (in *instance) deliver(b *Bot, msg *TelegramMessage, text string) {
 	}
 }
 
-// matchQuestion decides whether a message is the answer to an ask_owner: either
-// an explicit reply to the question message, or any text sent while the bot is
-// parked waiting for one.
+// matchQuestion is true only for an explicit reply to that question's message.
+// Waiting status is not enough: free text in the DM is always General.
 func (in *instance) matchQuestion(b *Bot, msg *TelegramMessage) (*Question, bool) {
-	if msg.ReplyToMessage != nil {
-		var q Question
-		err := in.db.Where("bot_id = ? AND asked_message_id = ? AND answered_at IS NULL",
-			b.ID, msg.ReplyToMessage.MessageID).First(&q).Error
-		if err == nil {
-			return &q, true
+	if msg == nil || msg.ReplyToMessage == nil {
+		return nil, false
+	}
+	var q Question
+	err := in.db.Where("bot_id = ? AND asked_message_id = ? AND answered_at IS NULL",
+		b.ID, msg.ReplyToMessage.MessageID).First(&q).Error
+	if err != nil {
+		return nil, false
+	}
+	return &q, true
+}
+
+// answerOwnerQuestion records the answer, fans it out to similar pending asks,
+// and ticks every original question message.
+func (in *instance) answerOwnerQuestion(q *Question, answer string) error {
+	answered, err := applyQuestionAnswer(in.db, in.runner, q, answer)
+	if err != nil {
+		return err
+	}
+	for i := range answered {
+		in.tickAskedMessage(&answered[i], answered[i].Answer)
+	}
+	return nil
+}
+
+// listPendingAsks posts unanswered ask_owner rows as one DM message with their
+// buttons. No timeout: it stays until the owner taps or replies. No-ops when
+// nothing is pending or Telegram is not configured.
+func (in *instance) listPendingAsks() {
+	asks := livePendingAsks(in.db)
+	if len(asks) == 0 {
+		return
+	}
+	cfg := in.config()
+	chat, thread, ok := destForTopic(cfg, 0)
+	if !ok {
+		return
+	}
+	shown := asks
+	extra := 0
+	if len(shown) > maxPendingAskList {
+		extra = len(shown) - maxPendingAskList
+		shown = shown[:maxPendingAskList]
+	}
+	var body strings.Builder
+	if len(asks) == 1 {
+		body.WriteString("❓ Pending decision")
+	} else {
+		fmt.Fprintf(&body, "❓ %d pending decisions", len(asks))
+	}
+	var rows [][]InlineKeyboardButton
+	multi := len(shown) > 1
+	for _, item := range shown {
+		fmt.Fprintf(&body, "\n\n<b>%s</b>\n%s", htmlEscape(item.Name), renderTelegramHTML(item.Q.Question))
+		opts := questionOptions(&item.Q)
+		if len(opts) == 0 {
+			body.WriteString("\n<i>Reply to the original question.</i>")
+			continue
 		}
+		var row []InlineKeyboardButton
+		for i, o := range opts {
+			label := o
+			if multi {
+				label = item.Name + ": " + o
+			}
+			row = append(row, InlineKeyboardButton{
+				Text:         clipButtonText(label),
+				CallbackData: fmt.Sprintf("q:%d:%d", item.Q.ID, i),
+			})
+		}
+		rows = append(rows, row)
 	}
-	if b.Status == botWaiting {
-		return pendingQuestion(in.db, b.ID)
+	if extra > 0 {
+		fmt.Fprintf(&body, "\n\n<i>and %d more</i>", extra)
 	}
-	return nil, false
+	if len(rows) == 0 {
+		_, _ = sendMessageHTMLGetID(cfg, chat, thread, body.String())
+		return
+	}
+	_, _ = sendMessageKeyboardGetID(cfg, chat, thread, body.String(), rows)
 }
 
 // handleCallback processes an inline button tap. Callback data is ccc's own
@@ -633,11 +701,7 @@ func (in *instance) handleCallback(cb *CallbackQuery) {
 		return
 	}
 	choice := opts[idx]
-	if cb.Message != nil {
-		confirmed := "❓ " + htmlEscape(q.Question) + "\n✓ <b>" + htmlEscape(choice) + "</b>"
-		_ = editMessageHTML(cfg, cb.Message.Chat.ID, int64(cb.Message.MessageID), cb.Message.MessageThreadID, confirmed) // safe-ignore: ticking the question message is cosmetic
-	}
-	if err := resolveQuestionAnswer(in.db, in.runner, &q, choice); err != nil {
+	if err := in.answerOwnerQuestion(&q, choice); err != nil {
 		hookLog("enqueue answer: %v", err)
 	}
 }

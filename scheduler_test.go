@@ -1003,7 +1003,7 @@ func TestIdleRemindStopsAfterUserActivity(t *testing.T) {
 	assertIdleRemindNotOnTelegram(t, api)
 }
 
-func TestIdleRemindIncludesWaitingAskOwner(t *testing.T) {
+func TestIdleRemindSkipsWaitingAskOwner(t *testing.T) {
 	s, in, runner, api := testScheduler(t)
 	if _, err := in.ensureGeneralBot(); err != nil {
 		t.Fatal(err)
@@ -1019,8 +1019,8 @@ func TestIdleRemindIncludesWaitingAskOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.remindIdleSessions(now)
-	if n := len(runner.enqueued); n != 1 {
-		t.Errorf("a parked ask_owner should wake General, got %d: %+v", n, runner.enqueued)
+	if n := len(runner.enqueued); n != 0 {
+		t.Errorf("a parked ask_owner must not nag General, got %d: %+v", n, runner.enqueued)
 	}
 	assertIdleRemindNotOnTelegram(t, api)
 }

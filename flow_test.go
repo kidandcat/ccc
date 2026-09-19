@@ -390,6 +390,161 @@ func TestReplyToQuestionCountsAsAnswer(t *testing.T) {
 	}
 }
 
+func TestFreeTextDoesNotAnswerWaitingQuestion(t *testing.T) {
+	in, runner, api := testInstance(t)
+	b, err := in.createBot("asker", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setBotStatus(in.db, b.ID, botWaiting)
+	q := Question{BotID: b.ID, Question: "Deploy to prod?", OptionsJSON: `["ship it","hold"]`, AskedMessageID: 555}
+	if err := in.db.Create(&q).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	in.handleMessage(ownerMessage("do the other thing"))
+
+	var stored Question
+	if err := in.db.First(&stored, q.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.AnsweredAt != nil {
+		t.Fatalf("free text answered the ask: %+v", stored)
+	}
+	g, err := generalBot(in.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last, ok := runner.last()
+	if !ok || last.BotID != g.ID || last.Text != "do the other thing" {
+		t.Fatalf("free text must go to General, got %+v ok=%v", last, ok)
+	}
+	joined := strings.Join(api.texts(""), "\n")
+	if !strings.Contains(joined, "Pending decision") || !strings.Contains(joined, "Deploy to prod?") {
+		t.Errorf("DM must list pending asks, got %q", joined)
+	}
+}
+
+func TestFreeTextListsPendingAskButtons(t *testing.T) {
+	in, _, api := testInstance(t)
+	b, err := in.createBot("ads", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := Question{BotID: b.ID, Question: "Raise the bid?", OptionsJSON: `["yes","no"]`, AskedMessageID: 9}
+	if err := in.db.Create(&q).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	in.handleMessage(ownerMessage("hola"))
+
+	kb := lastKeyboard(t, api)
+	if len(kb) != 1 || len(kb[0]) != 2 {
+		t.Fatalf("pending list keyboard = %+v", kb)
+	}
+	if kb[0][0].CallbackData != fmt.Sprintf("q:%d:0", q.ID) {
+		t.Errorf("button callback = %q", kb[0][0].CallbackData)
+	}
+	if kb[0][0].Text != "yes" || kb[0][1].Text != "no" {
+		t.Errorf("single pending list should use option labels, got %+v", kb[0])
+	}
+}
+
+func TestQuestionCallbackFansOutToSimilar(t *testing.T) {
+	in, runner, _ := testInstance(t)
+	a, err := in.createBot("one", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := in.createBot("two", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := json.Marshal([]string{"ship it", "hold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q1 := Question{BotID: a.ID, Question: "Deploy to prod?", OptionsJSON: string(opts), AskedMessageID: 1}
+	q2 := Question{BotID: b.ID, Question: "deploy to prod", OptionsJSON: string(opts), AskedMessageID: 2}
+	if err := in.db.Create(&q1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := in.db.Create(&q2).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	cb := &CallbackQuery{ID: "cb1", Data: fmt.Sprintf("q:%d:0", q1.ID)}
+	cb.From.ID = 42
+	cb.Message = ownerMessage("")
+	cb.Message.MessageID = 1
+	in.handleCallback(cb)
+
+	var first, second Question
+	if err := in.db.First(&first, q1.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := in.db.First(&second, q2.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if first.AnsweredAt == nil || first.Answer != "ship it" {
+		t.Fatalf("tapped question not answered: %+v", first)
+	}
+	if second.AnsweredAt == nil || second.Answer != "ship it" {
+		t.Fatalf("similar question not answered: %+v", second)
+	}
+	runner.mu.Lock()
+	n := len(runner.enqueued)
+	runner.mu.Unlock()
+	if n != 2 {
+		t.Errorf("want 2 answer turns, got %d: %+v", n, runner.enqueued)
+	}
+}
+
+func TestQuestionCallbackSkipsDissimilar(t *testing.T) {
+	in, _, _ := testInstance(t)
+	a, _ := in.createBot("one", "")
+	b, _ := in.createBot("two", "")
+	q1 := Question{BotID: a.ID, Question: "Deploy?", OptionsJSON: `["ship","hold"]`}
+	q2 := Question{BotID: b.ID, Question: "Archive the session?", OptionsJSON: `["ship","hold"]`}
+	if err := in.db.Create(&q1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := in.db.Create(&q2).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	cb := &CallbackQuery{ID: "cb", Data: fmt.Sprintf("q:%d:0", q1.ID)}
+	cb.From.ID = 42
+	cb.Message = ownerMessage("")
+	in.handleCallback(cb)
+
+	var other Question
+	if err := in.db.First(&other, q2.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if other.AnsweredAt != nil {
+		t.Fatalf("dissimilar question was answered: %+v", other)
+	}
+}
+
+func TestQuestionsSimilarNormalized(t *testing.T) {
+	a := &Question{ID: 1, Question: "Deploy to prod?"}
+	b := &Question{ID: 2, Question: "deploy to prod"}
+	if !questionsSimilar(a, b) {
+		t.Fatal("same question with different punctuation must match")
+	}
+	c := &Question{ID: 3, Question: "Archive it?"}
+	if questionsSimilar(a, c) {
+		t.Fatal("different questions must not match")
+	}
+	if _, ok := mapQuestionAnswer(&Question{OptionsJSON: `["Yes","No"]`}, "yes"); !ok {
+		t.Fatal("option match is case-insensitive")
+	}
+	if _, ok := mapQuestionAnswer(&Question{OptionsJSON: `["Yes","No"]`}, "later"); ok {
+		t.Fatal("unknown option must not map")
+	}
+}
+
 func TestSendToBotDoesNotDumpIntoTelegram(t *testing.T) {
 	in, _, api := testInstance(t)
 	a, err := in.createBot("alpha", "")

@@ -127,9 +127,10 @@ fallback. The phone hub still sees every turn.
 
 - Persist `turns` row: profile used, duration, cost/usage from `result`,
   `stop_reason`, session id.
-- If the turn ended with `ask_owner` pending, the session is marked `waiting`
-  and no queued inputs are delivered until the answer arrives (answers are
-  inputs).
+- If the turn ended with `ask_owner` pending, the session is marked `waiting`.
+  Workers stay parked until a button tap or a reply-to that question (answers
+  are inputs). General keeps taking DM turns while a question is pending:
+  free text is never the answer, so blocking the dispatcher would swallow it.
 - If `set_name` changed the session name during the turn, rotate the
   conversation now that the turn has recorded its id (§14.14).
 - Leftover `inbox` rows (from the old inter-session `send_to_bot` path) are
@@ -297,7 +298,7 @@ home (Codex also gets per-turn `exec -c`). Identity is `--bot`/`--turn` or
 | `recall` | `query`, `scope?`, `limit?` | Full-text (SQLite FTS5) search over memories visible to this session: all `user`, all `project`, own session. Returns key+text+scope. |
 | `forget` | `scope`, `key`, `project_path?` | Delete one memory. |
 | `notify_owner` | `text`, `urgency` (normal\|urgent) | Post in General (the DM), labelled with the session name. Interruptions only — not a report dump. |
-| `ask_owner` | `question`, `options?` (≤4 strings) | Post question with inline buttons (or free text if no options) in General. Returns immediately with `{"status":"asked"}`; the session should end its turn. The answer arrives as the next input (`source=user`, prefixed `Answer to "<question>": …`) via a button tap or a reply-to that question in the DM. Free text in the DM is always General. Prompt contract: mandatory for every owner decision (yes/no, pick one, architectural fork); recommended option first; never ask in chat prose. |
+| `ask_owner` | `question`, `options?` (≤4 strings) | Post question with inline buttons (or free text if no options) in General. Returns immediately with `{"status":"asked"}`; the session should end its turn. The answer arrives as the next input (`source=user`, prefixed `Answer to "<question>": …`) via a button tap or a reply-to that question in the DM. Free text in the DM is never an answer (it is always General) and, if anything is still pending, listen posts a list of unanswered questions with their buttons — no timeout. Tapping one also answers similar pending questions (same normalized text, answer maps onto their options) so General does not re-ask. Prompt contract: mandatory for every owner decision (yes/no, pick one, architectural fork); recommended option first; never ask in chat prose. |
 | `set_name` | `name` | Rename this session: validate (§8 `/name`), update `bots.name`. Rotates the conversation (§14.14). `/name` in the DM only hits General, which refuses. No topic icon. |
 | `watch` | `name`, `command`, `interval_s` (≥60) | Register a deterministic watch (§7). Polling tool: no change = zero tokens. Lasts `watch_ttl_s` (default 4h); re-upserting the name renews it. `unwatch(name)`, `list_watches()`. |
 | `schedule_wakeup` | `in_seconds` or `at` (RFC3339), `note`, `cron?` | Wake at a time (§7). Each fire is a full turn. Not for polling. `cancel_schedule(id)`. |
@@ -353,16 +354,18 @@ One goroutine in `ccc listen`:
   the start of a turn, so a watch that fires after the cache TTL does not
   rebuild a cold fat session. A silent 🧹 lands in the topic when the
   scheduler rotates. `idle_compact_s=0` disables it. General is never rotated.
-- **Idle-session reminder**: a live worker that is idle or `waiting`, has
-  no watch / schedule / routine / background job keeping it alive, and has
-  no queued work, is waiting on the owner. Every **10 minutes** of that
+- **Idle-session reminder**: a live worker that is **idle** (not `waiting`),
+  has no watch / schedule / routine / background job keeping it alive, and
+  has no queued work, is waiting on the owner. Every **10 minutes** of that
   state, ccc queues an inbox message from the worker to General (`wake=true`)
   and immediately `Enqueue`s a `source=bot` turn on General so the
   dispatcher actually runs — the same path as `report_to_general`. Nothing
   is posted to Telegram. General then decides: `ask_owner`, `tell_session`,
-  archive, or ignore. Stop when the session is working again, gains a
-  keepalive, gets a user message, or is archived. `idle_reminded_at` on the
-  bot row is the anti-spam clock.
+  archive, or ignore. A parked `ask_owner` (`waiting`) is not reminded: the
+  question is already in the DM, and the owner's next free-text message lists
+  pending asks. Stop when the session is working again, gains a keepalive,
+  gets a user message, or is archived. `idle_reminded_at` on the bot row is
+  the anti-spam clock.
 - **Schedules**: unnamed `schedule_wakeup` enqueues a turn with
   `source=schedule` and the note on the owning bot when `fire_at` passes;
   recurring via cron expression. Polling a command is a watch, not a
@@ -460,11 +463,13 @@ older than 90 days.
 - Photos/documents → saved into General's workspace `inbox/`, path passed
   in the message. Voice → transcribed if the `voice` build is present, else
   the file path is passed (keep the existing whisper integration).
-- `ask_owner` → inline buttons `q:<question_id>:<option_idx>`; tapping edits the
-  message with ✓ and enqueues the answer. Free-text answers: replying to the
-  question message counts as the answer, and so does ANY text sent while the
-  session is parked `waiting` (a reply-to takes priority when both apply,
-  §14.3).
+- `ask_owner` → inline buttons `q:<question_id>:<option_idx>`; tapping ticks the
+  original question message with ✓ and enqueues the answer. Free-text answers:
+  only a reply to that question message. Free text in the DM never answers; if
+  anything is still pending, listen posts a list of unanswered questions with
+  their buttons (no timeout). Tapping one also answers similar pending
+  questions (same normalized text; the tapped label maps onto their options)
+  so General does not re-ask.
 - An **edited** message is gated like any other update. If its text starts with
   `/` it goes through the same command dispatcher — editing a mistyped command
   in place is how a phone corrects one — deduped by
@@ -701,10 +706,15 @@ conversation id the turn is about to write. The runner compares the name
 before and after and clears `session_id` once the turn has been persisted.
 `update_instructions` / `/role` are not registered.
 
-**14.3 Any text to a `waiting` bot counts as the answer.** §8 only specified
-"replying to the question message". In practice people answer without using
-reply-to, and the bot is parked either way. Reply-to still takes priority when
-both could apply, so answering an older question explicitly still works.
+**14.3 Free text never answers `ask_owner`.** §8 used to treat any DM text
+while a session was `waiting` as the answer. That stole the next owner
+message (always meant for General) and, when several similar questions were
+pending, answered only one — then the 10-minute idle nag made General
+re-ask the rest. Now: a button tap or a reply-to that question is the
+answer; free text lists the pending asks (no timeout) and goes to General.
+Tapping one fans the same answer out to similar pending questions
+(normalized text match; the label must exist on the sibling). Workers stay
+parked; General keeps taking DM turns. Idle-remind skips `waiting`.
 
 **14.4 `linkSharedProjects` only creates symlinks.** §4 was silent about an
 existing `projects/`. Replacing one would destroy real transcript history, so
@@ -1016,7 +1026,7 @@ Client RPC (plaintext inside the box, instance `hubClient.dispatch`):
 | `bots` | — | Live sessions, most recently active first (`last`, `last_text`, `status`, pending `question`). General is marked `general: true` / `topic_id: 0`. |
 | `archived` | — | Sessions with `archived_at` set. |
 | `history` | `bot_id`, `limit?` | Turns, oldest first. |
-| `send` | `bot_id`, `text?`, `image?` (`mime`, `name`, `data` base64) | Enqueue a user turn. Sending to General is the DM. Sending to a worker is `tell_session`. An image is written to the session `inbox/` (≤512 KiB) the same way a Telegram photo is. A send while that session has an unanswered `ask_owner` is the answer (same as a Telegram reply). |
+| `send` | `bot_id`, `text?`, `image?` (`mime`, `name`, `data` base64) | Enqueue a user turn. Sending to General is the DM (never an `ask_owner` answer). Sending to a worker is `tell_session`. An image is written to the session `inbox/` (≤512 KiB) the same way a Telegram photo is. A send to a worker with an unanswered `ask_owner` is the answer (same as a Telegram reply) and fans out to similar pending questions. |
 | `rename` | `bot_id`, `name` | `validateBotName` + `renameBot`. Refused for General. |
 | `archive` | `bot_id` | `archiveBotRow`. Drops off `bots`. Refused for General. |
 | `unarchive` | `bot_id` | `unarchiveBotRow`. |

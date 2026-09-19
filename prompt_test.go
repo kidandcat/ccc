@@ -75,6 +75,7 @@ func TestSystemPromptRequiresAskOwnerForDecisions(t *testing.T) {
 			"recommended option first",
 			"architectural",
 			"end the turn",
+			"never an answer",
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("%s prompt missing %q:\n%s", name, want, got)

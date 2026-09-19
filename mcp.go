@@ -672,6 +672,106 @@ func pendingQuestion(db *gorm.DB, botID int64) (*Question, bool) {
 	return &q, true
 }
 
+// pendingAsk is one unanswered ask_owner on a live session, for the DM list.
+type pendingAsk struct {
+	Q    Question
+	Name string
+}
+
+const maxPendingAskList = 8
+
+// livePendingAsks is unanswered questions on live (not archived) sessions,
+// oldest first. The DM lists these when the owner types; they are not answered
+// by that text.
+func livePendingAsks(db *gorm.DB) []pendingAsk {
+	var rows []Question
+	if err := db.Where("answered_at IS NULL").Order("id").Find(&rows).Error; err != nil {
+		return nil
+	}
+	out := make([]pendingAsk, 0, len(rows))
+	for i := range rows {
+		b, err := botByID(db, rows[i].BotID)
+		if err != nil || b.ArchivedAt != nil {
+			continue
+		}
+		out = append(out, pendingAsk{Q: rows[i], Name: b.Name})
+	}
+	return out
+}
+
+// normalizeQuestionText is the similarity key: case-fold, collapse space, drop
+// trailing ?¿!. Two pending asks match when this is equal and non-empty.
+func normalizeQuestionText(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.Join(strings.Fields(s), " ")
+	return strings.TrimRight(s, "?¿!.")
+}
+
+func questionsSimilar(a, b *Question) bool {
+	if a == nil || b == nil || a.ID == b.ID {
+		return false
+	}
+	na := normalizeQuestionText(a.Question)
+	nb := normalizeQuestionText(b.Question)
+	return na != "" && na == nb
+}
+
+// mapQuestionAnswer returns the answer to store on q. Empty-option questions
+// take the text as-is. Button questions only accept an option they already
+// have (case-insensitive), so a tap on "Yes" does not invent a choice on a
+// sibling that asked with different buttons.
+func mapQuestionAnswer(q *Question, answer string) (string, bool) {
+	answer = strings.TrimSpace(answer)
+	if answer == "" || q == nil {
+		return "", false
+	}
+	opts := questionOptions(q)
+	if len(opts) == 0 {
+		return answer, true
+	}
+	for _, o := range opts {
+		if strings.EqualFold(strings.TrimSpace(o), answer) {
+			return o, true
+		}
+	}
+	return "", false
+}
+
+// applyQuestionAnswer records the answer on q, then the same answer on every
+// similar pending ask whose options can take it. Each resolved row is returned
+// so the caller can tick Telegram and emit hub events. The primary error is
+// the only hard failure; siblings are best-effort.
+func applyQuestionAnswer(db *gorm.DB, runner turnRunner, q *Question, answer string) ([]Question, error) {
+	if err := resolveQuestionAnswer(db, runner, q, answer); err != nil {
+		return nil, err
+	}
+	out := []Question{*q}
+	var rows []Question
+	if err := db.Where("answered_at IS NULL AND id != ?", q.ID).Order("id").Find(&rows).Error; err != nil {
+		return out, nil
+	}
+	for i := range rows {
+		other := rows[i]
+		if !questionsSimilar(q, &other) {
+			continue
+		}
+		mapped, ok := mapQuestionAnswer(&other, answer)
+		if !ok {
+			continue
+		}
+		b, err := botByID(db, other.BotID)
+		if err != nil || b.ArchivedAt != nil {
+			continue
+		}
+		if err := resolveQuestionAnswer(db, runner, &other, mapped); err != nil {
+			hookLog("similar ask %d: %v", other.ID, err)
+			continue
+		}
+		out = append(out, other)
+	}
+	return out, nil
+}
+
 // answerQuestion records an answer and returns the text to feed back into the
 // bot as its next input (DESIGN §6 ask_owner).
 func answerQuestion(db *gorm.DB, q *Question, answer string) string {
@@ -691,6 +791,9 @@ func resolveQuestionAnswer(db *gorm.DB, runner turnRunner, q *Question, answer s
 		return fmt.Errorf("already answered")
 	}
 	text := answerQuestion(db, q, answer)
+	q.Answer = answer
+	now := time.Now()
+	q.AnsweredAt = &now
 	setBotStatus(db, q.BotID, botIdle)
 	if runner == nil {
 		return fmt.Errorf("runner not running")

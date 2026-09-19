@@ -491,11 +491,85 @@ func TestHubSendAnswersPendingQuestion(t *testing.T) {
 	}
 	last, ok := runner.last()
 	if !ok || !strings.Contains(last.Text, "main") || !strings.Contains(last.Text, "Which branch?") {
-		t.Fatalf("send while waiting must answer, got %+v", last)
+		t.Fatalf("send to a waiting worker must answer, got %+v", last)
 	}
 	var stored Question
 	if err := in.db.First(&stored, q.ID).Error; err != nil || stored.AnsweredAt == nil {
 		t.Fatalf("question not answered: %+v err=%v", stored, err)
+	}
+}
+
+func TestHubSendToGeneralDoesNotAnswer(t *testing.T) {
+	h, in, runner, _ := testHub(t)
+	g, err := in.ensureGeneralBot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := Question{BotID: g.ID, Question: "Which branch?"}
+	if err := in.db.Create(&q).Error; err != nil {
+		t.Fatal(err)
+	}
+	params, _ := json.Marshal(map[string]any{"bot_id": g.ID, "text": "do the other thing"})
+	res := h.dispatch(hubRPC{Kind: "req", ID: "1", Method: "send", Params: params})
+	if !res.OK {
+		t.Fatalf("send: %s", res.Error)
+	}
+	var stored Question
+	if err := in.db.First(&stored, q.ID).Error; err != nil || stored.AnsweredAt != nil {
+		t.Fatalf("send to General must not answer: %+v err=%v", stored, err)
+	}
+	last, ok := runner.last()
+	if !ok || last.BotID != g.ID || last.Text != "do the other thing" {
+		t.Fatalf("send to General must enqueue the text, got %+v ok=%v", last, ok)
+	}
+}
+
+func TestHubAnswerFansOutToSimilar(t *testing.T) {
+	h, in, runner, _ := testHub(t)
+	a, err := in.createBot("one", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := in.createBot("two", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := json.Marshal([]string{"ship", "hold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q1 := Question{BotID: a.ID, Question: "Deploy?", OptionsJSON: string(opts)}
+	q2 := Question{BotID: b.ID, Question: "deploy?", OptionsJSON: string(opts)}
+	if err := in.db.Create(&q1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := in.db.Create(&q2).Error; err != nil {
+		t.Fatal(err)
+	}
+	opt := 0
+	params, _ := json.Marshal(map[string]any{"question_id": q1.ID, "option": opt})
+	ans := h.dispatch(hubRPC{Kind: "req", ID: "3", Method: "answer", Params: params})
+	if !ans.OK {
+		t.Fatalf("answer: %s", ans.Error)
+	}
+	var first, second Question
+	if err := in.db.First(&first, q1.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := in.db.First(&second, q2.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if first.AnsweredAt == nil || second.AnsweredAt == nil {
+		t.Fatalf("similar questions not both answered: %+v %+v", first, second)
+	}
+	if first.Answer != "ship" || second.Answer != "ship" {
+		t.Fatalf("answers = %q %q", first.Answer, second.Answer)
+	}
+	runner.mu.Lock()
+	n := len(runner.enqueued)
+	runner.mu.Unlock()
+	if n != 2 {
+		t.Errorf("want 2 answer turns, got %d", n)
 	}
 }
 

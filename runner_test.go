@@ -278,6 +278,27 @@ func TestDisabledBotDoesNotRun(t *testing.T) {
 	}
 }
 
+func TestSessionSkipsTurns(t *testing.T) {
+	worker := &Bot{Status: botWaiting, TopicID: -1}
+	if !sessionSkipsTurns(worker) {
+		t.Error("a waiting worker must stay parked")
+	}
+	chief := &Bot{Status: botWaiting, TopicID: 0}
+	if sessionSkipsTurns(chief) {
+		t.Error("waiting General must still take DM turns")
+	}
+	if sessionSkipsTurns(&Bot{Status: botIdle, TopicID: -2}) {
+		t.Error("an idle worker must run")
+	}
+	if !sessionSkipsTurns(&Bot{Status: botDisabled, TopicID: 0}) {
+		t.Error("disabled General must skip")
+	}
+	now := time.Now()
+	if !sessionSkipsTurns(&Bot{Status: botIdle, ArchivedAt: &now}) {
+		t.Error("archived bots must skip")
+	}
+}
+
 func TestInterruptActiveTimesOutWithoutLookingLikeStop(t *testing.T) {
 	cmd := exec.Command("sleep", "30")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

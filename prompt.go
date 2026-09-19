@@ -42,8 +42,8 @@ const askOwnerRule = `- Decisions go through ask_owner, never through chat or tr
   fork: call ask_owner with up to 4 Telegram buttons (recommended option first)
   and end the turn. Omit options only when the answer cannot be a button.
   The answer arrives as your next message (button tap, or a reply to the
-  question in the DM). Do not guess on anything architectural, destructive
-  or irreversible.
+  question in the DM). Free text in the DM is never an answer. Do not guess
+  on anything architectural, destructive or irreversible.
 `
 
 // otherBot is one line of a leftover roster helper. The system prompt no
@@ -134,9 +134,11 @@ Rules:
   with a short summary of what they did; never paste a transcript. Do that in
   this turn — do not spawn, do not investigate. If you time out, ccc posts a
   short fallback from the worker's last message. You are the bridge.
-- Idle workers with no watch/schedule/routine/background wake you every 10 minutes
-  the same way (inbox, not a chat ping). Decide: ask_owner, tell_session, archive,
-  or ignore. Do not notify_owner just to repeat the nag.
+- Idle workers with no watch/schedule/routine/background and no unanswered ask_owner
+  wake you every 10 minutes the same way (inbox, not a chat ping). Decide: ask_owner,
+  tell_session, archive, or ignore. Do not notify_owner just to repeat the nag.
+  Do not re-ask a pending ask_owner; the owner sees unanswered questions when they
+  next write in the DM, and similar pending questions are answered together.
 - Every message you get carries a <context> block with the memories and pending
   messages that fit; use recall when you need more.
 - Call remember when you learn something durable. Do not remember transient chatter.

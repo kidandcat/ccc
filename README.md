@@ -244,7 +244,7 @@ ssh host
 | `/session <prompt>` | Starts a backend worker named after the first line, first turn = that prompt. |
 | A photo or document | Saved into the orchestrator's `inbox/`, with the path passed in the message. |
 | A voice note | Transcribed if the `voice` build is installed, else the file path is passed. |
-| A reply to a question / a button | Answers that session's `ask_owner`. Free text in the DM is always the orchestrator. |
+| A reply to a question / a button | Answers that session's `ask_owner`. Free text in the DM is always the orchestrator, never an answer; if anything is still pending it is listed (no timeout). Tapping one also answers similar pending questions. |
 
 While an orchestrator turn runs, one progress message in the DM is edited in place
 (no Telegram notification). The answer is posted when the turn finishes — that

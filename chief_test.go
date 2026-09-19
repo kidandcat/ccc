@@ -321,6 +321,9 @@ func TestChiefPromptIsByteStable(t *testing.T) {
 	if !strings.Contains(first, "every 10 minutes") || !strings.Contains(first, "Do not notify_owner just to repeat the nag") {
 		t.Errorf("chief prompt must teach idle nags are dispatcher-only:\n%s", first)
 	}
+	if !strings.Contains(first, "Do not re-ask a pending ask_owner") {
+		t.Errorf("chief prompt must not re-ask pending decisions:\n%s", first)
+	}
 	if !strings.Contains(first, "MUST be a watch") || !strings.Contains(first, "fresh worker") {
 		t.Errorf("chief prompt must teach watch-not-wakeup and isolated routines:\n%s", first)
 	}

@@ -579,13 +579,17 @@ func (h *hubClient) rpcSend(params json.RawMessage, out *hubRPC) {
 		out.OK, out.Error = false, "empty message"
 		return
 	}
-	if q, ok := pendingQuestion(h.in.db, b.ID); ok {
-		if err := h.answerPending(q, p.Text); err != nil {
-			out.OK, out.Error = false, err.Error()
+	// Send to a waiting worker is the answer (the phone targeted that session).
+	// Send to General is the DM: free text never answers an ask_owner.
+	if !isGeneralBot(b) {
+		if q, ok := pendingQuestion(h.in.db, b.ID); ok {
+			if err := h.answerPending(q, p.Text); err != nil {
+				out.OK, out.Error = false, err.Error()
+				return
+			}
+			out.Body, _ = json.Marshal(map[string]any{"queued": true, "bot": b.Name, "answered": q.ID})
 			return
 		}
-		out.Body, _ = json.Marshal(map[string]any{"queued": true, "bot": b.Name, "answered": q.ID})
-		return
 	}
 	if _, err := h.in.runner.Enqueue(b.ID, sourceUser, p.Text, 0); err != nil {
 		out.OK, out.Error = false, err.Error()
@@ -731,17 +735,20 @@ func (h *hubClient) rpcAnswer(params json.RawMessage, out *hubRPC) {
 }
 
 func (h *hubClient) answerPending(q *Question, answer string) error {
-	if err := resolveQuestionAnswer(h.in.db, h.in.runner, q, answer); err != nil {
+	answered, err := applyQuestionAnswer(h.in.db, h.in.runner, q, answer)
+	if err != nil {
 		return err
 	}
-	h.in.tickAskedMessage(q, answer)
-	b, err := botByID(h.in.db, q.BotID)
-	name := ""
-	if err == nil {
-		name = b.Name
+	for i := range answered {
+		a := &answered[i]
+		h.in.tickAskedMessage(a, a.Answer)
+		h.noteQuestionGone(a.ID)
+		name := ""
+		if b, err := botByID(h.in.db, a.BotID); err == nil {
+			name = b.Name
+		}
+		h.pushEvent("answered", map[string]any{"id": a.ID, "bot_id": a.BotID, "bot": name, "answer": a.Answer, "text": a.Answer})
 	}
-	h.noteQuestionGone(q.ID)
-	h.pushEvent("answered", map[string]any{"id": q.ID, "bot_id": q.BotID, "bot": name, "answer": answer, "text": answer})
 	return nil
 }
 
