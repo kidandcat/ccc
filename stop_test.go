@@ -190,6 +190,13 @@ func TestWorkerTurnTimeoutKillsAndRelays(t *testing.T) {
 	if r.Running(w.ID) {
 		t.Error("process still running after the cap")
 	}
+	// The worker row is marked failed before relayTurnTimeout Enqueues
+	// General — wait for that write, not just the worker status.
+	waitUntil(t, 5*time.Second, func() bool {
+		var n int64
+		in.db.Model(&Turn{}).Where("bot_id = ? AND source = ?", chief.ID, sourceBot).Count(&n)
+		return n >= 1
+	})
 	var gen []Turn
 	in.db.Where("bot_id = ? AND source = ?", chief.ID, sourceBot).Find(&gen)
 	if len(gen) != 1 {
