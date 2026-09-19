@@ -21,15 +21,17 @@ type Config struct {
 	AllowedUserIDs    []int64             `json:"allowed_user_ids,omitempty"`   // extra Telegram user ids allowed to talk (not owner commands)
 	TranscriptionLang string              `json:"transcription_lang,omitempty"` // language code for whisper (e.g. "es")
 	RelayURL          string              `json:"relay_url,omitempty"`          // relay server for files over 50 MB
-	HubURL            string              `json:"hub_url,omitempty"`            // public ccc hub (default wss://hub.getccc.dev; "-" disables)
-	InstanceName      string              `json:"instance_name,omitempty"`      // label shown in the mobile machine picker
 	Profiles          map[string]*Profile `json:"profiles,omitempty"`           // identity -> account (engine + isolated home)
-	DefaultProfile    string              `json:"default_profile,omitempty"`    // default account; new bots inherit its engine unless default_engine is set
-	DataDir           string              `json:"data_dir,omitempty"`           // runtime root (default ~/.local/share/ccc)
-	Model             string              `json:"model,omitempty"`              // legacy Claude instance model; prefer Models["claude"]
-	Models            map[string]string   `json:"models,omitempty"`             // per-engine default model slugs
-	DefaultEngine     string              `json:"default_engine,omitempty"`     // engine assigned to new bots (default: claude)
-	EnvPassthrough    []string            `json:"env_passthrough,omitempty"`    // extra env var names bots inherit (DESIGN §3.1)
+	// WorkerTurnTimeoutS caps one worker (or General non-owner) CLI turn.
+	// Pointer so 0 can disable. Default 1800 (30m). Hung claude/grok is
+	// SIGTERM then SIGKILL.
+	WorkerTurnTimeoutS *int              `json:"worker_turn_timeout_s,omitempty"`
+	DefaultProfile     string            `json:"default_profile,omitempty"` // default account; new bots inherit its engine unless default_engine is set
+	DataDir            string            `json:"data_dir,omitempty"`        // runtime root (default ~/.local/share/ccc)
+	Model              string            `json:"model,omitempty"`           // legacy Claude instance model; prefer Models["claude"]
+	Models             map[string]string `json:"models,omitempty"`          // per-engine default model slugs
+	DefaultEngine      string            `json:"default_engine,omitempty"`  // engine assigned to new bots (default: claude)
+	EnvPassthrough     []string          `json:"env_passthrough,omitempty"` // extra env var names bots inherit (DESIGN §3.1)
 	// Tuning knobs. They are pointers where 0 is a meaningful value, so an
 	// absent key means "use the default" rather than "set it to zero".
 	DebounceMS      *int   `json:"debounce_ms,omitempty"`      // ms an idle bot waits for more messages (default 2500; 0 disables)
@@ -192,19 +194,6 @@ func main() {
 		}
 		runRelayServer(port)
 
-	case "hub":
-		addr := ":8787"
-		if len(os.Args) >= 3 {
-			addr = os.Args[2]
-		}
-		must(runHubServer(addr))
-
-	case "pair":
-		must(runPairCommand(os.Args[2:]))
-
-	case "unpair":
-		must(runUnpairCommand(os.Args[2:]))
-
 	default:
 		fail("Unknown command %q. Run `ccc --help`.", os.Args[1])
 	}
@@ -305,8 +294,8 @@ func withDefaultNote(value string, isDefault bool) string {
 // configKeys are the keys `ccc config` understands. Secrets are never printed
 // back (DESIGN §12): the bot token reads as "configured".
 var configKeys = []string{"bot_token", "chat_id", "allowed_user_ids", "model", "data_dir", "env_passthrough", "relay_url",
-	"hub_url", "instance_name", "transcription_lang", "default_profile", "default_engine", "debounce_ms",
-	"compaction_model", "maintenance_hour", "idle_compact_s", "watch_ttl_s"}
+	"transcription_lang", "default_profile", "default_engine", "debounce_ms",
+	"compaction_model", "maintenance_hour", "idle_compact_s", "watch_ttl_s", "worker_turn_timeout_s"}
 
 func configGet(config *Config, key string) (string, error) {
 	switch key {
@@ -327,10 +316,6 @@ func configGet(config *Config, key string) (string, error) {
 		return strings.Join(config.EnvPassthrough, ","), nil
 	case "relay_url":
 		return firstNonEmpty(config.RelayURL, defaultRelayURL), nil
-	case "hub_url":
-		return hubURLFromConfig(config), nil
-	case "instance_name":
-		return instanceDisplayName(config), nil
 	case "transcription_lang":
 		return firstNonEmpty(config.TranscriptionLang, "(auto-detect)"), nil
 	case "default_profile":
@@ -347,6 +332,8 @@ func configGet(config *Config, key string) (string, error) {
 		return withDefaultNote(fmt.Sprint(int(idleCompact(config)/time.Second)), config.IdleCompactS == nil), nil
 	case "watch_ttl_s":
 		return withDefaultNote(fmt.Sprint(int(watchTTL(config)/time.Second)), config.WatchTTLS == nil), nil
+	case "worker_turn_timeout_s":
+		return withDefaultNote(fmt.Sprint(int(workerTurnTimeout(config)/time.Second)), config.WorkerTurnTimeoutS == nil), nil
 	}
 	return "", fmt.Errorf("unknown config key %q (known: %s)", key, strings.Join(configKeys, ", "))
 }
@@ -383,10 +370,6 @@ func configSet(config *Config, key, value string) error {
 		config.EnvPassthrough = splitList(value)
 	case "relay_url":
 		config.RelayURL = value
-	case "hub_url":
-		config.HubURL = value
-	case "instance_name":
-		config.InstanceName = value
 	case "transcription_lang":
 		config.TranscriptionLang = value
 	case "default_profile":
@@ -427,6 +410,12 @@ func configSet(config *Config, key, value string) error {
 			return err
 		}
 		config.WatchTTLS = &n
+	case "worker_turn_timeout_s":
+		n, err := parseRange(key, value, 0, maxWorkerTurnTimeoutS)
+		if err != nil {
+			return err
+		}
+		config.WorkerTurnTimeoutS = &n
 	default:
 		return fmt.Errorf("unknown config key %q (known: %s)", key, strings.Join(configKeys, ", "))
 	}

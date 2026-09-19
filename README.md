@@ -18,8 +18,8 @@ has a 60s cap on **your** messages — longer work must go to a session. Session
 reports are not under that cap: the orchestrator has to summarize them. If the
 cap fires and the orchestrator does not spawn, ccc starts the session itself
 (the owner is never asked to `/session`). Idle sessions waiting on
-you wake the orchestrator every 10 minutes (inbox, not a chat ping); it decides
-what to do. `/session <prompt>`
+you wake the orchestrator once per idle spell after 10 minutes (inbox, not a
+chat ping); it decides what to do. `/session <prompt>`
 still starts a worker without going through the orchestrator. Sessions report only
 to the orchestrator (`report_to_general`); the owner does not see the transcript.
 A live status card in the DM (one block per working session) is pinned
@@ -241,7 +241,7 @@ ssh host
 
 | Where | What happens |
 |---|---|
-| Text in the **DM** (orchestrator) | A turn of the orchestrator (60s cap on your messages; session reports are not capped). It sees live sessions and can spawn or tell them. Idle workers waiting on you wake the orchestrator every 10 minutes in its inbox, not as a DM ping. |
+| Text in the **DM** (orchestrator) | A turn of the orchestrator (60s cap on your messages; session reports are not capped). It sees live sessions and can spawn or tell them. Idle workers waiting on you wake the orchestrator once per idle spell after 10 minutes in its inbox, not as a DM ping. |
 | `/session <prompt>` | Starts a backend worker named after the first line, first turn = that prompt. |
 | A photo or document | Saved into the orchestrator's `inbox/`, with the path passed in the message. |
 | A voice note | Transcribed if the `voice` build is installed, else the file path is passed. |
@@ -263,7 +263,7 @@ summary so you are never left with only a status line.
 |---|---|
 | `/name [name]` | Show or set the session's name (the orchestrator cannot be renamed). Starts a fresh conversation (the name is in the system prompt). Names are unique. |
 | `/new` | Fresh conversation. Memories are kept. |
-| `/stop` | Kill the running turn and drop the queue. |
+| `/stop [name\|all]` | Kill that session's running turn and drop its queue. Bare `/stop` kills the orchestrator if it is running; if nothing was running there, it stops live workers. `/stop all` stops every live session. Hung CLIs get SIGTERM, then SIGKILL after 5s. Workers also have a 30m cap (`worker_turn_timeout_s`). |
 | `/cwd [path]` | Show or set the session's working directory. |
 | `/engine [name]` | Show this session's engine pool, or assign it to another (`claude`, `grok`, `antigravity`). Secondary: engine is set when you add the account. Switching pools starts a fresh conversation. |
 | `/memory [query]` | List or search the memories this session can see. |
@@ -349,7 +349,7 @@ changes per turn is in it), so the API's prompt cache covers the conversation
 and only the new message is charged as fresh input. `/usage` reports the cache
 hit ratio per session — if it drops, something started varying the prompt.
 
-**Idle conversations are rotated.** After `idle_compact_s` (default 1 h) without a
+**Idle conversations are rotated** (including the orchestrator). After `idle_compact_s` (default 1 h) without a
 turn, ccc does the same as `/new`: memories stay, the conversation does not.
 Claude's prompt cache expires on that same horizon; resuming a cold fat session
 would re-charge the whole history.
@@ -389,6 +389,7 @@ defaults are meant to be right, and `ccc config` prints what is in force.
 | `maintenance_hour` | 4 | Local hour the daily job runs at. A machine that was off catches up when it wakes. |
 | `idle_compact_s` | 3600 | Seconds a conversation may sit unused before it is rotated (`/new`). 0 disables. |
 | `watch_ttl_s` | 14400 | Seconds a watch lives before it is cancelled and the session is woken. 0 disables. Routines do not expire. |
+| `worker_turn_timeout_s` | 1800 | Seconds a worker (or orchestrator non-owner) CLI turn may run before SIGTERM→SIGKILL. 0 disables. Owner messages to the orchestrator stay on the 60s cap. |
 
 ```bash
 ccc config                              # every key, with the defaults in force
@@ -397,6 +398,7 @@ ccc config set compaction_model sonnet
 ccc config set maintenance_hour 22
 ccc config set idle_compact_s 3600
 ccc config set watch_ttl_s 14400
+ccc config set worker_turn_timeout_s 1800
 ```
 
 ### Access control
@@ -413,7 +415,8 @@ ccc config set allowed_user_ids ""    # owner only again
 
 - A stranger's message — **group or DM** — is dropped in silence. No pairing
   code, no "this bot is private", no owner ping.
-- `/access` lists the config whitelist. It does not add or remove anyone.
+- `/access` lists the config whitelist. `/access add` does not grant anyone
+  (no remote grant from Telegram). Changing the list is `ccc config set`.
 
 An allowed user can talk in the DM (the orchestrator). They cannot use `/account`, `/access`,
 `/model`, `/secret` — those stay yours.
@@ -602,9 +605,6 @@ ccc profile <cmd>             Manage accounts from a shell
                               (list/add/remove/default/login/accept-disclaimer)
 ccc send <file>               Send a file to the owner from the session owning this directory
 ccc relay [port]              Relay server for files over 50 MB
-ccc pair                      Print a pairing URI for this machine
-ccc unpair                    List or revoke paired devices
-ccc hub [addr]                Run the public pairing hub (default :8787)
 ccc mcp --bot <id>            MCP server for one turn (spawned by Claude Code)
 ```
 

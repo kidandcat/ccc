@@ -17,6 +17,22 @@ func sendContaining(api *fakeBotAPI, substr string) (apiCall, bool) {
 	return apiCall{}, false
 }
 
+// waitSendContaining waits for a sendMessage that contains substr. Job
+// finish writes the row, then notifies; tests that only wait on the row
+// otherwise lose the race.
+func waitSendContaining(t *testing.T, api *fakeBotAPI, substr string) apiCall {
+	t.Helper()
+	var got apiCall
+	waitUntil(t, 2*time.Second, func() bool {
+		c, ok := sendContaining(api, substr)
+		if ok {
+			got = c
+		}
+		return ok
+	})
+	return got
+}
+
 func TestRecoverAfterRestartPingsEvenWhenIdle(t *testing.T) {
 	_, in, _, api := testScheduler(t)
 	in.recoverAfterRestart()
@@ -186,8 +202,8 @@ func TestRecoverAfterRestartResumesLiveBackgroundJob(t *testing.T) {
 	if job.Status != jobRunning {
 		t.Fatalf("live job marked %q error=%q", job.Status, job.Error)
 	}
-	if len(runner.enqueued) != 0 {
-		t.Fatalf("resuming a live job must not wake the bot: %+v", runner.enqueued)
+	if queued := runner.queued(); len(queued) != 0 {
+		t.Fatalf("resuming a live job must not wake the bot: %+v", queued)
 	}
 	got, ok := sendContaining(api, "Resumed")
 	if !ok {

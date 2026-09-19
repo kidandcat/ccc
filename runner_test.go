@@ -308,7 +308,7 @@ func TestInterruptActiveTimesOutWithoutLookingLikeStop(t *testing.T) {
 	defer syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // safe-ignore: test teardown
 
 	r := &Runner{active: map[int64]*activeTurn{}}
-	r.active[1] = &activeTurn{cmd: cmd}
+	r.active[1] = &activeTurn{cmd: cmd, pid: cmd.Process.Pid}
 	if !r.interruptActive(1, true) {
 		t.Fatal("timeout should have signalled the process")
 	}
@@ -337,7 +337,7 @@ func TestInterruptArchivedDoesNotLookLikeStop(t *testing.T) {
 	defer syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // safe-ignore: test teardown
 
 	r := &Runner{active: map[int64]*activeTurn{}}
-	r.active[1] = &activeTurn{cmd: cmd}
+	r.active[1] = &activeTurn{cmd: cmd, pid: cmd.Process.Pid}
 	if !r.interruptArchived(1) {
 		t.Fatal("archive should have signalled the process")
 	}
@@ -369,19 +369,31 @@ func TestWatchArchiveKillsRunningTurn(t *testing.T) {
 
 	prev := archiveWatchInterval
 	archiveWatchInterval = 20 * time.Millisecond
-	defer func() { archiveWatchInterval = prev }()
 
 	r := newRunner(in.db, in.cfg, nil)
-	r.active[w.ID] = &activeTurn{cmd: cmd}
+	exited := make(chan struct{})
+	r.active[w.ID] = &activeTurn{cmd: cmd, pid: cmd.Process.Pid, exited: exited}
 	stop := make(chan struct{})
-	defer close(stop)
-	go r.watchArchive(w.ID, stop)
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		r.watchArchive(w.ID, stop)
+	}()
+	// Restore the global only after the watcher has left the read.
+	defer func() {
+		close(stop)
+		<-watchDone
+		archiveWatchInterval = prev
+	}()
 
 	if err := archiveBotRow(in.db, w.ID); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	go func() {
+		done <- cmd.Wait()
+		close(exited)
+	}()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):

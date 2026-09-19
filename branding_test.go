@@ -15,9 +15,8 @@ func TestUserFacingCopyHasNoCrewBranding(t *testing.T) {
 	t.Parallel()
 
 	blobs := map[string]string{
-		"ccc --help":     helpText(),
-		"systemd unit":   renderSystemdUnit("/usr/bin/ccc", &Config{}),
-		"hub /privacy":   hubPrivacyHTML,
+		"ccc --help":   helpText(),
+		"systemd unit": renderSystemdUnit("/usr/bin/ccc", &Config{}),
 	}
 	for name, body := range blobs {
 		if loc := bannedBranding.FindString(body); loc != "" {

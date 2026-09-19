@@ -340,10 +340,11 @@ func TestBackgroundJobInjectsAndRedacts(t *testing.T) {
 	if !strings.Contains(got.Output, secretRedactToken) {
 		t.Error("stored output should be redacted")
 	}
-	if len(runner.enqueued) != 1 {
-		t.Fatalf("enqueued %d", len(runner.enqueued))
+	queued := waitEnqueued(t, runner, 1)
+	if len(queued) != 1 {
+		t.Fatalf("enqueued %d", len(queued))
 	}
-	assertNoSecret(t, runner.enqueued[0].Text, "background wake")
+	assertNoSecret(t, queued[0].Text, "background wake")
 }
 
 func TestRedactSecretsLongestFirst(t *testing.T) {

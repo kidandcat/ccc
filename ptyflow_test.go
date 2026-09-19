@@ -85,7 +85,7 @@ func fakeClaudeScript(t *testing.T, codeFile string, withTheme bool) string {
 		theme = `
 printf 'Choose the text style that looks best with your terminal\n'
 printf '  1. Auto (match terminal)\n'
-printf '\xe2\x9d\xaf 2. Dark mode\n'
+printf '\342\235\257 2. Dark mode\n'
 printf '  3. Light mode\n'
 read -r themechoice
 printf 'theme %s\n' "$themechoice" >> "$OUT"
@@ -94,7 +94,7 @@ printf 'theme %s\n' "$themechoice" >> "$OUT"
 	script := `#!/bin/sh
 OUT="` + codeFile + `"
 ` + theme + `
-printf 'Opening browser to sign in\xe2\x80\xa6\n'
+printf 'Opening browser to sign in\342\200\246\n'
 printf 'If the browser didn'"'"'t open, visit: \033]8;;https://claude.com/cai/oauth/authorize?x=1\a\033[94mhttps://claude.com/cai/oauth/authorize?x=1\033[39m\033]8;;\a\n'
 printf 'Paste code here if prompted > '
 read -r code

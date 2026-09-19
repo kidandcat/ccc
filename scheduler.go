@@ -228,9 +228,6 @@ func (s *scheduler) compactIdleSessions(now time.Time) {
 	}
 	for i := range bots {
 		b := bots[i]
-		if isGeneralBot(&b) {
-			continue
-		}
 		if !sessionIdleTooLong(s.in.db, b.ID, now, after) {
 			continue
 		}
@@ -239,16 +236,25 @@ func (s *scheduler) compactIdleSessions(now time.Time) {
 		if res.Error != nil || res.RowsAffected == 0 {
 			continue
 		}
+		if isGeneralBot(&b) {
+			if chat, thread, ok := destForTopic(s.in.config(), 0); ok {
+				_, _ = sendMessageHTMLGetIDSilent(s.in.config(), chat, thread, renderGeneralRotated(after))
+			}
+		}
 	}
+}
+
+func renderGeneralRotated(after time.Duration) string {
+	return fmt.Sprintf("🧹 Fresh conversation after %s idle. Memories are kept.", humanDuration(after))
 }
 
 // remindIdleSessions wakes General about live workers that are idle (not
 // parked on ask_owner), have nothing keeping them alive, and have been
-// waiting on the owner for idleRemindInterval. Cadence is wall-clock 10
-// minutes, not every turn. The nag is an inbox row plus an immediate Enqueue
-// on General — the same path as report_to_general — so the dispatcher
-// actually runs. Nothing is posted to Telegram. Waiting bots already asked;
-// the owner sees them on the next DM message.
+// waiting on the owner for idleRemindInterval. One reminder per idle spell
+// (IdleRemindedAt latches until the worker leaves idle-waiting). The nag
+// is an inbox row plus an immediate Enqueue on General — the same path as
+// report_to_general — so the dispatcher actually runs. Nothing is posted to
+// Telegram. Waiting bots already asked; the owner sees them on the next DM.
 func (s *scheduler) remindIdleSessions(now time.Time) {
 	if s.in.runner == nil {
 		return
@@ -358,13 +364,10 @@ func shouldIdleRemind(db *gorm.DB, b *Bot, now time.Time) bool {
 	if !sessionIdleWaitingOnUser(db, b) {
 		return false
 	}
-	if now.Sub(sessionIdleSince(db, b)) < idleRemindInterval {
+	if b.IdleRemindedAt != nil {
 		return false
 	}
-	if b.IdleRemindedAt != nil && now.Sub(*b.IdleRemindedAt) < idleRemindInterval {
-		return false
-	}
-	return true
+	return now.Sub(sessionIdleSince(db, b)) >= idleRemindInterval
 }
 
 // sessionIdleTooLong is the shared idle check: last finished turn older than

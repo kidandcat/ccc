@@ -196,7 +196,7 @@ func (s *mcpServer) register(server *mcp.Server) {
 	}, s.setName)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "send_file",
-		Description: "Send a file from this machine to the owner: Telegram DM and paired phones (max 50 MB).",
+		Description: "Send a file from this machine to the owner via Telegram (max 50 MB).",
 	}, s.sendFile)
 	s.registerAutomation(server)
 	s.registerSecrets(server)
@@ -576,26 +576,15 @@ func (s *mcpServer) sendFile(_ context.Context, _ *mcp.CallToolRequest, in sendF
 	if info.Size() > sendFileMaxBytes {
 		return toolErr("%s is %d bytes, over the 50 MB limit", abs, info.Size()), nil, nil
 	}
-	b, err := s.bot()
-	if err != nil {
+	if _, err := s.bot(); err != nil {
 		return toolErr("unknown bot"), nil, nil
 	}
-	stored := abs
-	if dst, copyErr := copyToHubFiles(s.config, abs); copyErr == nil {
-		stored = dst
+	chat, thread, ok := destForTopic(s.config, 0)
+	if !ok {
+		return toolErr("no Telegram destination (set chat_id)"), nil, nil
 	}
-	if _, err := recordOutgoingFile(s.db, b.ID, s.turnID, stored, filepath.Base(abs), info.Size()); err != nil {
-		hookLog("hub file row: %v", err)
-	}
-	var tgErr error
-	if chat, thread, ok := destForTopic(s.config, 0); ok {
-		tgErr = sendFile(s.config, chat, thread, abs, in.Caption)
-	}
-	if tgErr != nil {
-		return toolErr("offered to phones; Telegram send failed: %v", tgErr), nil, nil
-	}
-	if _, _, ok := destForTopic(s.config, 0); !ok {
-		return text("offered %s to paired phones (no Telegram configured)", filepath.Base(abs)), nil, nil
+	if err := sendFile(s.config, chat, thread, abs, in.Caption); err != nil {
+		return toolErr("Telegram send failed: %v", err), nil, nil
 	}
 	return text("sent %s", filepath.Base(abs)), nil, nil
 }
@@ -792,7 +781,7 @@ func mapQuestionAnswer(q *Question, answer string) (string, bool) {
 
 // applyQuestionAnswer records the answer on q, then the same answer on every
 // similar pending ask whose options can take it. Each resolved row is returned
-// so the caller can tick Telegram and emit hub events. The primary error is
+// so the caller can tick Telegram. The primary error is
 // the only hard failure; siblings are best-effort.
 func applyQuestionAnswer(db *gorm.DB, runner turnRunner, q *Question, answer string) ([]Question, error) {
 	if err := resolveQuestionAnswer(db, runner, q, answer); err != nil {
@@ -838,7 +827,7 @@ func answerQuestion(db *gorm.DB, q *Question, answer string) string {
 }
 
 // resolveQuestionAnswer records the answer, clears waiting, and enqueues the
-// follow-up turn. Shared by Telegram taps/replies and the phone hub.
+// follow-up turn. Shared by Telegram taps and replies.
 func resolveQuestionAnswer(db *gorm.DB, runner turnRunner, q *Question, answer string) error {
 	if q == nil {
 		return fmt.Errorf("unknown question")
