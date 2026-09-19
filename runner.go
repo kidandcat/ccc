@@ -276,6 +276,20 @@ func (r *Runner) interruptActive(botID int64, timedOut bool) bool {
 		}
 	}
 	r.mu.Unlock()
+	return killActiveTurn(at)
+}
+
+// interruptArchived SIGTERMs a running turn because the session was archived
+// mid-turn (archive_bot). It does not set stopped: that would skip the
+// last-message relay, and the owner would only see "session ended".
+func (r *Runner) interruptArchived(botID int64) bool {
+	r.mu.Lock()
+	at := r.active[botID]
+	r.mu.Unlock()
+	return killActiveTurn(at)
+}
+
+func killActiveTurn(at *activeTurn) bool {
 	if at == nil || at.cmd == nil || at.cmd.Process == nil {
 		return false
 	}
@@ -284,6 +298,39 @@ func (r *Runner) interruptActive(botID int64, timedOut bool) bool {
 		_ = at.cmd.Process.Signal(syscall.SIGTERM) // safe-ignore: best-effort fallback when the group kill fails
 	}
 	return true
+}
+
+// archiveWatchInterval is how often spawn checks whether the bot archived
+// itself. Tests shorten it. A tool with no stdout (a hung find) would
+// otherwise block until the engine exited on its own — after archive_bot
+// already told the owner the session ended.
+var archiveWatchInterval = time.Second
+
+func (r *Runner) watchArchive(botID int64, stop <-chan struct{}) {
+	if r == nil || r.db == nil {
+		return
+	}
+	tick := time.NewTicker(archiveWatchInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-tick.C:
+			if botIsArchived(r.db, botID) {
+				r.interruptArchived(botID)
+				return
+			}
+		}
+	}
+}
+
+func botIsArchived(db *gorm.DB, botID int64) bool {
+	if db == nil {
+		return false
+	}
+	b, err := botByID(db, botID)
+	return err == nil && b != nil && b.ArchivedAt != nil
 }
 
 // PlainTurn runs one model call outside any bot (DESIGN §7's memory
@@ -621,6 +668,13 @@ func (r *Runner) execute(b *Bot, t *Turn, input string, triggers []int64) {
 
 		sessionID, resume := r.sessionForTurn(b)
 		res = r.spawn(p, b, t, sessionID, resume, envelope, prog)
+		if botIsArchived(r.db, b.ID) {
+			// archive_bot ended the session. The engine may have been
+			// SIGTERM'd while still tooling; treat as a finished turn so
+			// report_to_general still wakes General.
+			class = ""
+			break
+		}
 		if res.ok() {
 			r.persistSession(b, sessionID, resume, res)
 			class = ""
@@ -1175,7 +1229,11 @@ func (r *Runner) spawn(p Profile, b *Bot, t *Turn, sessionID string, resume bool
 	r.active[b.ID] = &activeTurn{cmd: cmd}
 	r.mu.Unlock()
 
-	if d := chiefTimeoutFor(b); d > 0 {
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go r.watchArchive(b.ID, stopWatch)
+
+	if d := chiefTimeoutFor(b, t); d > 0 {
 		timer := time.AfterFunc(d, func() { r.interruptActive(b.ID, true) })
 		defer timer.Stop()
 	}

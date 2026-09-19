@@ -160,16 +160,20 @@ session's engine. Codex thread-loss text (`thread not loaded` and
 
 ### 3.5 General turn timeout
 
-The dispatcher (topic id 0) has a **60 second cap** on each turn. Other
-sessions do not. When the cap fires, ccc SIGTERMs the engine process
-(without dropping the queue — this is not `/stop`). If this turn already
-`spawn_session` / `tell_session`'d, that is the handoff. Otherwise ccc
-**starts a backend worker itself** (same path as `spawn_session` / `/session`)
-with the **owner's** request (`source=user`) plus a short note that General
-timed out, and the live session card in the DM picks up the new worker.
-Session reports (`source=bot`), watches, schedules and routines are
-not owner work: timing out on those does not auto-spawn and does not inject
-a follow-up (that duplicated turns). A timed-out **relay** report still
+The dispatcher (topic id 0) has a **60 second cap** on **owner** turns
+(`source=user` and the timeout follow-up). Other sessions do not. Session
+reports (`source=bot`), idle nags, watches, schedules and routines are the
+dispatcher's job and are **not** capped: killing those at 60s left the owner
+with only "session ended" while General never summarized. When the cap
+fires, ccc SIGTERMs the engine process (without dropping the queue — this
+is not `/stop`). If this turn already `spawn_session` / `tell_session`'d,
+that is the handoff. Otherwise ccc **starts a backend worker itself** (same
+path as `spawn_session` / `/session`) with the **owner's** request
+(`source=user`) plus a short note that General timed out, and the live
+session card in the DM picks up the new worker.
+Session reports, watches, schedules and routines are not owner work: if
+one still fails (crash, empty reply) it does not auto-spawn and does not
+inject a follow-up (that duplicated turns). A failed **relay** report still
 posts listen's short owner-facing fallback from the worker's last message.
 The owner is never told to `/session`.
 A first timeout of owner work also enqueues a `source=system` turn whose
@@ -308,7 +312,7 @@ home (Codex also gets per-turn `exec -c`). Identity is `--bot`/`--turn` or
 | `list_background` | — | This bot's recent/active jobs: id, status, short summary. |
 | `get_background` | `id` | Status + truncated output for one job. |
 | `cancel_background` | `id` | Best-effort kill (queued → failed; running → SIGTERM). |
-| `archive_bot` | `bot?` (default self) | Mark archived. |
+| `archive_bot` | `bot?` (default self) | Mark archived. Stops the running engine (and its tools) so the turn ends and a pending `report_to_general` still wakes General. |
 | `get_project` / `set_project` | `path`, fields | Read/update the project registry. |
 | `send_file` | `path`, `caption?` | Send a file to the owner in General (≤50 MB; larger → existing relay if kept). |
 | `list_sessions` | — | **General only.** Live workers: name, status, last output. |

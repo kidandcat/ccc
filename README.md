@@ -14,9 +14,10 @@ Antigravity accounts you already pay for. Sessions have no Telegram topic.
 The bot's **1:1 DM is the orchestrator**: you talk to it, it sees
 live sessions, and it can start a backend worker (`spawn_session`) or message
 one (`tell_session`). Sessions live in the backend — no Telegram topic. It
-has a 60s cap — longer work must go to a session. If the cap fires and
-the orchestrator does not spawn, ccc starts the session itself (the owner is never
-asked to `/session`). Idle sessions waiting on
+has a 60s cap on **your** messages — longer work must go to a session. Session
+reports are not under that cap: the orchestrator has to summarize them. If the
+cap fires and the orchestrator does not spawn, ccc starts the session itself
+(the owner is never asked to `/session`). Idle sessions waiting on
 you wake the orchestrator every 10 minutes (inbox, not a chat ping); it decides
 what to do. `/session <prompt>`
 still starts a worker without going through the orchestrator. Sessions report only
@@ -240,7 +241,7 @@ ssh host
 
 | Where | What happens |
 |---|---|
-| Text in the **DM** (orchestrator) | A turn of the orchestrator (60s cap). It sees live sessions and can spawn or tell them. Idle workers waiting on you wake the orchestrator every 10 minutes in its inbox, not as a DM ping. |
+| Text in the **DM** (orchestrator) | A turn of the orchestrator (60s cap on your messages; session reports are not capped). It sees live sessions and can spawn or tell them. Idle workers waiting on you wake the orchestrator every 10 minutes in its inbox, not as a DM ping. |
 | `/session <prompt>` | Starts a backend worker named after the first line, first turn = that prompt. |
 | A photo or document | Saved into the orchestrator's `inbox/`, with the path passed in the message. |
 | A voice note | Transcribed if the `voice` build is installed, else the file path is passed. |

@@ -270,6 +270,9 @@ func TestSystemPromptTeachesBackgroundInsteadOfSpawn(t *testing.T) {
 	if strings.Contains(got, "the owner sees what you report_to_general") {
 		t.Error("workers must not be told that reports land in the owner's chat")
 	}
+	if !strings.Contains(got, "archive_bot last") && !strings.Contains(got, "do not keep using tools") {
+		t.Error("workers must be told to archive last, not keep tooling after archive_bot")
+	}
 }
 
 func TestSystemPromptHasNoWakeDiscipline(t *testing.T) {

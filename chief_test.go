@@ -318,6 +318,9 @@ func TestChiefPromptIsByteStable(t *testing.T) {
 	if !strings.Contains(first, "MUST reply in this DM") {
 		t.Errorf("chief prompt must require a user-visible summary after a worker reports:\n%s", first)
 	}
+	if !strings.Contains(first, "not under the") || !strings.Contains(first, "60s cap") {
+		t.Errorf("chief prompt must say report turns are not 60s-capped:\n%s", first)
+	}
 	if !strings.Contains(first, "every 10 minutes") || !strings.Contains(first, "Do not notify_owner just to repeat the nag") {
 		t.Errorf("chief prompt must teach idle nags are dispatcher-only:\n%s", first)
 	}
@@ -368,14 +371,34 @@ func TestDestForTopic(t *testing.T) {
 }
 
 func TestChiefTimeoutIsSixtySecondsForGeneralOnly(t *testing.T) {
-	if d := chiefTimeoutFor(&Bot{TopicID: 0}); d != 60*time.Second {
+	owner := &Turn{Source: sourceUser, Input: "deploy fecha"}
+	if d := chiefTimeoutFor(&Bot{TopicID: 0}, owner); d != 60*time.Second {
 		t.Errorf("General timeout = %s, want 60s", d)
 	}
-	if d := chiefTimeoutFor(&Bot{TopicID: 1}); d != 0 {
+	if d := chiefTimeoutFor(&Bot{TopicID: 1}, owner); d != 0 {
 		t.Errorf("worker timeout = %s, want none", d)
 	}
-	if d := chiefTimeoutFor(nil); d != 0 {
+	if d := chiefTimeoutFor(nil, owner); d != 0 {
 		t.Errorf("nil bot timeout = %s, want none", d)
+	}
+}
+
+func TestChiefTimeoutSkipsSessionReports(t *testing.T) {
+	chief := &Bot{TopicID: 0}
+	report := &Turn{Source: sourceBot, Input: "Message from nota de voz:\ndone."}
+	if d := chiefTimeoutFor(chief, report); d != 0 {
+		t.Errorf("session report timeout = %s, want none so General can summarize", d)
+	}
+	idle := &Turn{Source: sourceBot, Input: idleRemindText("parked")}
+	if d := chiefTimeoutFor(chief, idle); d != 0 {
+		t.Errorf("idle nag timeout = %s, want none", d)
+	}
+	follow := &Turn{Source: sourceSystem, Input: chiefTimeoutInput()}
+	if d := chiefTimeoutFor(chief, follow); d != 60*time.Second {
+		t.Errorf("timeout follow-up = %s, want 60s", d)
+	}
+	if d := chiefTimeoutFor(chief, nil); d != 60*time.Second {
+		t.Errorf("unknown General turn = %s, want 60s (fail closed)", d)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -75,8 +76,14 @@ func runMCPServer(args []string) error {
 
 	server := mcp.NewServer(&mcp.Implementation{Name: "ccc", Version: version}, nil)
 	s.register(server)
+	mcpProcess = true
 	return server.Run(context.Background(), &mcp.StdioTransport{})
 }
+
+// mcpProcess is true only inside `ccc mcp` (listen's per-turn subprocess).
+// archive_bot tests construct mcpServer directly; they must not SIGTERM the
+// test process group.
+var mcpProcess bool
 
 // text is the standard single-text-block tool result.
 func text(format string, args ...any) *mcp.CallToolResult {
@@ -1234,7 +1241,25 @@ func (s *mcpServer) archiveBot(_ context.Context, _ *mcp.CallToolRequest, in arc
 		return toolErr("could not archive: %v", err), nil, nil
 	}
 	s.post(0, "📦 Session <b>"+htmlEscape(target.Name)+"</b> ended. Memories are kept.")
+	if target.ID == s.botID && mcpProcess {
+		// Stop the engine (and its tools) so this turn actually ends and
+		// report_to_general can wake General. listen also watches archived_at.
+		go terminateSelfProcessGroup()
+	}
 	return text("archived %s", target.Name), nil, nil
+}
+
+// terminateSelfProcessGroup SIGTERMs the engine process group this MCP
+// server lives in (listen starts each turn with Setpgid). A short delay lets
+// the tool result reach the model and the Telegram "session ended" post
+// finish; listen's archive watcher is the backup if this does not fire.
+func terminateSelfProcessGroup() {
+	time.Sleep(150 * time.Millisecond)
+	pgid, err := syscall.Getpgid(0)
+	if err != nil || pgid <= 1 {
+		return
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGTERM) // safe-ignore: listen's watcher also kills
 }
 
 func (s *mcpServer) getProject(_ context.Context, _ *mcp.CallToolRequest, in getProjectIn) (*mcp.CallToolResult, any, error) {

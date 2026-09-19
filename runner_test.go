@@ -328,6 +328,108 @@ func TestInterruptActiveTimesOutWithoutLookingLikeStop(t *testing.T) {
 	}
 }
 
+func TestInterruptArchivedDoesNotLookLikeStop(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // safe-ignore: test teardown
+
+	r := &Runner{active: map[int64]*activeTurn{}}
+	r.active[1] = &activeTurn{cmd: cmd}
+	if !r.interruptArchived(1) {
+		t.Fatal("archive should have signalled the process")
+	}
+	at := r.active[1]
+	if at.stopped || at.timedOut {
+		t.Error("archive must not look like /stop or a 60s timeout (that skips the owner relay)")
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("archived process did not exit")
+	}
+}
+
+func TestWatchArchiveKillsRunningTurn(t *testing.T) {
+	in, _, _ := testInstance(t)
+	w, err := in.createBot("hung-find", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // safe-ignore: test teardown
+
+	prev := archiveWatchInterval
+	archiveWatchInterval = 20 * time.Millisecond
+	defer func() { archiveWatchInterval = prev }()
+
+	r := newRunner(in.db, in.cfg, nil)
+	r.active[w.ID] = &activeTurn{cmd: cmd}
+	stop := make(chan struct{})
+	defer close(stop)
+	go r.watchArchive(w.ID, stop)
+
+	if err := archiveBotRow(in.db, w.ID); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchArchive did not kill the archived session's engine")
+	}
+}
+
+func TestArchivedWorkerStillDeliversRelay(t *testing.T) {
+	in, _, _ := testInstance(t)
+	chief, err := in.ensureGeneralBot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := in.createBot("ccc voice transcribe", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := &fakeUI{}
+	r := newRunner(in.db, in.cfg, ui)
+	s := &mcpServer{db: in.db, config: in.cfg, botID: w.ID}
+	if res, _, err := s.reportToGeneral(t.Context(), nil, reportToGeneralIn{Text: "Sí es capacidad de CCC."}); err != nil || res.IsError {
+		t.Fatalf("report: %+v %v", res, err)
+	}
+	if res, _, err := s.archiveBot(t.Context(), nil, archiveBotIn{}); err != nil || res.IsError {
+		t.Fatalf("archive: %+v %v", res, err)
+	}
+	if !botIsArchived(in.db, w.ID) {
+		t.Fatal("worker should be archived")
+	}
+	// Same footer execute runs after spawn sees the archive: do not skip
+	// last-message relay, and deliver the pending report.
+	r.ensureWorkerRelayToGeneral(w, "", false, "")
+	r.deliverInbox(w.ID)
+
+	var genTurns []Turn
+	in.db.Where("bot_id = ? AND source = ?", chief.ID, sourceBot).Find(&genTurns)
+	if len(genTurns) != 1 {
+		t.Fatalf("General turns = %d, want the relay wake", len(genTurns))
+	}
+	var inbox InboxMessage
+	if err := in.db.Where("turn_id = ?", genTurns[0].ID).First(&inbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !inbox.Relay || !strings.Contains(inbox.Text, "capacidad de CCC") {
+		t.Fatalf("relay inbox = %+v", inbox)
+	}
+}
+
 func TestStopDropsTheQueue(t *testing.T) {
 	in, _, _ := testInstance(t)
 	b, err := in.createBot("stopper", "")

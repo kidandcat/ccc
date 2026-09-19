@@ -46,8 +46,14 @@ const (
 	idleRemindInterval = 10 * time.Minute
 )
 
-func chiefTimeoutFor(b *Bot) time.Duration {
+func chiefTimeoutFor(b *Bot, t *Turn) time.Duration {
 	if !isGeneralBot(b) {
+		return 0
+	}
+	// The cap is for owner work. Session reports, idle nags, watches and
+	// schedules are the dispatcher's job: killing them at 60s left the owner
+	// with only "session ended" while General never summarized.
+	if t != nil && t.Source != sourceUser && !isChiefTimeoutFollowUp(t.Input) {
 		return 0
 	}
 	return chiefTurnTimeout
