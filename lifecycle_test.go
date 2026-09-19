@@ -202,8 +202,8 @@ func TestRecoverAfterRestartResumesLiveBackgroundJob(t *testing.T) {
 	if job.Status != jobRunning {
 		t.Fatalf("live job marked %q error=%q", job.Status, job.Error)
 	}
-	if len(runner.enqueued) != 0 {
-		t.Fatalf("resuming a live job must not wake the bot: %+v", runner.enqueued)
+	if queued := runner.queued(); len(queued) != 0 {
+		t.Fatalf("resuming a live job must not wake the bot: %+v", queued)
 	}
 	got, ok := sendContaining(api, "Resumed")
 	if !ok {
