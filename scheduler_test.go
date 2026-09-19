@@ -18,6 +18,7 @@ func testScheduler(t *testing.T) (*scheduler, *instance, *fakeRunner, *fakeBotAP
 	in, runner, api := testInstance(t)
 	s := newScheduler(in)
 	in.sched = s
+	t.Cleanup(s.Close)
 	return s, in, runner, api
 }
 

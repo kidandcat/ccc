@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,13 +24,29 @@ const maxResponseSize = 10 * 1024 * 1024 // 10MB
 // cap is 4096; the slack absorbs the tags splitTelegramHTML has to reopen.
 const telegramChunkLimit = 4000
 
-// telegramBaseURL is the Bot API root. It is a variable so tests can point the
-// whole Telegram surface at an httptest server; production never changes it.
-var telegramBaseURL = "https://api.telegram.org"
+// telegramBaseURL is the Bot API root. Tests point the whole Telegram
+// surface at an httptest server. Leftover goroutines must not race the
+// restore, so the value is stored atomically.
+var telegramBaseURL atomic.Value
+
+func init() {
+	setTelegramBaseURL("https://api.telegram.org")
+}
+
+func setTelegramBaseURL(u string) {
+	telegramBaseURL.Store(u)
+}
+
+func telegramBase() string {
+	if v, ok := telegramBaseURL.Load().(string); ok && v != "" {
+		return v
+	}
+	return "https://api.telegram.org"
+}
 
 // telegramURL builds a Bot API method URL.
 func telegramURL(token, method string) string {
-	return fmt.Sprintf("%s/bot%s/%s", telegramBaseURL, token, method)
+	return fmt.Sprintf("%s/bot%s/%s", telegramBase(), token, method)
 }
 
 // redactTokenError replaces the bot token in error messages with "***"
@@ -520,7 +537,7 @@ func downloadTelegramFile(config *Config, fileID string, destPath string) error 
 	}
 
 	// Download the file
-	fileURL := fmt.Sprintf("%s/file/bot%s/%s", telegramBaseURL, config.BotToken, result.Result.FilePath)
+	fileURL := fmt.Sprintf("%s/file/bot%s/%s", telegramBase(), config.BotToken, result.Result.FilePath)
 	fileResp, err := telegramGet(config.BotToken, fileURL)
 	if err != nil {
 		return err

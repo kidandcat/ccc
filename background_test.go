@@ -317,6 +317,11 @@ func TestReattachDeadPIDWithoutExitFileFailsAndWakes(t *testing.T) {
 	if len(runner.enqueued) != 1 || runner.enqueued[0].Source != sourceBackground {
 		t.Fatalf("orphan wakeup = %+v", runner.enqueued)
 	}
+	// Status is written before notifyBot; wait for the ping, not just the row.
+	waitUntil(t, 2*time.Second, func() bool {
+		_, ok := sendContaining(api, "Background job")
+		return ok
+	})
 	ping, ok := sendContaining(api, "Background job")
 	if !ok {
 		t.Fatalf("a job that died while listen was down must ping, texts=%v", api.texts(""))

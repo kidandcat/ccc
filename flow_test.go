@@ -58,10 +58,10 @@ func newFakeBotAPI(t *testing.T) *fakeBotAPI {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, body)
 	}))
-	old := telegramBaseURL
-	telegramBaseURL = f.URL
+	old := telegramBase()
+	setTelegramBaseURL(f.URL)
 	t.Cleanup(func() {
-		telegramBaseURL = old
+		setTelegramBaseURL(old)
 		f.Close()
 	})
 	return f
