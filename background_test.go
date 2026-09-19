@@ -196,10 +196,7 @@ func TestBackgroundJobWakesTheBotOnFailure(t *testing.T) {
 	if !strings.Contains(runner.enqueued[0].Text, "failed") || !strings.Contains(runner.enqueued[0].Text, "Exit code: 7") {
 		t.Errorf("failure wakeup:\n%s", runner.enqueued[0].Text)
 	}
-	ping, ok := sendContaining(api, "Background job")
-	if !ok {
-		t.Fatalf("failed job must ping Telegram, texts=%v", api.texts(""))
-	}
+	ping := waitSendContaining(t, api, "Background job")
 	if ping.Params.Get("disable_notification") == "true" {
 		t.Fatal("the failure ping must notify")
 	}
@@ -317,15 +314,7 @@ func TestReattachDeadPIDWithoutExitFileFailsAndWakes(t *testing.T) {
 	if len(runner.enqueued) != 1 || runner.enqueued[0].Source != sourceBackground {
 		t.Fatalf("orphan wakeup = %+v", runner.enqueued)
 	}
-	// Status is written before notifyBot; wait for the ping, not just the row.
-	waitUntil(t, 2*time.Second, func() bool {
-		_, ok := sendContaining(api, "Background job")
-		return ok
-	})
-	ping, ok := sendContaining(api, "Background job")
-	if !ok {
-		t.Fatalf("a job that died while listen was down must ping, texts=%v", api.texts(""))
-	}
+	ping := waitSendContaining(t, api, "Background job")
 	if ping.Params.Get("disable_notification") == "true" {
 		t.Fatal("the orphan failure ping must notify")
 	}
