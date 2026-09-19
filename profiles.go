@@ -26,8 +26,10 @@ import (
 // (auth.json). An Antigravity profile is an isolated HOME so ~/.gemini stays
 // off the real user home and off Claude's config dirs.
 //
-// Claude profiles of an instance still share projects/ (DESIGN §4) so failover
-// can resume the same conversation UUID. Failover stays inside one engine.
+// Claude profiles of an instance still share projects/ (DESIGN §4) so
+// same-engine failover can resume the same conversation UUID. When that
+// engine's pool is exhausted, execute failovers to another configured engine
+// with a fresh conversation (transcripts are per CLI).
 //
 // Verified against Claude Code 2.1.270. Grok isolation is the documented
 // GROK_HOME. Antigravity has no official profile selector; isolation is HOME +
@@ -1053,9 +1055,14 @@ func betterProfile(a, b profileStat) bool {
 }
 
 // pickSpawnEngine is the engine a new worker joins: the account with the most
-// 5-hour headroom (usagefetch cache, then disk), across engines. Unknown usage
-// falls back to defaultEngine so a cold cache does not reshuffle every spawn.
-// A running turn still failovers only inside its engine (DESIGN §4).
+// 5-hour headroom (usagefetch cache, then disk), across every configured
+// engine. A cold cache (no usage snapshot at all) falls back to defaultEngine
+// so the first spawn of a new install is stable. Once any account has numbers,
+// an engine whose usage is still unknown is treated as idle — otherwise a
+// configured Codex/Grok account is starved by the default Claude profile at
+// 42% while the unused engine sits at unknownUtilization (50). Antigravity
+// n/a stays unknown so it does not steal spawns. A running turn may still
+// failover across engines when its pool is exhausted (DESIGN §4).
 func pickSpawnEngine(db *gorm.DB, cfg *Config) string {
 	def := defaultEngine(cfg)
 	now := time.Now()
@@ -1070,7 +1077,7 @@ func pickSpawnEngine(db *gorm.DB, cfg *Config) string {
 	if !spawnUsageKnown(stats) {
 		return def
 	}
-	name := chooseProfile(stats, now)
+	name := chooseProfile(spawnStatsAssumeIdleUnknown(stats), now)
 	if p, ok := profileByKey(cfg, name); ok {
 		return profileEngine(p)
 	}
@@ -1084,6 +1091,49 @@ func spawnUsageKnown(stats []profileStat) bool {
 		}
 	}
 	return false
+}
+
+// spawnStatsAssumeIdleUnknown copies stats so chooseProfile can run on them
+// without mutating the caller's slice. Unknown usage (fetch miss, no disk
+// cache) becomes 0% so a configured but unused engine is not ignored; a
+// structural n/a (Antigravity, API-key Codex) is left at unknownUtilization.
+func spawnStatsAssumeIdleUnknown(stats []profileStat) []profileStat {
+	out := make([]profileStat, len(stats))
+	copy(out, stats)
+	for i := range out {
+		if out[i].Usage.Unavailable != "" {
+			continue
+		}
+		if out[i].Usage.FiveHourKnown || out[i].Usage.SevenDayKnown || len(out[i].Usage.Windows) > 0 {
+			continue
+		}
+		out[i].FiveHour = 0
+		out[i].SevenDay = 0
+	}
+	return out
+}
+
+// nextEngineByHeadroom picks a configured engine that is not in exclude, using
+// the same 5-hour policy as spawn. Empty when every configured engine has
+// already been tried (the current turn then fails rather than inventing an
+// implicit CLI the owner never added).
+func nextEngineByHeadroom(cfg *Config, working map[string]int, exclude map[string]bool) (string, bool) {
+	now := time.Now()
+	var open []profileStat
+	for _, s := range collectProfileStats(cfg, working, now) {
+		if exclude[s.Engine] {
+			continue
+		}
+		open = append(open, s)
+	}
+	if len(open) == 0 {
+		return "", false
+	}
+	name := chooseProfile(spawnStatsAssumeIdleUnknown(open), now)
+	if p, ok := profileByKey(cfg, name); ok {
+		return profileEngine(p), true
+	}
+	return "", false
 }
 
 // ---------------------------------------------------------------------------

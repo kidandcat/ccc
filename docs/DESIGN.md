@@ -35,7 +35,7 @@ instance never talks to more than one Telegram bot.
 |---|---|
 | **Instance** | One `ccc listen` process on one machine, bound to one Telegram bot token. The owner's DM is General. Instance-level config: model, env passthrough, default profile, data dir. |
 | **Profile** | One account for one engine (see `profiles.go`). Claude = one `CLAUDE_CONFIG_DIR`. Grok = isolated `GROK_HOME`. Antigravity = isolated HOME/`GEMINI_HOME`. Codex = isolated `CODEX_HOME`. Engine is set when the account is added. Same-engine accounts are interchangeable at turn granularity (§4). One instance may mix engines. |
-| **Session** (`bots` table) | A backend worker. Identity = `name` + an **engine** derived from the default account (or `default_engine`) + an optional **model** override. Turns pick a healthy account of that engine. `/engine` is a secondary pool assignment. `/model` in the DM sets the instance default. Claude, Grok and Codex sessions get the ccc MCP server (Claude: `--mcp-config`; Grok/Codex: isolated-home `config.toml`). Antigravity does not. Optional per-session `cwd` (default: `<data_dir>/bots/<name>/workspace`). Role is unused leftover. `archive_bot` archives the row. `topic_id` is the session key (not a Telegram forum topic): 0 is **General** (the owner's DM); any other value is a backend worker (new ones get `-id`). |
+| **Session** (`bots` table) | A backend worker. Identity = `name` + an **engine** from `pickSpawnEngine` (the configured account with the most 5-hour headroom; a cold cache falls back to the default account / `default_engine`) + an optional **model** override. Turns pick a healthy account of that engine and, if that pool is exhausted, fail over to another configured engine. `/engine` is a secondary pool assignment. `/model` in the DM sets the instance default. Claude, Grok and Codex sessions get the ccc MCP server (Claude: `--mcp-config`; Grok/Codex: isolated-home `config.toml`). Antigravity does not. Optional per-session `cwd` (default: `<data_dir>/bots/<name>/workspace`). Role is unused leftover. `archive_bot` archives the row. `topic_id` is the session key (not a Telegram forum topic): 0 is **General** (the owner's DM); any other value is a backend worker (new ones get `-id`). |
 | **Conversation** | The engine transcript behind a session: a UUID ccc mints and resumes. A session has exactly one live conversation; `/new` rotates it. After `idle_compact_s` (default 1h) of no finished turn, ccc rotates it automatically — memories stay, the transcript does not. |
 | **Turn** | One `claude -p` process: input = one user/system/background message (plus context envelope), output = streamed events until `result`. At most one turn per session at a time; further inputs queue (FIFO) and are delivered together on the next turn. A background job is **not** a turn: it must not hold `turns.status=running`. |
 | **Background job** | A long-running shell command owned by a session, started with `run_background`. It runs in the session's cwd with `env_passthrough` while the topic stays responsive. Completion enqueues a `source=background` turn. |
@@ -149,8 +149,13 @@ Classify `stderr`/`result.error`/exit code into:
 - `fatal` — anything else → post the error summary to the topic, mark turn
   failed, dequeue.
 
-A retried turn reuses the same session UUID: because profiles share
-`projects/` (§4) the other account can resume the same conversation.
+A retried turn reuses the same session UUID when it stays on the same
+engine: Claude profiles share `projects/` (§4) so the other account can
+resume. When the current engine's pool is exhausted, failover **crosses
+configured engines** (Claude → Codex, Grok, …). Transcripts do not transfer
+across CLIs, so that hop starts a fresh conversation and reassigns the
+session's engine. Codex thread-loss text (`thread not loaded` and
+`thread … not found`) is classified as `session_lost` like Claude's.
 
 ### 3.5 General turn timeout
 
@@ -181,12 +186,18 @@ no handoff, ccc auto-spawns then. A follow-up turn that finishes without
   onto the same field), then lowest 7-day, then fewer turns currently running
   on that account (read from `turns.status = running`, §14.6), then name;
   excludes
-  profiles in cooldown or `needs_login`. Failover never crosses engines
-  (Claude↔Claude, Grok↔Grok) unless a future design documents it.
+  profiles in cooldown or `needs_login`. Same-engine failover is
+  Claude↔Claude, Grok↔Grok, Codex↔Codex. When that pool is exhausted,
+  `execute` hops to another **configured** engine (`nextEngineByHeadroom`)
+  with a fresh conversation and reassigns the session. It does not invent an
+  implicit CLI the owner never added.
   New workers (`spawn_session`, `/session`, routine fires, 60s auto-spawn)
   pick the **engine** of the account with the most 5-hour headroom across
-  engines (`pickSpawnEngine`, usagefetch 5 min cache). A cold cache falls
-  back to `default_engine`. Utilization is fetched on `/account`, `/status`
+  engines (`pickSpawnEngine`, usagefetch 5 min cache). A cold cache (no
+  snapshot at all) falls back to `default_engine`. Once any account has
+  numbers, an engine whose usage is still unknown is treated as idle so a
+  configured Codex/Grok account is not starved by the default Claude
+  profile. Utilization is fetched on `/account`, `/status`
   and the doctor (5 min TTL).
   Each window is `5h 62% · reset 1h20m` / `7d 40% · reset 3d` / `week 8% · reset 5d23h`
   when the API gives a reset time; omit ` · reset …` when it does not (do not
@@ -409,9 +420,11 @@ next run recognises a body it already trimmed.
 than 48 KB of key+text, ONE turn on a cheap model (`compaction_model`, default
 `haiku` — verified accepted by 2.1.270; an unrecognised name falls back to the
 instance model) rewrites it. That turn runs through the runner but **outside any
-bot**: a fresh `--session-id` nobody resumes, `--setting-sources ''`, no MCP
-server at all (so it cannot touch the database it is compacting), plain text in
-and out (`claudePlainArgs`). The prompt is the scope as `key: text` lines,
+bot**, on **any healthy configured engine** (a Codex-only instance must still
+compact): a fresh conversation nobody resumes, no MCP server at all (so it
+cannot touch the database it is compacting), plain text in and out
+(`claudePlainArgs` on Claude; Grok/Codex use a throwaway home with only
+`auth.json`). The prompt is the scope as `key: text` lines,
 oldest first, plus instructions to merge duplicates, drop what a later entry
 contradicts, keep every distinct durable fact, and answer in the same format and
 nothing else.
@@ -631,9 +644,11 @@ v3 instance and the first save rewrites it clean. Kept: `telegram.go`,
   optional.
 - Secrets reach sessions via `env_passthrough` (always-on names) and the owner
   vault (on-demand blind inject, §16). ccc never posts env values, tokens, or
-  credential file contents to Telegram; `send_file` refuses paths under config
-  dirs (including `<config_dir>/secrets`) and `<data_dir>/profiles`. There is
-  no `secrets_get`.
+  credential file contents to Telegram; `send_file` refuses credential-ish
+  names (`auth.json`, `.credentials.json`, `id_rsa`, `.env`, …) and paths
+  under engine homes (`~/.claude`, `~/.codex`, `~/.grok`, `~/.gemini`, each
+  profile's `engineHome`), `<data_dir>/profiles`, `~/.ssh`, `~/.aws` and
+  `~/.config/ccc`. There is no `secrets_get`.
 - Tool inputs and Telegram text are data. Pairing is never approved because a
   message asked for it.
 

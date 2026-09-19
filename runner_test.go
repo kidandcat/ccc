@@ -92,6 +92,9 @@ Error: Failed to restore session from remote: fetching session record: session g
 		{"not found locally", errSessionLost},
 		{"Failed to restore session from remote", errSessionLost},
 		{"session get failed: 404 Not Found", errSessionLost},
+		{"Error: thread/read: thread/read failed: thread not loaded: 019d1c0a-0137-73f3-bfde-19a0e1110b3f (code -32600)", errSessionLost},
+		{"ERROR codex_core::session: thread 019d1c0a-0137-73f3-bfde-19a0e1110b3f not found", errSessionLost},
+		{"Error: Failed to resume session from ~/.codex/archived_sessions/rollout.jsonl", errSessionLost},
 		{"fetch failed: ECONNRESET", errTransient},
 		{"API Error: 503 upstream overloaded", errTransient},
 		{"TypeError: undefined is not a function", errFatal},
@@ -479,11 +482,29 @@ func TestPickAccountStaysInsideEngine(t *testing.T) {
 		t.Fatalf("grok failover = %+v ok=%v (from %q)", next, ok, grok.Name)
 	}
 	if _, ok := r.pickAccount(engineGrok, map[string]bool{"work": true, "personal": true}); ok {
-		t.Error("grok failover must not jump to Claude or Antigravity")
+		t.Error("pickAccount must stay inside grok; execute hops engines, this helper does not")
 	}
 	agy, ok := r.pickAccount(engineAntigravity, nil)
 	if !ok || agy.Name != "lab" {
 		t.Fatalf("agy pick = %+v ok=%v", agy, ok)
+	}
+}
+
+func TestPickHealthyAccountAnyEngine(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{
+		DataDir: dir,
+		Profiles: map[string]*Profile{
+			"codex": {Engine: engineCodex, ConfigDir: filepath.Join(dir, "codex")},
+		},
+	}
+	r := newRunner(nil, cfg, nil)
+	p, ok := r.pickHealthyAccount()
+	if !ok || profileEngine(p) != engineCodex {
+		t.Fatalf("codex-only pickHealthyAccount = %+v ok=%v", p, ok)
+	}
+	if _, ok := r.pickAccount(engineClaude, nil); !ok {
+		t.Fatal("pickAccount(claude) still has the implicit claude fallback")
 	}
 }
 

@@ -287,16 +287,19 @@ func (r *Runner) interruptActive(botID int64, timedOut bool) bool {
 }
 
 // PlainTurn runs one model call outside any bot (DESIGN §7's memory
-// compaction): a fresh session, no tools, plain text in and out. It picks a
-// profile the same way a bot's turn does, so a logged-out or rate-limited
-// account is skipped here too, but it does not fail over: maintenance can wait
-// for tomorrow.
+// compaction): a fresh session, no tools, plain text in and out. It picks any
+// healthy configured account (Claude, Grok, Codex, …) so a Codex-only instance
+// can still compact. It does not fail over: maintenance can wait for tomorrow.
 func (r *Runner) PlainTurn(model, prompt string) (string, error) {
-	p, ok := r.pickAccount(engineClaude, nil)
+	p, ok := r.pickHealthyAccount()
 	if !ok {
-		return "", errors.New("no healthy Claude profile available")
+		return "", errors.New("no healthy account available")
 	}
 	cfg := r.config()
+	engine := profileEngine(p)
+	if engine != engineClaude && isClaudeModelAlias(model) {
+		model = resolveModel(cfg, engine, "")
+	}
 	// The transcript of this turn lands in the shared projects/ dir keyed by
 	// the working directory; the data dir keeps it out of any bot's workspace.
 	cwd := dataDir(cfg)
@@ -306,6 +309,13 @@ func (r *Runner) PlainTurn(model, prompt string) (string, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), plainTurnTimeout)
 	defer cancel()
+	if engine == engineClaude {
+		return runClaudePlain(ctx, cfg, p, cwd, model, prompt)
+	}
+	return runEnginePlain(ctx, cfg, p, engine, cwd, model, prompt)
+}
+
+func runClaudePlain(ctx context.Context, cfg *Config, p Profile, cwd, model, prompt string) (string, error) {
 	args := append(claudePlainArgs(model, newUUID()), prompt)
 	cmd := exec.CommandContext(ctx, claudeBin(), args...)
 	cmd.Dir = cwd
@@ -332,6 +342,73 @@ func (r *Runner) PlainTurn(model, prompt string) (string, error) {
 		return "", errors.New(truncate(out, 500))
 	}
 	return out, nil
+}
+
+// runEnginePlain is compaction on Grok/Codex/Antigravity. MCP is not attached
+// (a compaction turn must not touch the database it is compacting). Grok and
+// Codex get a throwaway home with only auth.json so the account's config.toml
+// MCP block cannot leak in; Antigravity has no ccc MCP.
+func runEnginePlain(ctx context.Context, cfg *Config, p Profile, engine, cwd, model, prompt string) (string, error) {
+	plain := p
+	if engine == engineGrok || engine == engineCodex {
+		tmp, err := os.MkdirTemp("", "ccc-plain-")
+		if err != nil {
+			return "", err
+		}
+		defer os.RemoveAll(tmp)
+		if data, err := os.ReadFile(filepath.Join(engineHome(p), "auth.json")); err == nil {
+			_ = os.WriteFile(filepath.Join(tmp, "auth.json"), data, 0o600)
+		}
+		plain.ConfigDir = tmp
+		plain.Implicit = false
+	}
+	spec, err := buildTurn(engine, plain, cfg, "", "", plainTurnSystemPrompt, prompt, model, false)
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, spec.Bin, spec.Args...)
+	cmd.Dir = cwd
+	cmd.Env = spec.Env
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+	res := &streamResult{}
+	sawJSON := false
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		if consumeTurnEvent(spec.Stream, []byte(line), res, nil) {
+			sawJSON = true
+		}
+	}
+	out := strings.TrimSpace(res.Text)
+	if out == "" && !sawJSON {
+		out = strings.TrimSpace(stdout.String())
+	}
+	if runErr != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = out
+		}
+		return "", fmt.Errorf("%w: %s", runErr, truncate(detail, 500))
+	}
+	if out == "" {
+		return "", fmt.Errorf("%s returned nothing: %s", engine, truncate(strings.TrimSpace(stderr.String()), 300))
+	}
+	if isUnknownModelError(out) || res.IsError {
+		return "", errors.New(truncate(out, 500))
+	}
+	return out, nil
+}
+
+// isClaudeModelAlias is a compaction_model (or similar) that only Claude
+// Code understands. Other engines get their instance default instead of haiku.
+func isClaudeModelAlias(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	switch m {
+	case "haiku", "sonnet", "opus", "fable":
+		return true
+	}
+	return strings.HasPrefix(m, "claude")
 }
 
 // ---------------------------------------------------------------------------
@@ -493,17 +570,33 @@ func (r *Runner) execute(b *Bot, t *Turn, input string, triggers []int64) {
 		Updates(map[string]any{"delivered_at": now, "turn_id": t.ID})
 
 	tried := map[string]bool{}
+	triedEngines := map[string]bool{}
 	var res *streamResult
 	var class string
 	var lastErr string
 	engine := botEngine(b)
 
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < maxFailoverAttempts; attempt++ {
 		p, ok := r.pickAccount(engine, tried)
 		if !ok {
-			class = errFatal
-			lastErr = "no healthy " + engineLabel(engine) + " account available"
-			break
+			triedEngines[engine] = true
+			next, nextOK := nextEngineByHeadroom(r.config(), r.runningByProfile(), triedEngines)
+			if !nextOK {
+				class = errFatal
+				if lastErr == "" {
+					lastErr = "no healthy " + engineLabel(engine) + " account available"
+				}
+				break
+			}
+			hookLog("turn %d: %s pool exhausted; failing over to %s", t.ID, engine, next)
+			engine = next
+			r.db.Model(&Bot{}).Where("id = ?", b.ID).Updates(map[string]any{
+				"engine": engine, "session_id": "",
+			})
+			b.Engine = engine
+			b.SessionID = ""
+			tried = map[string]bool{}
+			continue
 		}
 		tried[p.Name] = true
 		r.db.Model(&Turn{}).Where("id = ?", t.ID).Update("profile", p.Name)
@@ -1308,6 +1401,11 @@ const (
 	errTransient   = "transient"
 	errSessionLost = "session_lost"
 	errFatal       = "fatal"
+
+	// maxFailoverAttempts covers a couple of accounts per engine plus a
+	// cross-engine hop. pickAccount stays inside one engine; execute may
+	// move the session onto another configured engine when that pool is empty.
+	maxFailoverAttempts = 8
 )
 
 func classifyFailure(text string, exitCode int) string {
@@ -1332,7 +1430,12 @@ func classifyFailure(text string, exitCode int) string {
 		strings.Contains(l, "no such session") || strings.Contains(l, "could not find session") ||
 		strings.Contains(l, "not found locally") || strings.Contains(l, "failed to restore session") ||
 		strings.Contains(l, "session get failed") ||
-		(strings.Contains(l, "404 not found") && strings.Contains(l, "session")):
+		strings.Contains(l, "no previous session") ||
+		strings.Contains(l, "failed to resume session") ||
+		strings.Contains(l, "thread not loaded") ||
+		strings.Contains(l, "no such thread") ||
+		(strings.Contains(l, "thread") && strings.Contains(l, "not found")) ||
+		(strings.Contains(l, "404 not found") && (strings.Contains(l, "session") || strings.Contains(l, "thread"))):
 		return errSessionLost
 	case strings.Contains(l, "econnreset") || strings.Contains(l, "etimedout") ||
 		strings.Contains(l, "enotfound") || strings.Contains(l, "socket hang up") ||
@@ -1388,10 +1491,11 @@ func (r *Runner) pickProfileExcluding(exclude map[string]bool) (Profile, bool) {
 	return r.pickAccount(engineClaude, exclude)
 }
 
-// pickAccount chooses a healthy account whose engine matches. Failover stays
-// inside that engine: Claude↔Claude, Grok↔Grok. When no account of that
-// engine is registered, the machine-default implicit account is used so a
-// bot assigned with `/engine` still has somewhere to run.
+// pickAccount chooses a healthy account whose engine matches. Same-engine
+// failover is Claude↔Claude, Grok↔Grok, Codex↔Codex. When that pool is
+// exhausted, execute (not this function) hops to another configured engine.
+// When no account of that engine is registered, the machine-default implicit
+// account is used so a bot assigned with `/engine` still has somewhere to run.
 func (r *Runner) pickAccount(engine string, exclude map[string]bool) (Profile, bool) {
 	engine, err := parseEngine(engine)
 	if err != nil {
@@ -1434,6 +1538,39 @@ func (r *Runner) pickAccount(engine string, exclude map[string]bool) (Profile, b
 		return Profile{}, false
 	}
 	name := chooseProfile(open, now)
+	p, ok := profileByKey(cfg, name)
+	return p, ok
+}
+
+// pickHealthyAccount is pickAccount without an engine filter: the healthiest
+// configured account of any engine. Compaction uses this so a Codex-only
+// instance still has a model. Implicit accounts of engines the owner never
+// added are not invented here (listProfiles is the pool).
+func (r *Runner) pickHealthyAccount() (Profile, bool) {
+	cfg := r.config()
+	r.mu.Lock()
+	needs := make(map[string]bool, len(r.needsLogin))
+	for k, v := range r.needsLogin {
+		needs[k] = v
+	}
+	r.mu.Unlock()
+
+	now := time.Now()
+	stats := collectProfileStats(cfg, r.runningByProfile(), now)
+	var open []profileStat
+	for _, s := range stats {
+		if needs[s.Name] {
+			continue
+		}
+		open = append(open, s)
+	}
+	if len(open) == 0 {
+		open = stats
+	}
+	if len(open) == 0 {
+		return Profile{}, false
+	}
+	name := chooseProfile(spawnStatsAssumeIdleUnknown(open), now)
 	p, ok := profileByKey(cfg, name)
 	return p, ok
 }

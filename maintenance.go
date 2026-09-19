@@ -371,7 +371,10 @@ func isUnknownModelError(text string) bool {
 	l := strings.ToLower(text)
 	return strings.Contains(l, "unrecognized_model") ||
 		strings.Contains(l, "model catalog") ||
-		strings.Contains(l, "issue with the selected model")
+		strings.Contains(l, "issue with the selected model") ||
+		strings.Contains(l, "unknown model") ||
+		strings.Contains(l, "invalid model") ||
+		strings.Contains(l, "model not found")
 }
 
 // renderCompactionPrompt is the whole input of a compaction turn: the scope's

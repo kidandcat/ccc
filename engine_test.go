@@ -785,6 +785,58 @@ func TestCreateBotPicksEngineWithMostHeadroom(t *testing.T) {
 	}
 }
 
+func TestCreateBotDoesNotStarveUnusedEngine(t *testing.T) {
+	in, _, _ := testInstance(t)
+	usageMemClear()
+	t.Cleanup(usageMemClear)
+	dir := t.TempDir()
+	in.cfg.DefaultEngine = ""
+	in.cfg.DefaultProfile = "you@example.com"
+	in.cfg.Profiles = map[string]*Profile{
+		"you@example.com": {Engine: engineClaude, ConfigDir: filepath.Join(dir, "claude")},
+		"codex":           {Engine: engineCodex, ConfigDir: filepath.Join(dir, "codex")},
+	}
+	for _, p := range listProfiles(in.cfg) {
+		if profileEngine(p) == engineClaude {
+			usageMemPut(p, profileUsage{FiveHour: 42, FiveHourKnown: true, SevenDay: 42, SevenDayKnown: true})
+		}
+	}
+	b, err := in.createBot("from-unused-codex", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if botEngine(b) != engineCodex {
+		t.Errorf("engine = %q, want codex (unknown unused engine must not lose to claude at 42%%)", b.Engine)
+	}
+}
+
+func TestNextEngineByHeadroomCrossesEngines(t *testing.T) {
+	usageMemClear()
+	t.Cleanup(usageMemClear)
+	dir := t.TempDir()
+	cfg := &Config{
+		Profiles: map[string]*Profile{
+			"you@example.com": {Engine: engineClaude, ConfigDir: filepath.Join(dir, "claude")},
+			"codex":           {Engine: engineCodex, ConfigDir: filepath.Join(dir, "codex")},
+		},
+	}
+	for _, p := range listProfiles(cfg) {
+		switch profileEngine(p) {
+		case engineClaude:
+			usageMemPut(p, profileUsage{FiveHour: 90, FiveHourKnown: true})
+		case engineCodex:
+			usageMemPut(p, profileUsage{FiveHour: 0, FiveHourKnown: true})
+		}
+	}
+	got, ok := nextEngineByHeadroom(cfg, nil, map[string]bool{engineClaude: true})
+	if !ok || got != engineCodex {
+		t.Fatalf("failover after claude = %q ok=%v, want codex", got, ok)
+	}
+	if _, ok := nextEngineByHeadroom(cfg, nil, map[string]bool{engineClaude: true, engineCodex: true}); ok {
+		t.Fatal("no engines left must not invent a pool")
+	}
+}
+
 func TestSessionForAntigravityMintsNothing(t *testing.T) {
 	r := &Runner{}
 	id, resume := r.sessionFor(&Bot{Engine: engineAntigravity})

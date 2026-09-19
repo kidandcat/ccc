@@ -558,32 +558,68 @@ func (s *mcpServer) sendFile(_ context.Context, _ *mcp.CallToolRequest, in sendF
 }
 
 // sendFileForbidden implements the DESIGN §12 rule: credentials never leave the
-// machine through send_file. Anything inside a Claude config dir, inside
-// <data_dir>/profiles, or with a credential-ish name is refused.
+// machine through send_file. Anything inside an engine home (Claude, Codex,
+// Grok, Gemini), inside <data_dir>/profiles, or with a credential-ish name
+// (including auth.json) is refused. ~/.codex/auth.json is the hole this
+// originally missed: the name list had .credentials.json but not auth.json,
+// and the directory list covered ~/.claude but not ~/.codex / ~/.grok.
 func sendFileForbidden(config *Config, abs string) (string, bool) {
+	abs = filepath.Clean(abs)
 	lower := strings.ToLower(filepath.Base(abs))
-	for _, bad := range []string{".credentials.json", "credentials.json", ".claude.json", "id_rsa", "id_ed25519", ".env"} {
+	for _, bad := range credentialFileNames {
 		if lower == bad {
 			return "it looks like a credentials file", true
 		}
 	}
+	home, _ := os.UserHomeDir()
+	home = filepath.Clean(home)
 	guarded := []string{filepath.Join(dataDir(config), "profiles")}
+	if home != "" && home != "." {
+		guarded = append(guarded,
+			filepath.Join(home, ".ssh"),
+			filepath.Join(home, ".aws"),
+			filepath.Join(home, ".claude"),
+			filepath.Join(home, ".codex"),
+			filepath.Join(home, ".grok"),
+			filepath.Join(home, ".gemini"),
+			configDir(),
+		)
+	}
 	for _, p := range listProfiles(config) {
 		guarded = append(guarded, claudeHome(p))
-	}
-	home, err := os.UserHomeDir()
-	if err == nil {
-		guarded = append(guarded, filepath.Join(home, ".ssh"), filepath.Join(home, ".aws"), configDir())
+		if h := engineHome(p); h != "" && filepath.Clean(h) != home {
+			// Never refuse the entire user home (implicit Antigravity HOME).
+			guarded = append(guarded, h)
+		}
 	}
 	for _, g := range guarded {
-		if g == "" {
-			continue
-		}
-		if abs == g || strings.HasPrefix(abs, strings.TrimRight(g, string(filepath.Separator))+string(filepath.Separator)) {
+		if pathInside(abs, g) {
 			return "it is inside a credentials/config directory", true
 		}
 	}
 	return "", false
+}
+
+// credentialFileNames are basenames send_file will not ship, wherever they
+// sit. auth.json is Grok/Codex OAuth; mcp_credentials.json is Grok MCP OAuth.
+var credentialFileNames = []string{
+	".credentials.json", "credentials.json", ".claude.json",
+	"auth.json", ".auth.json", "mcp_credentials.json",
+	"antigravity-oauth-token",
+	"id_rsa", "id_ed25519", ".env",
+}
+
+func pathInside(abs, dir string) bool {
+	if dir == "" {
+		return false
+	}
+	abs = filepath.Clean(abs)
+	dir = filepath.Clean(dir)
+	if abs == dir {
+		return true
+	}
+	sep := string(filepath.Separator)
+	return strings.HasPrefix(abs, strings.TrimRight(dir, sep)+sep)
 }
 
 // ---------------------------------------------------------------------------

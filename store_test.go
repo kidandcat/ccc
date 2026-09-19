@@ -224,12 +224,27 @@ func TestSettingsRoundTrip(t *testing.T) {
 }
 
 func TestSendFileRefusesCredentialPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 	dir := t.TempDir()
-	cfg := &Config{DataDir: dir}
+	iso := filepath.Join(t.TempDir(), "isolated-codex")
+	cfg := &Config{
+		DataDir: dir,
+		Profiles: map[string]*Profile{
+			"codex-work": {Engine: engineCodex, ConfigDir: iso},
+		},
+	}
 	cases := []string{
 		filepath.Join(dir, "profiles", "work", "settings.json"),
-		filepath.Join(claudeHome(implicitProfile()), "anything.txt"),
+		filepath.Join(home, ".claude", "anything.txt"),
 		filepath.Join(dir, ".credentials.json"),
+		filepath.Join(home, ".codex", "auth.json"),
+		filepath.Join(home, ".codex", "sessions", "rollout.jsonl"),
+		filepath.Join(home, ".grok", "auth.json"),
+		filepath.Join(home, ".grok", "mcp_credentials.json"),
+		filepath.Join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token"),
+		filepath.Join(iso, "auth.json"),
+		filepath.Join(dir, "bots", "alpha", "workspace", "auth.json"),
 	}
 	for _, p := range cases {
 		if _, forbidden := sendFileForbidden(cfg, p); !forbidden {
