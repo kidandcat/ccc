@@ -2,7 +2,7 @@
 
 **ccc** — a personal assistant in Telegram. You talk to the **orchestrator** in
 the bot's 1:1 DM; it runs backend workers on the Claude, Grok, Codex, and
-Antigravity accounts you already pay for. Sessions have no Telegram topic.
+Antigravity accounts you already pay for.
 
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -13,7 +13,7 @@ Antigravity accounts you already pay for. Sessions have no Telegram topic.
 
 The bot's **1:1 DM is the orchestrator**: you talk to it, it sees
 live sessions, and it can start a backend worker (`spawn_session`) or message
-one (`tell_session`). Sessions live in the backend — no Telegram topic. It
+one (`tell_session`). Sessions live in the backend. It
 has a 60s cap on **your** messages — longer work must go to a session. Session
 reports are not under that cap: the orchestrator has to summarize them. If the
 cap fires and the orchestrator does not spawn, ccc starts the session itself
