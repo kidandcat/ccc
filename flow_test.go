@@ -490,8 +490,90 @@ func TestFreeTextListsPendingAskButtons(t *testing.T) {
 	if kb[0][0].CallbackData != fmt.Sprintf("q:%d:0", q.ID) {
 		t.Errorf("button callback = %q", kb[0][0].CallbackData)
 	}
-	if kb[0][0].Text != "yes" || kb[0][1].Text != "no" {
-		t.Errorf("single pending list should use option labels, got %+v", kb[0])
+	if kb[0][0].Text != "1" || kb[0][1].Text != "2" {
+		t.Errorf("pending list buttons should be numbers, got %+v", kb[0])
+	}
+	joined := strings.Join(api.texts(""), "\n")
+	for _, want := range []string{"1. yes", "2. no"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("pending list body missing %q, got %q", want, joined)
+		}
+	}
+}
+
+func TestRenderPendingAsksNumbersMultipleSessions(t *testing.T) {
+	// The owner's screenshot: two sessions, long names, every option prefixed
+	// onto one row so Telegram truncated them all to "notion-cale...".
+	a := pendingAsk{
+		Name: "notion-calendar-menubar",
+		Q: Question{
+			ID:          11,
+			Question:    "¿me dejas quitar iconos de Centro de Control?",
+			OptionsJSON: `["Quitar Bluetooth, Pantalla, Sonido","Dejarlo","Otra idea","Omitir"]`,
+		},
+	}
+	b := pendingAsk{
+		Name: "General",
+		Q: Question{
+			ID:          22,
+			Question:    "¿aviso en el hilo de Slack o lo dejo?",
+			OptionsJSON: `["Avísale en el hilo","Déjalo, y no avises","Omitir"]`,
+		},
+	}
+	body, rows := renderPendingAsks([]pendingAsk{a, b}, 2, 0)
+
+	if !strings.Contains(body, "❓ 2 pending decisions") {
+		t.Errorf("header = %q", body)
+	}
+	for _, want := range []string{
+		"<b>notion-calendar-menubar</b>",
+		"<b>General</b>",
+		"1. Quitar Bluetooth, Pantalla, Sonido",
+		"2. Dejarlo",
+		"3. Otra idea",
+		"4. Omitir",
+		"5. Avísale en el hilo",
+		"6. Déjalo, y no avises",
+		"7. Omitir",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "notion-calendar-menubar:") {
+		t.Errorf("options must not be prefixed with the session name:\n%s", body)
+	}
+	if len(rows) != 2 || len(rows[0]) != 4 || len(rows[1]) != 3 {
+		t.Fatalf("keyboard = %+v", rows)
+	}
+	wantLabels := [][]string{{"1", "2", "3", "4"}, {"5", "6", "7"}}
+	wantData := [][]string{
+		{"q:11:0", "q:11:1", "q:11:2", "q:11:3"},
+		{"q:22:0", "q:22:1", "q:22:2"},
+	}
+	for i, wantRow := range wantLabels {
+		for j, want := range wantRow {
+			if rows[i][j].Text != want {
+				t.Errorf("button [%d][%d] = %q, want %q", i, j, rows[i][j].Text, want)
+			}
+			if rows[i][j].CallbackData != wantData[i][j] {
+				t.Errorf("callback [%d][%d] = %q, want %q", i, j, rows[i][j].CallbackData, wantData[i][j])
+			}
+			if strings.Contains(rows[i][j].Text, "notion") || strings.Contains(rows[i][j].Text, "General") {
+				t.Errorf("button still carries a session name: %q", rows[i][j].Text)
+			}
+		}
+	}
+}
+
+func TestRenderPendingAsksExtraFooter(t *testing.T) {
+	item := pendingAsk{Name: "ads", Q: Question{ID: 1, Question: "Raise?", OptionsJSON: `["yes","Omitir"]`}}
+	body, rows := renderPendingAsks([]pendingAsk{item}, 9, 8)
+	if !strings.Contains(body, "❓ 9 pending decisions") || !strings.Contains(body, "and 8 more") {
+		t.Errorf("extra footer = %q", body)
+	}
+	if len(rows) != 1 || rows[0][0].Text != "1" || rows[0][1].Text != "2" {
+		t.Errorf("keyboard = %+v", rows)
 	}
 }
 

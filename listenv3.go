@@ -588,6 +588,44 @@ func (in *instance) answerOwnerQuestion(q *Question, answer string) error {
 	return nil
 }
 
+// renderPendingAsks is the DM list of unanswered ask_owner rows plus their
+// buttons. Options are numbered in the body and on the keyboard so Telegram
+// truncation cannot make two choices look the same (same trick as /account).
+func renderPendingAsks(shown []pendingAsk, total, extra int) (string, [][]InlineKeyboardButton) {
+	var body strings.Builder
+	if total == 1 {
+		body.WriteString("❓ Pending decision")
+	} else {
+		fmt.Fprintf(&body, "❓ %d pending decisions", total)
+	}
+	var rows [][]InlineKeyboardButton
+	n := 0
+	for _, item := range shown {
+		fmt.Fprintf(&body, "\n\n<b>%s</b>\n%s", htmlEscape(item.Name), renderTelegramHTML(item.Q.Question))
+		opts := questionOptions(&item.Q)
+		if questionIsFreeText(opts) {
+			body.WriteString("\n<i>Reply to the original question.</i>")
+		}
+		if len(opts) == 0 {
+			continue
+		}
+		var row []InlineKeyboardButton
+		for i, o := range opts {
+			n++
+			fmt.Fprintf(&body, "\n%d. %s", n, htmlEscape(o))
+			row = append(row, InlineKeyboardButton{
+				Text:         strconv.Itoa(n),
+				CallbackData: fmt.Sprintf("q:%d:%d", item.Q.ID, i),
+			})
+		}
+		rows = append(rows, row)
+	}
+	if extra > 0 {
+		fmt.Fprintf(&body, "\n\n<i>and %d more</i>", extra)
+	}
+	return body.String(), rows
+}
+
 // listPendingAsks posts unanswered ask_owner rows as one DM message with their
 // buttons. No timeout: it stays until the owner taps or replies. No-ops when
 // nothing is pending or Telegram is not configured.
@@ -607,44 +645,12 @@ func (in *instance) listPendingAsks() {
 		extra = len(shown) - maxPendingAskList
 		shown = shown[:maxPendingAskList]
 	}
-	var body strings.Builder
-	if len(asks) == 1 {
-		body.WriteString("❓ Pending decision")
-	} else {
-		fmt.Fprintf(&body, "❓ %d pending decisions", len(asks))
-	}
-	var rows [][]InlineKeyboardButton
-	multi := len(shown) > 1
-	for _, item := range shown {
-		fmt.Fprintf(&body, "\n\n<b>%s</b>\n%s", htmlEscape(item.Name), renderTelegramHTML(item.Q.Question))
-		opts := questionOptions(&item.Q)
-		if questionIsFreeText(opts) {
-			body.WriteString("\n<i>Reply to the original question.</i>")
-		}
-		if len(opts) == 0 {
-			continue
-		}
-		var row []InlineKeyboardButton
-		for i, o := range opts {
-			label := o
-			if multi {
-				label = item.Name + ": " + o
-			}
-			row = append(row, InlineKeyboardButton{
-				Text:         clipButtonText(label),
-				CallbackData: fmt.Sprintf("q:%d:%d", item.Q.ID, i),
-			})
-		}
-		rows = append(rows, row)
-	}
-	if extra > 0 {
-		fmt.Fprintf(&body, "\n\n<i>and %d more</i>", extra)
-	}
+	body, rows := renderPendingAsks(shown, len(asks), extra)
 	if len(rows) == 0 {
-		_, _ = sendMessageHTMLGetID(cfg, chat, thread, body.String())
+		_, _ = sendMessageHTMLGetID(cfg, chat, thread, body)
 		return
 	}
-	_, _ = sendMessageKeyboardGetID(cfg, chat, thread, body.String(), rows)
+	_, _ = sendMessageKeyboardGetID(cfg, chat, thread, body, rows)
 }
 
 // handleCallback processes an inline button tap. Callback data is ccc's own
