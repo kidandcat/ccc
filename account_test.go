@@ -88,6 +88,12 @@ func TestRenderAccountsCard(t *testing.T) {
 		t.Errorf("disclaimer warning shown for the wrong number of accounts:\n%s", body)
 	}
 
+	for _, want := range []string{"1. ", "2. ", "3. "} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the card is missing numbered row %q:\n%s", want, body)
+		}
+	}
+
 	var relogin, makeDefault int
 	for _, row := range buttons {
 		for _, b := range row {
@@ -104,6 +110,93 @@ func TestRenderAccountsCard(t *testing.T) {
 	}
 	if makeDefault != 2 {
 		t.Errorf("%d default buttons, want one per non-default account", makeDefault)
+	}
+	// Labels are the list numbers, not emails — Telegram truncates long
+	// addresses and the two Default buttons would otherwise look identical.
+	wantButtons := [][]string{
+		{"1 Relogin"},
+		{"2 Relogin", "⭐ 2"},
+		{"3 Relogin", "⭐ 3"},
+		{"🔄 Refresh"},
+	}
+	if len(buttons) != len(wantButtons) {
+		t.Fatalf("button rows = %d, want %d: %+v", len(buttons), len(wantButtons), buttons)
+	}
+	for i, wantRow := range wantButtons {
+		if len(buttons[i]) != len(wantRow) {
+			t.Fatalf("row %d has %d buttons, want %d: %+v", i, len(buttons[i]), len(wantRow), buttons[i])
+		}
+		for j, want := range wantRow {
+			if buttons[i][j].Text != want {
+				t.Errorf("button [%d][%d] = %q, want %q", i, j, buttons[i][j].Text, want)
+			}
+			if strings.Contains(buttons[i][j].Text, "@") {
+				t.Errorf("button [%d][%d] still carries an email: %q", i, j, buttons[i][j].Text)
+			}
+		}
+	}
+	if got, want := buttons[0][0].CallbackData, "account:login:"+accountTarget("work"); got != want {
+		t.Errorf("account 1 relogin callback = %q, want %q", got, want)
+	}
+	if got, want := buttons[1][0].CallbackData, "account:login:"+accountTarget("personal"); got != want {
+		t.Errorf("account 2 relogin callback = %q, want %q", got, want)
+	}
+	if got, want := buttons[1][1].CallbackData, "account:default:"+accountTarget("personal"); got != want {
+		t.Errorf("account 2 default callback = %q, want %q", got, want)
+	}
+	if got, want := buttons[2][0].CallbackData, "account:login:"+accountTarget("spare"); got != want {
+		t.Errorf("account 3 relogin callback = %q, want %q", got, want)
+	}
+}
+
+func TestRenderAccountsNumbersSameEmailDifferentEngines(t *testing.T) {
+	cards := []accountCard{
+		{
+			Profile:    Profile{Name: "jairo.caroaccino@agentero.com", Engine: engineClaude, Label: "jairo.caroaccino@agentero.com"},
+			State:      accountLoggedOut,
+			IsDefault:  true,
+			Disclaimer: true,
+		},
+		{
+			Profile: Profile{Name: "jairo.caroaccino@agentero.com/codex", Engine: engineCodex, Label: "jairo.caroaccino@agentero.com"},
+			State:   accountOK,
+		},
+		{
+			Profile:    Profile{Name: "jairo@agentero.com", Engine: engineClaude, Label: "jairo@agentero.com"},
+			State:      accountOK,
+			Disclaimer: true,
+		},
+	}
+	body, buttons := renderAccounts(cards)
+	if !strings.Contains(body, "1. <b>jairo.caroaccino@agentero.com</b> ⭐") {
+		t.Errorf("row 1 should be numbered and starred:\n%s", body)
+	}
+	if !strings.Contains(body, "2. <b>jairo.caroaccino@agentero.com</b> —") {
+		t.Errorf("row 2 should be numbered without stealing the default star:\n%s", body)
+	}
+	if !strings.Contains(body, "3. <b>jairo@agentero.com</b>") {
+		t.Errorf("row 3 should be numbered:\n%s", body)
+	}
+	if len(buttons) != 4 {
+		t.Fatalf("rows = %d, want 3 accounts + refresh: %+v", len(buttons), buttons)
+	}
+	if buttons[0][0].Text != "1 Relogin" || buttons[1][0].Text != "2 Relogin" || buttons[2][0].Text != "3 Relogin" {
+		t.Errorf("relogin labels = %q %q %q", buttons[0][0].Text, buttons[1][0].Text, buttons[2][0].Text)
+	}
+	if buttons[1][1].Text != "⭐ 2" || buttons[2][1].Text != "⭐ 3" {
+		t.Errorf("default labels = %q %q", buttons[1][1].Text, buttons[2][1].Text)
+	}
+	if got, want := buttons[0][0].CallbackData, "account:login:jairo.caroaccino@agentero.com"; got != want {
+		t.Errorf("1 relogin callback = %q, want %q", got, want)
+	}
+	if got, want := buttons[1][0].CallbackData, "account:login:jairo.caroaccino@agentero.com/codex"; got != want {
+		t.Errorf("2 relogin callback = %q, want %q", got, want)
+	}
+	if got, want := buttons[1][1].CallbackData, "account:default:jairo.caroaccino@agentero.com/codex"; got != want {
+		t.Errorf("2 default callback = %q, want %q", got, want)
+	}
+	if got, want := buttons[2][0].CallbackData, "account:login:jairo@agentero.com"; got != want {
+		t.Errorf("3 relogin callback = %q, want %q", got, want)
 	}
 }
 

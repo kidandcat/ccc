@@ -208,16 +208,19 @@ func renderAccounts(cards []accountCard) (string, [][]InlineKeyboardButton) {
 		return sb.String(), nil
 	}
 	var buttons [][]InlineKeyboardButton
-	for _, c := range cards {
+	for i, c := range cards {
 		// An account is its email here: the config dir behind it is an
 		// implementation detail the owner never has to know (DESIGN §8).
+		// List and buttons share a 1-based index so Telegram truncation of
+		// long emails cannot make Relogin/Default rows indistinguishable.
+		n := i + 1
 		name := accountDisplay(c.Profile)
 		marker := ""
 		if c.IsDefault {
 			marker = " ⭐"
 		}
 		eng := profileEngine(c.Profile)
-		fmt.Fprintf(&sb, "\n<b>%s</b>%s — %s · %s\n", htmlEscape(name), marker, engineLabel(eng), c.State.icon())
+		fmt.Fprintf(&sb, "\n%d. <b>%s</b>%s — %s · %s\n", n, htmlEscape(name), marker, engineLabel(eng), c.State.icon())
 		if acct := strings.TrimSpace(c.Account); acct != "" && normalizeEmail(acct) != normalizeEmail(name) && acct != name {
 			fmt.Fprintf(&sb, "  %s\n", htmlEscape(acct))
 		}
@@ -231,9 +234,9 @@ func renderAccounts(cards []accountCard) (string, [][]InlineKeyboardButton) {
 			sb.WriteString("  ⚠️ bypass disclaimer not accepted\n")
 		}
 		target := accountTarget(c.Profile.Name)
-		row := []InlineKeyboardButton{{Text: "🔑 Relogin " + name, CallbackData: "account:login:" + target}}
+		row := []InlineKeyboardButton{{Text: fmt.Sprintf("%d Relogin", n), CallbackData: "account:login:" + target}}
 		if !c.IsDefault {
-			row = append(row, InlineKeyboardButton{Text: "⭐ Default", CallbackData: "account:default:" + target})
+			row = append(row, InlineKeyboardButton{Text: fmt.Sprintf("⭐ %d", n), CallbackData: "account:default:" + target})
 		}
 		buttons = append(buttons, row)
 	}
