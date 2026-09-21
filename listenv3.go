@@ -496,6 +496,13 @@ func (in *instance) handleMessage(msg *TelegramMessage) {
 	in.deliver(b, msg, text)
 }
 
+func questionAnsweredHTML(q *Question, answer string) string {
+	if q == nil {
+		return "✓ <b>" + htmlEscape(answer) + "</b>"
+	}
+	return "❓ " + htmlEscape(q.Question) + "\n✓ <b>" + htmlEscape(answer) + "</b>"
+}
+
 func (in *instance) tickAskedMessage(q *Question, answer string) {
 	if q == nil || q.AskedMessageID == 0 {
 		return
@@ -505,8 +512,33 @@ func (in *instance) tickAskedMessage(q *Question, answer string) {
 	if !ok {
 		return
 	}
-	confirmed := "❓ " + htmlEscape(q.Question) + "\n✓ <b>" + htmlEscape(answer) + "</b>"
-	_ = editMessageHTML(cfg, chat, q.AskedMessageID, thread, confirmed) // safe-ignore: ticking the question message is cosmetic
+	empty := emptyInlineKeyboard()
+	_ = editMessageHTMLMarkup(cfg, chat, q.AskedMessageID, thread, questionAnsweredHTML(q, answer), &empty) // safe-ignore: ticking the question message is cosmetic
+}
+
+// showQuestionAnswered ticks the original ask_owner message and the message
+// the owner actually tapped (the pending-decision card is a different id).
+func (in *instance) showQuestionAnswered(cb *CallbackQuery, q *Question, answer string) {
+	in.tickAskedMessage(q, answer)
+	if cb == nil || cb.Message == nil {
+		return
+	}
+	if q != nil && int64(cb.Message.MessageID) == q.AskedMessageID {
+		return
+	}
+	remaining := livePendingAsks(in.db)
+	if len(remaining) == 0 {
+		in.editCallbackMessage(cb, questionAnsweredHTML(q, answer))
+		return
+	}
+	shown := remaining
+	extra := 0
+	if len(shown) > maxPendingAskList {
+		extra = len(shown) - maxPendingAskList
+		shown = shown[:maxPendingAskList]
+	}
+	body, rows := renderPendingAsks(shown, len(remaining), extra)
+	in.editCallbackMarkup(cb, body, &rows)
 }
 
 // botForQuestionReply matches a reply-to against any pending ask_owner
@@ -663,46 +695,68 @@ func (in *instance) handleCallback(cb *CallbackQuery) {
 	if role == roleDenied {
 		return
 	}
-	answerCallbackQuery(cfg, cb.ID)
 	parts := strings.Split(cb.Data, ":")
 	if len(parts) == 0 {
+		answerCallbackQuery(cfg, cb.ID, "")
 		return
 	}
 	switch parts[0] {
 	case "account":
+		answerCallbackQuery(cfg, cb.ID, "")
 		if role == roleOwner {
 			in.handleAccountCallback(cb, parts)
 		}
 		return
 	case "model":
+		answerCallbackQuery(cfg, cb.ID, "")
 		if role == roleOwner {
 			in.handleModelCallback(cb, parts)
 		}
 		return
 	}
+	in.handleQuestionCallback(cb, parts)
+}
+
+func (in *instance) handleQuestionCallback(cb *CallbackQuery, parts []string) {
+	cfg := in.config()
 	if len(parts) != 3 || parts[0] != "q" {
+		answerCallbackQuery(cfg, cb.ID, "Unknown button")
+		hookLog("question callback: bad data %q", cb.Data)
 		return
 	}
 	qID, err1 := strconv.ParseInt(parts[1], 10, 64)
 	idx, err2 := strconv.Atoi(parts[2])
 	if err1 != nil || err2 != nil {
+		answerCallbackQuery(cfg, cb.ID, "Unknown button")
+		hookLog("question callback: parse %q: %v %v", cb.Data, err1, err2)
 		return
 	}
 	var q Question
 	if err := in.db.First(&q, qID).Error; err != nil {
+		answerCallbackQuery(cfg, cb.ID, "That question is gone")
+		hookLog("question callback: %d: %v", qID, err)
+		in.editCallbackMessage(cb, "That question is gone")
 		return
 	}
 	if q.AnsweredAt != nil {
+		answerCallbackQuery(cfg, cb.ID, "Already answered")
+		in.showQuestionAnswered(cb, &q, q.Answer)
 		return
 	}
 	opts := questionOptions(&q)
 	if idx < 0 || idx >= len(opts) {
+		answerCallbackQuery(cfg, cb.ID, "Unknown option")
+		hookLog("question callback: %d option %d of %d", qID, idx, len(opts))
 		return
 	}
 	choice := opts[idx]
 	if err := in.answerOwnerQuestion(&q, choice); err != nil {
+		answerCallbackQuery(cfg, cb.ID, "Could not record that")
 		hookLog("enqueue answer: %v", err)
+		return
 	}
+	answerCallbackQuery(cfg, cb.ID, choice)
+	in.showQuestionAnswered(cb, &q, choice)
 }
 
 // ---------------------------------------------------------------------------
@@ -1336,11 +1390,16 @@ func (in *instance) reply(msg *TelegramMessage, html string) {
 // editCallbackMessage rewrites the message a button lived on, which both shows
 // the result and retires the buttons.
 func (in *instance) editCallbackMessage(cb *CallbackQuery, html string) {
+	empty := emptyInlineKeyboard()
+	in.editCallbackMarkup(cb, html, &empty)
+}
+
+func (in *instance) editCallbackMarkup(cb *CallbackQuery, html string, buttons *[][]InlineKeyboardButton) {
 	cfg := in.config()
-	if cb.Message == nil || cfg.BotToken == "" {
+	if cb == nil || cb.Message == nil || cfg.BotToken == "" {
 		return
 	}
-	_ = editMessageHTML(cfg, cb.Message.Chat.ID, int64(cb.Message.MessageID), cb.Message.MessageThreadID, html) // safe-ignore: cosmetic
+	_ = editMessageHTMLMarkup(cfg, cb.Message.Chat.ID, int64(cb.Message.MessageID), cb.Message.MessageThreadID, html, buttons) // safe-ignore: cosmetic
 }
 
 // handleEngineCommand assigns a bot to an engine's account pool. Engine itself

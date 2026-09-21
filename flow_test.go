@@ -353,7 +353,7 @@ func TestNonOwnerIsIgnored(t *testing.T) {
 }
 
 func TestQuestionCallbackAnswersAndResumesTheBot(t *testing.T) {
-	in, runner, _ := testInstance(t)
+	in, runner, api := testInstance(t)
 	b, err := in.createBot("asker", "")
 	if err != nil {
 		t.Fatalf("createBot: %v", err)
@@ -392,6 +392,133 @@ func TestQuestionCallbackAnswersAndResumesTheBot(t *testing.T) {
 	if after.Status != botIdle {
 		t.Errorf("bot status = %q, want idle after answering", after.Status)
 	}
+	assertCallbackAck(t, api, "ship it")
+	assertMessageRetired(t, api, 555, "ship it")
+}
+
+func TestPendingListCallbackAnswersAndRetiresCard(t *testing.T) {
+	in, runner, api := testInstance(t)
+	b, err := in.createBot("notion-calendar-menubar", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setBotStatus(in.db, b.ID, botWaiting)
+	opts, err := json.Marshal([]string{"Sí, ya se ve", "No, sigue sin verse", "Se ve pero falta sitio para otros", skipOptionLabel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := Question{BotID: b.ID, Question: "¿aparece ya el icono de Notion Calendar?", OptionsJSON: string(opts), AskedMessageID: 555}
+	if err := in.db.Create(&q).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	in.handleMessage(ownerMessage("hola"))
+	kb := lastKeyboard(t, api)
+	if len(kb) != 1 || len(kb[0]) != 4 || kb[0][0].Text != "1" {
+		t.Fatalf("pending list keyboard = %+v", kb)
+	}
+
+	cb := &CallbackQuery{ID: "tap", Data: kb[0][0].CallbackData}
+	cb.From.ID = 42
+	cb.Message = ownerMessage("")
+	cb.Message.MessageID = int(api.nextMsg)
+	in.handleCallback(cb)
+
+	var stored Question
+	if err := in.db.First(&stored, q.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.AnsweredAt == nil || stored.Answer != "Sí, ya se ve" {
+		t.Fatalf("pending-list tap did not answer: %+v", stored)
+	}
+	last, ok := runner.last()
+	if !ok || last.BotID != b.ID || !strings.Contains(last.Text, "Sí, ya se ve") {
+		t.Errorf("answer was not fed back: %+v", last)
+	}
+	assertCallbackAck(t, api, "Sí, ya se ve")
+	assertMessageRetired(t, api, 555, "Sí, ya se ve")
+	assertMessageRetired(t, api, int64(cb.Message.MessageID), "Sí, ya se ve")
+}
+
+func TestQuestionCallbackAlreadyAnsweredRetiresButtons(t *testing.T) {
+	in, _, api := testInstance(t)
+	b, err := in.createBot("asker", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	q := Question{BotID: b.ID, Question: "Deploy?", OptionsJSON: `["ship it","hold"]`, AskedMessageID: 7, Answer: "ship it", AnsweredAt: &now}
+	if err := in.db.Create(&q).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	cb := &CallbackQuery{ID: "again", Data: fmt.Sprintf("q:%d:0", q.ID)}
+	cb.From.ID = 42
+	cb.Message = ownerMessage("")
+	cb.Message.MessageID = 9
+	in.handleCallback(cb)
+
+	assertCallbackAck(t, api, "Already answered")
+	assertMessageRetired(t, api, 7, "ship it")
+	assertMessageRetired(t, api, 9, "ship it")
+}
+
+func TestLivePendingAsksSkipsDisabled(t *testing.T) {
+	in, _, _ := testInstance(t)
+	live, err := in.createBot("live", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead, err := in.createBot("dead", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := in.db.Model(dead).Update("status", botDisabled).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []Question{
+		{BotID: dead.ID, Question: "stale?", OptionsJSON: `["yes","Omitir"]`},
+		{BotID: live.ID, Question: "live?", OptionsJSON: `["yes","Omitir"]`},
+	} {
+		if err := in.db.Create(&row).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	asks := livePendingAsks(in.db)
+	if len(asks) != 1 || asks[0].Name != "live" {
+		t.Fatalf("live pending = %+v, want only the live session", asks)
+	}
+}
+
+func assertCallbackAck(t *testing.T, api *fakeBotAPI, want string) {
+	t.Helper()
+	acks := api.since("answerCallbackQuery")
+	if len(acks) == 0 {
+		t.Fatal("no answerCallbackQuery")
+	}
+	got := acks[len(acks)-1].Params.Get("text")
+	if got != want {
+		t.Errorf("callback ack = %q, want %q", got, want)
+	}
+}
+
+func assertMessageRetired(t *testing.T, api *fakeBotAPI, messageID int64, wantText string) {
+	t.Helper()
+	id := fmt.Sprintf("%d", messageID)
+	for _, e := range api.since("editMessageText") {
+		if e.Params.Get("message_id") != id {
+			continue
+		}
+		if !strings.Contains(e.Params.Get("text"), wantText) {
+			t.Errorf("edit %s text = %q, want substring %q", id, e.Params.Get("text"), wantText)
+		}
+		raw := e.Params.Get("reply_markup")
+		if !strings.Contains(raw, `"inline_keyboard":[]`) {
+			t.Errorf("edit %s did not remove the keyboard: %q", id, raw)
+		}
+		return
+	}
+	t.Errorf("no editMessageText for message %s", id)
 }
 
 func TestCallbackFromStrangerIsIgnored(t *testing.T) {

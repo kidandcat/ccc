@@ -714,9 +714,9 @@ type pendingAsk struct {
 
 const maxPendingAskList = 8
 
-// livePendingAsks is unanswered questions on live (not archived) sessions,
-// oldest first. The DM lists these when the owner types; they are not answered
-// by that text.
+// livePendingAsks is unanswered questions on live (not archived, not disabled)
+// sessions, oldest first. The DM lists these when the owner types; they are
+// not answered by that text.
 func livePendingAsks(db *gorm.DB) []pendingAsk {
 	var rows []Question
 	if err := db.Where("answered_at IS NULL").Order("id").Find(&rows).Error; err != nil {
@@ -725,7 +725,7 @@ func livePendingAsks(db *gorm.DB) []pendingAsk {
 	out := make([]pendingAsk, 0, len(rows))
 	for i := range rows {
 		b, err := botByID(db, rows[i].BotID)
-		if err != nil || b.ArchivedAt != nil {
+		if err != nil || b.ArchivedAt != nil || b.Status == botDisabled {
 			continue
 		}
 		out = append(out, pendingAsk{Q: rows[i], Name: b.Name})

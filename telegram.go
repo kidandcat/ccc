@@ -271,15 +271,27 @@ func sendMessageOpts(config *Config, chatID int64, threadID int64, text string, 
 
 // editMessage edits an existing message, sending overflow as new messages
 func editMessage(config *Config, chatID int64, messageID int64, threadID int64, text string) error {
-	return editMessageWithMode(config, chatID, messageID, threadID, text, "Markdown")
+	return editMessageWithMode(config, chatID, messageID, threadID, text, "Markdown", nil)
 }
 
-// editMessageHTML edits a message using HTML parse mode
+// editMessageHTML edits a message using HTML parse mode. The inline keyboard
+// is left as-is (Telegram keeps reply_markup when the field is omitted).
 func editMessageHTML(config *Config, chatID int64, messageID int64, threadID int64, text string) error {
-	return editMessageWithMode(config, chatID, messageID, threadID, text, "HTML")
+	return editMessageWithMode(config, chatID, messageID, threadID, text, "HTML", nil)
 }
 
-func editMessageWithMode(config *Config, chatID int64, messageID int64, threadID int64, text string, parseMode string) error {
+// editMessageHTMLMarkup edits HTML text. A non-nil buttons pointer sets
+// reply_markup: an empty slice removes the inline keyboard, a populated one
+// replaces it. Nil leaves the keyboard untouched.
+func editMessageHTMLMarkup(config *Config, chatID, messageID, threadID int64, text string, buttons *[][]InlineKeyboardButton) error {
+	return editMessageWithMode(config, chatID, messageID, threadID, text, "HTML", buttons)
+}
+
+func emptyInlineKeyboard() [][]InlineKeyboardButton {
+	return [][]InlineKeyboardButton{}
+}
+
+func editMessageWithMode(config *Config, chatID int64, messageID int64, threadID int64, text string, parseMode string, buttons *[][]InlineKeyboardButton) error {
 	// Split message - first part goes to edit, rest as new messages
 	messages := splitForMode(text, parseMode)
 
@@ -289,6 +301,13 @@ func editMessageWithMode(config *Config, chatID int64, messageID int64, threadID
 		"message_id": {fmt.Sprintf("%d", messageID)},
 		"text":       {messages[0]},
 		"parse_mode": {parseMode},
+	}
+	if buttons != nil {
+		keyboardJSON, err := json.Marshal(map[string]any{"inline_keyboard": *buttons})
+		if err != nil {
+			return err
+		}
+		params.Set("reply_markup", string(keyboardJSON))
 	}
 
 	result, err := telegramAPI(config, "editMessageText", params)
@@ -404,9 +423,12 @@ func sendMessageWithKeyboard(config *Config, chatID int64, threadID int64, text 
 	return nil
 }
 
-func answerCallbackQuery(config *Config, callbackID string) {
+func answerCallbackQuery(config *Config, callbackID, text string) {
 	params := url.Values{
 		"callback_query_id": {callbackID},
+	}
+	if text != "" {
+		params.Set("text", truncate(text, 200))
 	}
 	telegramAPI(config, "answerCallbackQuery", params)
 }
