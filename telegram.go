@@ -707,7 +707,7 @@ func setMessageReaction(config *Config, chatID int64, messageID int64, emoji str
 }
 
 // sendMessageKeyboardGetID sends one HTML message with an inline keyboard and
-// returns its message id, which ask_owner needs to match a tap to a question.
+// returns its message id (account / model pickers).
 func sendMessageKeyboardGetID(config *Config, chatID int64, threadID int64, text string, buttons [][]InlineKeyboardButton) (int64, error) {
 	keyboardJSON, err := json.Marshal(map[string]any{"inline_keyboard": buttons})
 	if err != nil {

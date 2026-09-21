@@ -135,7 +135,7 @@ type notifyOwnerIn struct {
 
 type askOwnerIn struct {
 	Question string   `json:"question" jsonschema:"the question, one sentence"`
-	Options  []string `json:"options,omitempty" jsonschema:"up to 4 Telegram button labels; put the recommended answer first. Prefer 3 content options; the last button is always Omitir (skip). Omit only when the answer cannot be a button"`
+	Options  []string `json:"options,omitempty" jsonschema:"optional listed choices shown in the Telegram message; put the recommended answer first. Omit when the answer cannot be a short pick"`
 }
 
 type updateInstructionsIn struct {
@@ -188,7 +188,7 @@ func (s *mcpServer) register(server *mcp.Server) {
 	}, s.notifyOwner)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "ask_owner",
-		Description: "Ask the owner a question via Telegram native buttons and END YOUR TURN. Mandatory for every decision (yes/no, pick one, architectural fork). Never ask in chat or transcript prose. Pass up to 3 content options as buttons, recommended first; Omitir is always added as the last button (skip without choosing, unblocks you). If you pass 4, the last is replaced. Omit options only when the answer cannot be a button. The answer arrives as your next message.",
+		Description: "Ask the owner a question via Telegram and END YOUR TURN. Mandatory for every decision (yes/no, pick one, architectural fork). Never ask in chat or transcript prose. Pass optional listed options, recommended first. The owner answers by replying to the question in the DM. The answer arrives as your next message.",
 	}, s.askOwner)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "set_name",
@@ -441,33 +441,16 @@ func (s *mcpServer) notifyOwner(_ context.Context, _ *mcp.CallToolRequest, in no
 	return text("owner notified"), nil, nil
 }
 
-// maxQuestionOptions is Telegram-friendly and matches DESIGN §6 (≤4 options).
-// The last slot is always Omitir (skip without choosing).
+// maxQuestionOptions caps listed choices in an ask_owner Telegram message.
 const maxQuestionOptions = 4
 
-// skipOptionLabel is the last ask_owner button. Tapping it closes the
-// question without picking a content option and unblocks the worker.
+// skipOptionLabel is the existing text convention that skips without choosing.
+// Replying Omitir or SKIP to a question unblocks the worker; it is not a button.
 const skipOptionLabel = "Omitir"
 
 func isSkipOption(s string) bool {
 	s = strings.TrimSpace(s)
 	return strings.EqualFold(s, skipOptionLabel) || strings.EqualFold(s, "Skip")
-}
-
-// ensureSkipOption puts Omitir last. Four content options lose the last slot
-// (DESIGN §6: 3 of substance + Omitir, or the 4th is always Omitir).
-func ensureSkipOption(opts []string) []string {
-	content := make([]string, 0, len(opts)+1)
-	for _, o := range opts {
-		if isSkipOption(o) {
-			continue
-		}
-		content = append(content, o)
-	}
-	if len(content) >= maxQuestionOptions {
-		content = content[:maxQuestionOptions-1]
-	}
-	return append(content, skipOptionLabel)
 }
 
 func questionIsFreeText(opts []string) bool {
@@ -499,7 +482,6 @@ func (s *mcpServer) askOwner(_ context.Context, _ *mcp.CallToolRequest, in askOw
 		}
 		opts = append(opts, truncate(o, 60))
 	}
-	opts = ensureSkipOption(opts)
 	optionsJSON, err := json.Marshal(opts)
 	if err != nil {
 		return toolErr("invalid options"), nil, nil
@@ -515,7 +497,7 @@ func (s *mcpServer) askOwner(_ context.Context, _ *mcp.CallToolRequest, in askOw
 	if !isGeneralBot(b) {
 		asked = fmt.Sprintf("[%s] %s", b.Name, q)
 	}
-	msgID := s.postQuestion(0, row.ID, asked, opts)
+	msgID := s.postQuestion(0, asked, opts)
 	if msgID != 0 {
 		s.db.Model(&Question{}).Where("id = ?", row.ID).Update("asked_message_id", msgID)
 	}
@@ -668,32 +650,24 @@ func (s *mcpServer) post(topicID int64, html string) {
 	_, _ = sendMessageHTMLGetID(s.config, chat, thread, html) // safe-ignore: a failed mirror must not fail the tool call
 }
 
-// postQuestion renders an ask_owner question with one button per option and
-// returns the message id so a tap can be matched back to the question.
-func (s *mcpServer) postQuestion(topicID, questionID int64, question string, options []string) int64 {
+// postQuestion renders an ask_owner question as text (options listed in the
+// body) and returns the message id so a reply-to can be matched back to it.
+func (s *mcpServer) postQuestion(topicID int64, question string, options []string) int64 {
 	chat, thread, ok := destForTopic(s.config, topicID)
 	if !ok {
 		return 0
 	}
 	body := "❓ " + renderTelegramHTML(question)
-	if questionIsFreeText(options) {
-		body += "\n<i>Reply to this message with your answer.</i>"
+	n := 0
+	for _, o := range options {
+		if strings.TrimSpace(o) == "" {
+			continue
+		}
+		n++
+		body += fmt.Sprintf("\n%d. %s", n, htmlEscape(o))
 	}
-	if len(options) == 0 {
-		id, _ := sendMessageHTMLGetID(s.config, chat, thread, body) // safe-ignore: a question with no message id can still be answered by reply
-		return id
-	}
-	var rows [][]InlineKeyboardButton
-	for i, o := range options {
-		rows = append(rows, []InlineKeyboardButton{{
-			Text:         o,
-			CallbackData: fmt.Sprintf("q:%d:%d", questionID, i),
-		}})
-	}
-	id, err := sendMessageKeyboardGetID(s.config, chat, thread, body, rows)
-	if err != nil {
-		return 0
-	}
+	body += "\n<i>Reply to this message with your answer.</i>"
+	id, _ := sendMessageHTMLGetID(s.config, chat, thread, body) // safe-ignore: a question with no message id can still be answered by reply
 	return id
 }
 
@@ -751,9 +725,9 @@ func questionsSimilar(a, b *Question) bool {
 }
 
 // mapQuestionAnswer returns the answer to store on q. Empty-option questions
-// take the text as-is. Button questions only accept an option they already
-// have (case-insensitive), so a tap on "Yes" does not invent a choice on a
-// sibling that asked with different buttons.
+// take the text as-is. Questions with options only accept a choice they already
+// have (case-insensitive), so answering "Yes" does not invent a choice on a
+// sibling that asked with different options.
 func mapQuestionAnswer(q *Question, answer string) (string, bool) {
 	answer = strings.TrimSpace(answer)
 	if answer == "" || q == nil {
@@ -827,7 +801,7 @@ func answerQuestion(db *gorm.DB, q *Question, answer string) string {
 }
 
 // resolveQuestionAnswer records the answer, clears waiting, and enqueues the
-// follow-up turn. Shared by Telegram taps and replies.
+// follow-up turn. Shared by Telegram replies.
 func resolveQuestionAnswer(db *gorm.DB, runner turnRunner, q *Question, answer string) error {
 	if q == nil {
 		return fmt.Errorf("unknown question")

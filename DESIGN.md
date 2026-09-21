@@ -171,7 +171,7 @@ The page is a two-ink system (near-black / off-white). Hue appears only inside t
 ### Interface (inside the product frame only)
 - **Telegram ground / head / in / out** (`tg-bg`, `tg-head`, `tg-in`, `tg-out`): DM canvas, header, incoming bubble, outgoing bubble.
 - **Bubble ink** (`tg-in-ink`, `tg-out-ink`): Message type on those bubbles.
-- **Keyboard fill / ink** (`kbd-fill`, `kbd-ink`): Inline `ask_owner` buttons.
+- **Keyboard fill / ink** (`kbd-fill`, `kbd-ink`): Inline Telegram buttons (accounts, model picker).
 - **Avatar fill / ink** (`avatar-fill`, `avatar-ink`): The `c` disc in the DM header.
 - **Run / wait / idle** (`run`, `wait`, `idle`): Session dots and matching pill type. Not page accents.
 
@@ -252,7 +252,7 @@ Restrained product chrome: filled or hairline, no color fills on the page, no li
 - Sticky, ground-filled, hairline floor. Wordmark left; dim 0.9375rem links that go full ink on hover; filled GitHub right. Below 860px, only the wordmark and GitHub remain.
 
 ### Product frame (signature)
-OS window around a Telegram DM and a session list. Titlebar: three 0.65rem lights (#ff5f57, #febc2e, #28c840) and a faint 0.75rem name. DM uses the Telegram tokens; outgoing bubbles sit right with a 4px bottom-right corner; incoming sit left. Sessions live on pane ground with 0.5rem status dots (running pulses 2.2s). `ask_owner` is the same window with a two-up keyboard in Telegram cyan, not page fill.
+OS window around a Telegram DM and a session list. Titlebar: three 0.65rem lights (#ff5f57, #febc2e, #28c840) and a faint 0.75rem name. DM uses the Telegram tokens; outgoing bubbles sit right with a 4px bottom-right corner; incoming sit left. Sessions live on pane ground with 0.5rem status dots (running pulses 2.2s). `ask_owner` is the same window with listed options in the incoming bubble, not a keyboard.
 
 Bubbles enter with `rise` (0.55s, cubic-bezier(0.16, 1, 0.3, 1), 8px up). `prefers-reduced-motion: reduce` kills bubble and pulse animation.
 

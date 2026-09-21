@@ -605,7 +605,7 @@ func (r *Runner) loop(botID int64, wake chan struct{}) {
 }
 
 // sessionSkipsTurns is the runNext gate: archived and disabled never run.
-// Workers parked on ask_owner stay parked until a button or reply-to. General
+// Workers parked on ask_owner stay parked until a reply-to. General
 // keeps taking DM turns while a question is pending — free text is never the
 // answer, so blocking the dispatcher would swallow the owner's next message.
 func sessionSkipsTurns(b *Bot) bool {

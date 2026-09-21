@@ -352,7 +352,7 @@ func TestNonOwnerIsIgnored(t *testing.T) {
 	}
 }
 
-func TestQuestionCallbackAnswersAndResumesTheBot(t *testing.T) {
+func TestReplyToQuestionAnswersAndResumesTheBot(t *testing.T) {
 	in, runner, api := testInstance(t)
 	b, err := in.createBot("asker", "")
 	if err != nil {
@@ -368,11 +368,9 @@ func TestQuestionCallbackAnswersAndResumesTheBot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cb := &CallbackQuery{ID: "cb1", Data: fmt.Sprintf("q:%d:0", q.ID)}
-	cb.From.ID = 42
-	cb.Message = ownerMessage("")
-	cb.Message.MessageID = 555
-	in.handleCallback(cb)
+	msg := ownerMessage("ship it")
+	msg.ReplyToMessage = &TelegramMessage{MessageID: 555}
+	in.handleMessage(msg)
 
 	var stored Question
 	if err := in.db.First(&stored, q.ID).Error; err != nil {
@@ -392,75 +390,40 @@ func TestQuestionCallbackAnswersAndResumesTheBot(t *testing.T) {
 	if after.Status != botIdle {
 		t.Errorf("bot status = %q, want idle after answering", after.Status)
 	}
-	assertCallbackAck(t, api, "ship it")
 	assertMessageRetired(t, api, 555, "ship it")
 }
 
-func TestPendingListCallbackAnswersAndRetiresCard(t *testing.T) {
+func TestLeftoverQuestionCallbackDoesNotAnswer(t *testing.T) {
 	in, runner, api := testInstance(t)
-	b, err := in.createBot("notion-calendar-menubar", "")
+	b, err := in.createBot("asker", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	setBotStatus(in.db, b.ID, botWaiting)
-	opts, err := json.Marshal([]string{"Sí, ya se ve", "No, sigue sin verse", "Se ve pero falta sitio para otros", skipOptionLabel})
-	if err != nil {
-		t.Fatal(err)
-	}
-	q := Question{BotID: b.ID, Question: "¿aparece ya el icono de Notion Calendar?", OptionsJSON: string(opts), AskedMessageID: 555}
+	q := Question{BotID: b.ID, Question: "Deploy to prod?", OptionsJSON: `["ship it","hold"]`, AskedMessageID: 555}
 	if err := in.db.Create(&q).Error; err != nil {
 		t.Fatal(err)
 	}
 
-	in.handleMessage(ownerMessage("hola"))
-	kb := lastKeyboard(t, api)
-	if len(kb) != 1 || len(kb[0]) != 4 || kb[0][0].Text != "1" {
-		t.Fatalf("pending list keyboard = %+v", kb)
-	}
-
-	cb := &CallbackQuery{ID: "tap", Data: kb[0][0].CallbackData}
+	cb := &CallbackQuery{ID: "cb1", Data: fmt.Sprintf("q:%d:0", q.ID)}
 	cb.From.ID = 42
 	cb.Message = ownerMessage("")
-	cb.Message.MessageID = int(api.nextMsg)
+	cb.Message.MessageID = 555
 	in.handleCallback(cb)
 
 	var stored Question
 	if err := in.db.First(&stored, q.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if stored.AnsweredAt == nil || stored.Answer != "Sí, ya se ve" {
-		t.Fatalf("pending-list tap did not answer: %+v", stored)
+	if stored.AnsweredAt != nil {
+		t.Fatalf("leftover q: tap must not answer: %+v", stored)
 	}
-	last, ok := runner.last()
-	if !ok || last.BotID != b.ID || !strings.Contains(last.Text, "Sí, ya se ve") {
-		t.Errorf("answer was not fed back: %+v", last)
+	if _, ok := runner.last(); ok {
+		t.Error("leftover tap must not enqueue a turn")
 	}
-	assertCallbackAck(t, api, "Sí, ya se ve")
-	assertMessageRetired(t, api, 555, "Sí, ya se ve")
-	assertMessageRetired(t, api, int64(cb.Message.MessageID), "Sí, ya se ve")
-}
-
-func TestQuestionCallbackAlreadyAnsweredRetiresButtons(t *testing.T) {
-	in, _, api := testInstance(t)
-	b, err := in.createBot("asker", "")
-	if err != nil {
-		t.Fatal(err)
+	if len(api.since("answerCallbackQuery")) == 0 {
+		t.Fatal("leftover tap must still be acked")
 	}
-	now := time.Now()
-	q := Question{BotID: b.ID, Question: "Deploy?", OptionsJSON: `["ship it","hold"]`, AskedMessageID: 7, Answer: "ship it", AnsweredAt: &now}
-	if err := in.db.Create(&q).Error; err != nil {
-		t.Fatal(err)
-	}
-
-	cb := &CallbackQuery{ID: "again", Data: fmt.Sprintf("q:%d:0", q.ID)}
-	cb.From.ID = 42
-	cb.Message = ownerMessage("")
-	cb.Message.MessageID = 9
-	in.handleCallback(cb)
-
-	assertCallbackAck(t, api, "Already answered")
-	assertMessageRetired(t, api, 7, "ship it")
-	assertMessageRetired(t, api, 9, "ship it")
 }
 
 func TestLivePendingAsksSkipsDisabled(t *testing.T) {
@@ -490,15 +453,15 @@ func TestLivePendingAsksSkipsDisabled(t *testing.T) {
 	}
 }
 
-func assertCallbackAck(t *testing.T, api *fakeBotAPI, want string) {
+func assertNoKeyboard(t *testing.T, api *fakeBotAPI) {
 	t.Helper()
-	acks := api.since("answerCallbackQuery")
-	if len(acks) == 0 {
-		t.Fatal("no answerCallbackQuery")
+	calls := api.since("sendMessage")
+	if len(calls) == 0 {
+		t.Fatal("no sendMessage")
 	}
-	got := acks[len(acks)-1].Params.Get("text")
-	if got != want {
-		t.Errorf("callback ack = %q, want %q", got, want)
+	raw := calls[len(calls)-1].Params.Get("reply_markup")
+	if raw != "" && strings.Contains(raw, `"inline_keyboard"`) && !strings.Contains(raw, `"inline_keyboard":[]`) {
+		t.Errorf("last sendMessage still has an inline keyboard: %q", raw)
 	}
 }
 
@@ -597,7 +560,7 @@ func TestFreeTextDoesNotAnswerWaitingQuestion(t *testing.T) {
 	}
 }
 
-func TestFreeTextListsPendingAskButtons(t *testing.T) {
+func TestFreeTextListsPendingAsksWithoutKeyboard(t *testing.T) {
 	in, _, api := testInstance(t)
 	b, err := in.createBot("ads", "")
 	if err != nil {
@@ -610,18 +573,9 @@ func TestFreeTextListsPendingAskButtons(t *testing.T) {
 
 	in.handleMessage(ownerMessage("hola"))
 
-	kb := lastKeyboard(t, api)
-	if len(kb) != 1 || len(kb[0]) != 2 {
-		t.Fatalf("pending list keyboard = %+v", kb)
-	}
-	if kb[0][0].CallbackData != fmt.Sprintf("q:%d:0", q.ID) {
-		t.Errorf("button callback = %q", kb[0][0].CallbackData)
-	}
-	if kb[0][0].Text != "1" || kb[0][1].Text != "2" {
-		t.Errorf("pending list buttons should be numbers, got %+v", kb[0])
-	}
+	assertNoKeyboard(t, api)
 	joined := strings.Join(api.texts(""), "\n")
-	for _, want := range []string{"1. yes", "2. no"} {
+	for _, want := range []string{"1. yes", "2. no", "Reply to the original question"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("pending list body missing %q, got %q", want, joined)
 		}
@@ -647,7 +601,7 @@ func TestRenderPendingAsksNumbersMultipleSessions(t *testing.T) {
 			OptionsJSON: `["Avísale en el hilo","Déjalo, y no avises","Omitir"]`,
 		},
 	}
-	body, rows := renderPendingAsks([]pendingAsk{a, b}, 2, 0)
+	body := renderPendingAsks([]pendingAsk{a, b}, 2, 0)
 
 	if !strings.Contains(body, "❓ 2 pending decisions") {
 		t.Errorf("header = %q", body)
@@ -662,6 +616,7 @@ func TestRenderPendingAsksNumbersMultipleSessions(t *testing.T) {
 		"5. Avísale en el hilo",
 		"6. Déjalo, y no avises",
 		"7. Omitir",
+		"Reply to the original question",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q:\n%s", want, body)
@@ -670,41 +625,17 @@ func TestRenderPendingAsksNumbersMultipleSessions(t *testing.T) {
 	if strings.Contains(body, "notion-calendar-menubar:") {
 		t.Errorf("options must not be prefixed with the session name:\n%s", body)
 	}
-	if len(rows) != 2 || len(rows[0]) != 4 || len(rows[1]) != 3 {
-		t.Fatalf("keyboard = %+v", rows)
-	}
-	wantLabels := [][]string{{"1", "2", "3", "4"}, {"5", "6", "7"}}
-	wantData := [][]string{
-		{"q:11:0", "q:11:1", "q:11:2", "q:11:3"},
-		{"q:22:0", "q:22:1", "q:22:2"},
-	}
-	for i, wantRow := range wantLabels {
-		for j, want := range wantRow {
-			if rows[i][j].Text != want {
-				t.Errorf("button [%d][%d] = %q, want %q", i, j, rows[i][j].Text, want)
-			}
-			if rows[i][j].CallbackData != wantData[i][j] {
-				t.Errorf("callback [%d][%d] = %q, want %q", i, j, rows[i][j].CallbackData, wantData[i][j])
-			}
-			if strings.Contains(rows[i][j].Text, "notion") || strings.Contains(rows[i][j].Text, "General") {
-				t.Errorf("button still carries a session name: %q", rows[i][j].Text)
-			}
-		}
-	}
 }
 
 func TestRenderPendingAsksExtraFooter(t *testing.T) {
 	item := pendingAsk{Name: "ads", Q: Question{ID: 1, Question: "Raise?", OptionsJSON: `["yes","Omitir"]`}}
-	body, rows := renderPendingAsks([]pendingAsk{item}, 9, 8)
+	body := renderPendingAsks([]pendingAsk{item}, 9, 8)
 	if !strings.Contains(body, "❓ 9 pending decisions") || !strings.Contains(body, "and 8 more") {
 		t.Errorf("extra footer = %q", body)
 	}
-	if len(rows) != 1 || rows[0][0].Text != "1" || rows[0][1].Text != "2" {
-		t.Errorf("keyboard = %+v", rows)
-	}
 }
 
-func TestQuestionCallbackFansOutToSimilar(t *testing.T) {
+func TestReplyToQuestionFansOutToSimilar(t *testing.T) {
 	in, runner, _ := testInstance(t)
 	a, err := in.createBot("one", "")
 	if err != nil {
@@ -727,11 +658,9 @@ func TestQuestionCallbackFansOutToSimilar(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cb := &CallbackQuery{ID: "cb1", Data: fmt.Sprintf("q:%d:0", q1.ID)}
-	cb.From.ID = 42
-	cb.Message = ownerMessage("")
-	cb.Message.MessageID = 1
-	in.handleCallback(cb)
+	msg := ownerMessage("ship it")
+	msg.ReplyToMessage = &TelegramMessage{MessageID: 1}
+	in.handleMessage(msg)
 
 	var first, second Question
 	if err := in.db.First(&first, q1.ID).Error; err != nil {
@@ -741,7 +670,7 @@ func TestQuestionCallbackFansOutToSimilar(t *testing.T) {
 		t.Fatal(err)
 	}
 	if first.AnsweredAt == nil || first.Answer != "ship it" {
-		t.Fatalf("tapped question not answered: %+v", first)
+		t.Fatalf("replied question not answered: %+v", first)
 	}
 	if second.AnsweredAt == nil || second.Answer != "ship it" {
 		t.Fatalf("similar question not answered: %+v", second)
@@ -754,11 +683,11 @@ func TestQuestionCallbackFansOutToSimilar(t *testing.T) {
 	}
 }
 
-func TestQuestionCallbackSkipsDissimilar(t *testing.T) {
+func TestReplyToQuestionSkipsDissimilar(t *testing.T) {
 	in, _, _ := testInstance(t)
 	a, _ := in.createBot("one", "")
 	b, _ := in.createBot("two", "")
-	q1 := Question{BotID: a.ID, Question: "Deploy?", OptionsJSON: `["ship","hold"]`}
+	q1 := Question{BotID: a.ID, Question: "Deploy?", OptionsJSON: `["ship","hold"]`, AskedMessageID: 1}
 	q2 := Question{BotID: b.ID, Question: "Archive the session?", OptionsJSON: `["ship","hold"]`}
 	if err := in.db.Create(&q1).Error; err != nil {
 		t.Fatal(err)
@@ -767,10 +696,9 @@ func TestQuestionCallbackSkipsDissimilar(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cb := &CallbackQuery{ID: "cb", Data: fmt.Sprintf("q:%d:0", q1.ID)}
-	cb.From.ID = 42
-	cb.Message = ownerMessage("")
-	in.handleCallback(cb)
+	msg := ownerMessage("ship")
+	msg.ReplyToMessage = &TelegramMessage{MessageID: 1}
+	in.handleMessage(msg)
 
 	var other Question
 	if err := in.db.First(&other, q2.ID).Error; err != nil {
@@ -803,46 +731,11 @@ func TestQuestionsSimilarNormalized(t *testing.T) {
 	}
 	mapped, ok = mapQuestionAnswer(&Question{OptionsJSON: `["Yes","No","Omitir"]`}, "SKIP")
 	if !ok || mapped != skipOptionLabel {
-		t.Fatalf("skip should match the Omitir button, got %q ok=%v", mapped, ok)
+		t.Fatalf("skip should match the Omitir text convention, got %q ok=%v", mapped, ok)
 	}
 }
 
-func TestEnsureSkipOptionAlwaysLast(t *testing.T) {
-	cases := []struct {
-		in   []string
-		want []string
-	}{
-		{nil, []string{skipOptionLabel}},
-		{[]string{}, []string{skipOptionLabel}},
-		{[]string{"yes", "no"}, []string{"yes", "no", skipOptionLabel}},
-		{[]string{"a", "b", "c"}, []string{"a", "b", "c", skipOptionLabel}},
-		{[]string{"a", "b", "c", "d"}, []string{"a", "b", "c", skipOptionLabel}},
-		{[]string{"yes", "Omitir", "no"}, []string{"yes", "no", skipOptionLabel}},
-		{[]string{"Skip", "yes"}, []string{"yes", skipOptionLabel}},
-		{[]string{skipOptionLabel}, []string{skipOptionLabel}},
-	}
-	for _, tc := range cases {
-		got := ensureSkipOption(tc.in)
-		if len(got) != len(tc.want) {
-			t.Errorf("ensureSkipOption(%v) = %v, want %v", tc.in, got, tc.want)
-			continue
-		}
-		for i := range got {
-			if got[i] != tc.want[i] {
-				t.Errorf("ensureSkipOption(%v) = %v, want %v", tc.in, got, tc.want)
-				break
-			}
-		}
-		if got[len(got)-1] != skipOptionLabel {
-			t.Errorf("last option must be Omitir, got %v", got)
-		}
-		if len(got) > maxQuestionOptions {
-			t.Errorf("too many options: %v", got)
-		}
-	}
-}
-
-func TestAskOwnerAlwaysAddsOmitir(t *testing.T) {
+func TestAskOwnerPostsOptionsAsTextNotButtons(t *testing.T) {
 	in, _, api := testInstance(t)
 	b, err := in.createBot("deployer", "")
 	if err != nil {
@@ -864,16 +757,19 @@ func TestAskOwnerAlwaysAddsOmitir(t *testing.T) {
 		t.Fatal(err)
 	}
 	opts := questionOptions(&q)
-	if len(opts) != 3 || opts[0] != "ship it" || opts[1] != "hold" || opts[2] != skipOptionLabel {
-		t.Fatalf("stored options = %v, want ship it / hold / Omitir", opts)
+	if len(opts) != 2 || opts[0] != "ship it" || opts[1] != "hold" {
+		t.Fatalf("stored options = %v, want ship it / hold", opts)
 	}
-	kb := lastKeyboard(t, api)
-	if len(kb) != 3 || kb[2][0].Text != skipOptionLabel {
-		t.Fatalf("keyboard = %+v, want Omitir last", kb)
+	assertNoKeyboard(t, api)
+	joined := strings.Join(api.texts(""), "\n")
+	for _, want := range []string{"1. ship it", "2. hold", "Reply to this message"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("ask body missing %q, got %q", want, joined)
+		}
 	}
 }
 
-func TestAskOwnerReplacesFourthWithOmitir(t *testing.T) {
+func TestAskOwnerKeepsFourOptions(t *testing.T) {
 	in, _, _ := testInstance(t)
 	b, err := in.createBot("deployer", "")
 	if err != nil {
@@ -891,17 +787,12 @@ func TestAskOwnerReplacesFourthWithOmitir(t *testing.T) {
 		t.Fatal(err)
 	}
 	opts := questionOptions(&q)
-	if len(opts) != 4 || opts[3] != skipOptionLabel || opts[2] != "fecha" {
-		t.Fatalf("options = %v, want first 3 kept and Omitir last", opts)
-	}
-	for _, o := range opts {
-		if o == "mac" {
-			t.Fatal("the 4th content option must be replaced by Omitir")
-		}
+	if len(opts) != 4 || opts[3] != "mac" || opts[2] != "fecha" {
+		t.Fatalf("options = %v, want all four kept", opts)
 	}
 }
 
-func TestAskOwnerSkipUnblocksWithoutChoosing(t *testing.T) {
+func TestReplySkipUnblocksWithoutChoosing(t *testing.T) {
 	in, runner, api := testInstance(t)
 	b, err := in.createBot("deployer", "")
 	if err != nil {
@@ -919,18 +810,10 @@ func TestAskOwnerSkipUnblocksWithoutChoosing(t *testing.T) {
 	if err := in.db.Where("bot_id = ?", b.ID).First(&q).Error; err != nil {
 		t.Fatal(err)
 	}
-	kb := lastKeyboard(t, api)
-	if len(kb) < 1 {
-		t.Fatal("no keyboard")
-	}
-	skip := kb[len(kb)-1][0]
-	if skip.Text != skipOptionLabel {
-		t.Fatalf("last button = %q", skip.Text)
-	}
-	cb := &CallbackQuery{ID: "skip", Data: skip.CallbackData}
-	cb.From.ID = 42
-	cb.Message = ownerMessage("")
-	in.handleCallback(cb)
+	assertNoKeyboard(t, api)
+	msg := ownerMessage(skipOptionLabel)
+	msg.ReplyToMessage = &TelegramMessage{MessageID: int(q.AskedMessageID)}
+	in.handleMessage(msg)
 
 	if err := in.db.First(&q, q.ID).Error; err != nil {
 		t.Fatal(err)
@@ -957,7 +840,7 @@ func TestAskOwnerSkipUnblocksWithoutChoosing(t *testing.T) {
 	}
 }
 
-func TestSkipFansOutToSimilarWithoutOmitirButton(t *testing.T) {
+func TestReplySkipFansOutToSimilar(t *testing.T) {
 	in, runner, _ := testInstance(t)
 	a, err := in.createBot("one", "")
 	if err != nil {
@@ -967,7 +850,7 @@ func TestSkipFansOutToSimilarWithoutOmitirButton(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	opts, err := json.Marshal([]string{"ship it", "hold", skipOptionLabel})
+	opts, err := json.Marshal([]string{"ship it", "hold"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -980,11 +863,9 @@ func TestSkipFansOutToSimilarWithoutOmitirButton(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cb := &CallbackQuery{ID: "cb", Data: fmt.Sprintf("q:%d:2", q1.ID)}
-	cb.From.ID = 42
-	cb.Message = ownerMessage("")
-	cb.Message.MessageID = 1
-	in.handleCallback(cb)
+	msg := ownerMessage("SKIP")
+	msg.ReplyToMessage = &TelegramMessage{MessageID: 1}
+	in.handleMessage(msg)
 
 	var first, second Question
 	if err := in.db.First(&first, q1.ID).Error; err != nil {
@@ -994,7 +875,7 @@ func TestSkipFansOutToSimilarWithoutOmitirButton(t *testing.T) {
 		t.Fatal(err)
 	}
 	if first.AnsweredAt == nil || !isSkipOption(first.Answer) {
-		t.Fatalf("tapped skip not recorded: %+v", first)
+		t.Fatalf("skip not recorded: %+v", first)
 	}
 	if second.AnsweredAt == nil || !isSkipOption(second.Answer) {
 		t.Fatalf("similar question must be skipped too: %+v", second)
@@ -1007,7 +888,7 @@ func TestSkipFansOutToSimilarWithoutOmitirButton(t *testing.T) {
 	}
 }
 
-func TestAskOwnerFreeTextStillGetsOmitir(t *testing.T) {
+func TestAskOwnerFreeTextHasNoKeyboard(t *testing.T) {
 	in, _, api := testInstance(t)
 	b, err := in.createBot("writer", "")
 	if err != nil {
@@ -1022,17 +903,14 @@ func TestAskOwnerFreeTextStillGetsOmitir(t *testing.T) {
 		t.Fatal(err)
 	}
 	opts := questionOptions(&q)
-	if len(opts) != 1 || opts[0] != skipOptionLabel {
-		t.Fatalf("free-text options = %v, want only Omitir", opts)
+	if len(opts) != 0 {
+		t.Fatalf("free-text options = %v, want none", opts)
 	}
 	joined := strings.Join(api.texts(""), "\n")
 	if !strings.Contains(joined, "Reply to this message") {
 		t.Errorf("free-text question must keep the reply hint, got %q", joined)
 	}
-	kb := lastKeyboard(t, api)
-	if len(kb) != 1 || kb[0][0].Text != skipOptionLabel {
-		t.Fatalf("free-text keyboard = %+v", kb)
-	}
+	assertNoKeyboard(t, api)
 }
 
 func TestSendToBotDoesNotDumpIntoTelegram(t *testing.T) {

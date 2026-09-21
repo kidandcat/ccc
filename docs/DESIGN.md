@@ -132,8 +132,8 @@ use the fallback.
 - Persist `turns` row: profile used, duration, cost/usage from `result`,
   `stop_reason`, session id.
 - If the turn ended with `ask_owner` pending, the session is marked `waiting`.
-  Workers stay parked until a button tap or a reply-to that question (answers
-  are inputs). General keeps taking DM turns while a question is pending:
+  Workers stay parked until a reply-to that question (answers are inputs).
+  General keeps taking DM turns while a question is pending:
   free text is never the answer, so blocking the dispatcher would swallow it.
 - If `set_name` changed the session name during the turn, rotate the
   conversation now that the turn has recorded its id (§14.14).
@@ -304,7 +304,7 @@ home (Codex also gets per-turn `exec -c`). Identity is `--bot`/`--turn` or
 | `recall` | `query`, `scope?`, `limit?` | Full-text (SQLite FTS5) search over memories visible to this session: all `user`, all `project`, own session. Returns key+text+scope. |
 | `forget` | `scope`, `key`, `project_path?` | Delete one memory. |
 | `notify_owner` | `text`, `urgency` (normal\|urgent) | Post in General (the DM), labelled with the session name. Interruptions only — not a report dump. |
-| `ask_owner` | `question`, `options?` (≤4 strings; last is always Omitir) | Post question with inline buttons in General. ccc always appends **Omitir** as the last button (3 content options + Omitir; if the model passes 4, the last is replaced). Tapping Omitir closes the question without choosing A/B and unblocks the worker (`The owner skipped the question "…" without choosing…`); similar pending asks are skipped too. Free-text questions (no content options) still take a reply-to and still get Omitir. Returns immediately with `{"status":"asked"}`; the session should end its turn. A content answer arrives as `Answer to "<question>": …` via a button tap or a reply-to that question in the DM. Free text in the DM is never an answer (it is always General) and, if anything is still pending, listen posts a list of unanswered questions with their buttons — no timeout. Tapping one also answers similar pending questions (same normalized text, answer maps onto their options) so General does not re-ask. Prompt contract: mandatory for every owner decision (yes/no, pick one, architectural fork); recommended option first; never ask in chat prose. |
+| `ask_owner` | `question`, `options?` (≤4 strings) | Post the question in General as text, with listed options in the message body. Returns immediately with `{"status":"asked"}`; the session should end its turn. The owner answers by replying to that question in the DM. A content answer arrives as `Answer to "<question>": …`. Replying **Omitir** or **SKIP** skips without choosing and unblocks the worker (`The owner skipped the question "…" without choosing…`); similar pending asks are skipped too. Free text in the DM is never an answer (it is always General) and, if anything is still pending, listen posts a list of unanswered questions as text — no timeout, no keyboard. Answering one also answers similar pending questions (same normalized text, answer maps onto their options) so General does not re-ask. Prompt contract: mandatory for every owner decision (yes/no, pick one, architectural fork); recommended option first; never ask in chat prose. |
 | `set_name` | `name` | Rename this session: validate (§8 `/name`), update `bots.name`. Rotates the conversation (§14.14). `/name` in the DM only hits General, which refuses. No topic icon. |
 | `watch` | `name`, `command`, `interval_s` (≥60) | Register a deterministic watch (§7). Polling tool: no change = zero tokens. Lasts `watch_ttl_s` (default 4h); re-upserting the name renews it. `unwatch(name)`, `list_watches()`. |
 | `schedule_wakeup` | `in_seconds` or `at` (RFC3339), `note`, `cron?` | Wake at a time (§7). Each fire is a full turn. Not for polling. `cancel_schedule(id)`. |
@@ -470,16 +470,15 @@ older than 90 days.
 - Photos/documents → saved into General's workspace `inbox/`, path passed
   in the message. Voice → transcribed if the `voice` build is present, else
   the file path is passed (keep the existing whisper integration).
-- `ask_owner` → inline buttons `q:<question_id>:<option_idx>` (last button is
-  always **Omitir**). Tapping a content option ticks the original question
-  message with ✓ and enqueues the answer. Tapping Omitir closes the question
-  without choosing and unblocks the worker (skip envelope, not `Answer to`).
-  Free-text answers: only a reply to that question message (Omitir is still
-  offered). Free text in the DM never answers; if anything is still pending,
-  listen posts a list of unanswered questions with their buttons (no timeout).
-  Tapping one also answers similar pending questions (same normalized text;
-  the tapped label maps onto their options; Omitir skips siblings even if they
-  have no skip button) so General does not re-ask.
+- `ask_owner` → a text question in the DM, options listed in the body. The
+  owner answers by replying to that message. The reply ticks the original
+  question with ✓ and enqueues the answer. Replying **Omitir** or **SKIP**
+  closes the question without choosing and unblocks the worker (skip
+  envelope, not `Answer to`). Free text in the DM never answers; if anything
+  is still pending, listen posts a list of unanswered questions as text (no
+  timeout, no keyboard). Answering one also answers similar pending questions
+  (same normalized text; the label maps onto their options; Omitir/SKIP
+  skips siblings even if they have no skip option) so General does not re-ask.
 - An **edited** message is gated like any other update. If its text starts with
   `/` it goes through the same command dispatcher — editing a mistyped command
   in place is how a phone corrects one — deduped by
@@ -585,10 +584,9 @@ Tools: you have the ccc MCP tools (memory, scheduling, watches,
 background jobs, secrets_list, run) plus the standard tools (Bash, Read, Edit, …) with full
 permissions. You cannot create other sessions. There is no secrets_get.
 Rules: … (owner escalation, when to remember, never print secrets, keep
-replies short for chat, always ask_owner with Telegram buttons for yes/no,
-pick-one, or an architectural fork — up to 3 content options, recommended
-first, last button always Omitir — never ask in chat/transcript prose;
-omit options only when the answer cannot be a button…)
+replies short for chat, always ask_owner for yes/no, pick-one, or an
+architectural fork — optional listed options, recommended first — never
+ask in chat/transcript prose; the owner answers by replying in the DM…)
 ```
 
 General's prompt is a dispatcher variant: the owner's DM, `spawn_session` /
@@ -722,12 +720,14 @@ before and after and clears `session_id` once the turn has been persisted.
 while a session was `waiting` as the answer. That stole the next owner
 message (always meant for General) and, when several similar questions were
 pending, answered only one — then the 10-minute idle nag made General
-re-ask the rest. Now: a button tap or a reply-to that question is the
-answer; free text lists the pending asks (no timeout) and goes to General.
-Tapping one fans the same answer out to similar pending questions
-(normalized text match; the label must exist on the sibling, except Omitir
-which skips siblings even without that button). Workers stay parked;
-General keeps taking DM turns. Idle-remind skips `waiting`.
+re-ask the rest. Now: a reply-to that question is the answer; free text
+lists the pending asks as text (no timeout, no keyboard) and goes to
+General. Answering one fans the same answer out to similar pending
+questions (normalized text match; the label must exist on the sibling,
+except Omitir/SKIP which skips siblings even without that option).
+Workers stay parked; General keeps taking DM turns. Idle-remind skips
+`waiting`. Inline `ask_owner` buttons (`q:<id>:<idx>`) were removed;
+leftover taps are acked and ignored.
 
 **14.4 `linkSharedProjects` only creates symlinks.** §4 was silent about an
 existing `projects/`. Replacing one would destroy real transcript history, so

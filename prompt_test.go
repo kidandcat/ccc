@@ -69,27 +69,27 @@ func TestSystemPromptRequiresAskOwnerForDecisions(t *testing.T) {
 		}
 		for _, want := range []string{
 			"ask_owner",
-			"Telegram buttons",
 			"A or B?",
 			"Yes/no",
-			"recommended option first",
+			"recommended first",
 			"architectural",
 			"end the turn",
 			"never an answer",
-			"Omitir",
-			"without choosing",
-			"do not re-ask",
+			"answers by writing a reply",
+			"to the question in the DM",
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("%s prompt missing %q:\n%s", name, want, got)
 			}
 		}
+		for _, leak := range []string{"Telegram buttons", "Omitir", "native Telegram buttons"} {
+			if strings.Contains(got, leak) {
+				t.Errorf("%s prompt still mentions %q:\n%s", name, leak, got)
+			}
+		}
 	}
-	if !strings.Contains(worker, "native Telegram buttons") {
-		t.Errorf("worker tool list should name native Telegram buttons:\n%s", worker)
-	}
-	if !strings.Contains(worker, "+ Omitir") {
-		t.Error("worker tool list must mention Omitir on ask_owner")
+	if !strings.Contains(worker, "optional listed options") {
+		t.Errorf("worker tool list should name listed options:\n%s", worker)
 	}
 	if strings.Contains(worker, "Prefer ask_owner over guessing on anything architectural") {
 		t.Error("old ask_owner wording leaked into the worker prompt")

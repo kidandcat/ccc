@@ -24,7 +24,7 @@ Success for this landing: a first-time visitor understands they get one assistan
 
 ## Positioning
 
-Visitor-facing pitch: **one personal assistant, every subscription, in Telegram.** Coding is a use, not the category. The mechanism a neighboring product could not copy without becoming ccc: **one Telegram DM is the orchestrator; sessions are backend workers with no chat of their own.** Quiet owner UX (`ask_owner` buttons, vault secrets the model never reads, watches that cost nothing until output changes, routines that fire as fresh workers). Engines are interchangeable runners (Claude Code default; Grok Build, Antigravity, Codex) behind the same envelope — the subscriptions you already pay for, one place.
+Visitor-facing pitch: **one personal assistant, every subscription, in Telegram.** Coding is a use, not the category. The mechanism a neighboring product could not copy without becoming ccc: **one Telegram DM is the orchestrator; sessions are backend workers with no chat of their own.** Quiet owner UX (`ask_owner` in the DM, vault secrets the model never reads, watches that cost nothing until output changes, routines that fire as fresh workers). Engines are interchangeable runners (Claude Code default; Grok Build, Antigravity, Codex) behind the same envelope — the subscriptions you already pay for, one place.
 
 Not: a Claude Code plugin, a Slack bot, a web agent dashboard, or Claude background agents / `claude attach` (explicitly dropped in v3).
 
@@ -41,7 +41,7 @@ Confirmed (README / `docs/DESIGN.md`):
 
 - Orchestrator 60s cap; longer work goes to a session. If the cap fires and the orchestrator does not spawn, ccc starts the session itself. `/session <prompt>` starts a worker without the orchestrator.
 - Live session card in the Telegram DM (one block per working session), pinned while a worker is running, waiting, or on a background job. `/sessions` is the full list.
-- Idle sessions waiting on the owner (no pending `ask_owner`) wake the orchestrator **once per idle spell** after 10 minutes (inbox, not a chat ping). The orchestrator conversation is rotated after `idle_compact_s` like any other session. Parked questions stay in the DM; the next free-text message lists them. Tapping one answers similar pending questions. Every `ask_owner` keyboard ends with **Omitir** (skip without choosing, unblocks the session).
+- Idle sessions waiting on the owner (no pending `ask_owner`) wake the orchestrator **once per idle spell** after 10 minutes (inbox, not a chat ping). The orchestrator conversation is rotated after `idle_compact_s` like any other session. Parked questions stay in the DM; the next free-text message lists them as text (no keyboard). Reply to the original question to answer; similar pending questions are answered together.
 - `/stop` kills the active turn (orchestrator or a named worker). Hung CLIs get SIGTERM, then SIGKILL. Workers have a 30m cap (`worker_turn_timeout_s`).
 - `/access add` does not grant anyone. Extra users are config whitelist only (`allowed_user_ids`). There is no phone pairing hub.
 - Tools sessions actually have: `remember` / `recall` / `forget`; `notify_owner` / `ask_owner`; `watch` / `schedule_wakeup` / `set_routine`; `run_background` / `run` with vault inject; `secrets_list` / `secrets_delete` (no `secrets_get`); orchestrator-only `spawn_session` / `tell_session`; workers-only `report_to_general`; `send_file`; `get_project` / `set_project`; `set_name`; `archive_bot`.

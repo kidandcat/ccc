@@ -177,7 +177,7 @@ type Schedule struct {
 }
 
 // Question is an ask_owner round trip: asked during a turn, answered later by
-// a button tap or a reply in the topic.
+// a reply to that question in the DM.
 type Question struct {
 	ID             int64 `gorm:"primaryKey"`
 	BotID          int64 `gorm:"index;not null"`

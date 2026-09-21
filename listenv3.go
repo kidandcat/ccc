@@ -516,31 +516,6 @@ func (in *instance) tickAskedMessage(q *Question, answer string) {
 	_ = editMessageHTMLMarkup(cfg, chat, q.AskedMessageID, thread, questionAnsweredHTML(q, answer), &empty) // safe-ignore: ticking the question message is cosmetic
 }
 
-// showQuestionAnswered ticks the original ask_owner message and the message
-// the owner actually tapped (the pending-decision card is a different id).
-func (in *instance) showQuestionAnswered(cb *CallbackQuery, q *Question, answer string) {
-	in.tickAskedMessage(q, answer)
-	if cb == nil || cb.Message == nil {
-		return
-	}
-	if q != nil && int64(cb.Message.MessageID) == q.AskedMessageID {
-		return
-	}
-	remaining := livePendingAsks(in.db)
-	if len(remaining) == 0 {
-		in.editCallbackMessage(cb, questionAnsweredHTML(q, answer))
-		return
-	}
-	shown := remaining
-	extra := 0
-	if len(shown) > maxPendingAskList {
-		extra = len(shown) - maxPendingAskList
-		shown = shown[:maxPendingAskList]
-	}
-	body, rows := renderPendingAsks(shown, len(remaining), extra)
-	in.editCallbackMarkup(cb, body, &rows)
-}
-
 // botForQuestionReply matches a reply-to against any pending ask_owner
 // question, so the owner can answer a worker from the DM.
 func (in *instance) botForQuestionReply(msg *TelegramMessage) (*Bot, bool) {
@@ -620,47 +595,39 @@ func (in *instance) answerOwnerQuestion(q *Question, answer string) error {
 	return nil
 }
 
-// renderPendingAsks is the DM list of unanswered ask_owner rows plus their
-// buttons. Options are numbered in the body and on the keyboard so Telegram
-// truncation cannot make two choices look the same (same trick as /account).
-func renderPendingAsks(shown []pendingAsk, total, extra int) (string, [][]InlineKeyboardButton) {
+// renderPendingAsks is the DM list of unanswered ask_owner rows. Options are
+// numbered in the body so Telegram truncation cannot make two choices look
+// the same. There is no keyboard; the owner replies to the original question.
+func renderPendingAsks(shown []pendingAsk, total, extra int) string {
 	var body strings.Builder
 	if total == 1 {
 		body.WriteString("❓ Pending decision")
 	} else {
 		fmt.Fprintf(&body, "❓ %d pending decisions", total)
 	}
-	var rows [][]InlineKeyboardButton
 	n := 0
 	for _, item := range shown {
 		fmt.Fprintf(&body, "\n\n<b>%s</b>\n%s", htmlEscape(item.Name), renderTelegramHTML(item.Q.Question))
 		opts := questionOptions(&item.Q)
 		if questionIsFreeText(opts) {
 			body.WriteString("\n<i>Reply to the original question.</i>")
-		}
-		if len(opts) == 0 {
 			continue
 		}
-		var row []InlineKeyboardButton
-		for i, o := range opts {
+		for _, o := range opts {
 			n++
 			fmt.Fprintf(&body, "\n%d. %s", n, htmlEscape(o))
-			row = append(row, InlineKeyboardButton{
-				Text:         strconv.Itoa(n),
-				CallbackData: fmt.Sprintf("q:%d:%d", item.Q.ID, i),
-			})
 		}
-		rows = append(rows, row)
+		body.WriteString("\n<i>Reply to the original question.</i>")
 	}
 	if extra > 0 {
 		fmt.Fprintf(&body, "\n\n<i>and %d more</i>", extra)
 	}
-	return body.String(), rows
+	return body.String()
 }
 
-// listPendingAsks posts unanswered ask_owner rows as one DM message with their
-// buttons. No timeout: it stays until the owner taps or replies. No-ops when
-// nothing is pending or Telegram is not configured.
+// listPendingAsks posts unanswered ask_owner rows as one DM message. No
+// timeout: it stays until the owner replies. No-ops when nothing is pending
+// or Telegram is not configured.
 func (in *instance) listPendingAsks() {
 	asks := livePendingAsks(in.db)
 	if len(asks) == 0 {
@@ -677,18 +644,14 @@ func (in *instance) listPendingAsks() {
 		extra = len(shown) - maxPendingAskList
 		shown = shown[:maxPendingAskList]
 	}
-	body, rows := renderPendingAsks(shown, len(asks), extra)
-	if len(rows) == 0 {
-		_, _ = sendMessageHTMLGetID(cfg, chat, thread, body)
-		return
-	}
-	_, _ = sendMessageKeyboardGetID(cfg, chat, thread, body, rows)
+	body := renderPendingAsks(shown, len(asks), extra)
+	_, _ = sendMessageHTMLGetID(cfg, chat, thread, body)
 }
 
 // handleCallback processes an inline button tap. Callback data is ccc's own
-// (`q:`, `account:`, `model:`), but the TAP is an inbound update like any
-// other, so it goes through the same gate — and the owner-only namespaces are
-// checked again here.
+// (`account:`, `model:`), but the TAP is an inbound update like any other, so
+// it goes through the same gate — and the owner-only namespaces are checked
+// again here. Leftover ask_owner `q:` taps are acked and ignored.
 func (in *instance) handleCallback(cb *CallbackQuery) {
 	cfg := in.config()
 	role := in.gate(cb.From.ID)
@@ -713,50 +676,9 @@ func (in *instance) handleCallback(cb *CallbackQuery) {
 			in.handleModelCallback(cb, parts)
 		}
 		return
+	default:
+		answerCallbackQuery(cfg, cb.ID, "")
 	}
-	in.handleQuestionCallback(cb, parts)
-}
-
-func (in *instance) handleQuestionCallback(cb *CallbackQuery, parts []string) {
-	cfg := in.config()
-	if len(parts) != 3 || parts[0] != "q" {
-		answerCallbackQuery(cfg, cb.ID, "Unknown button")
-		hookLog("question callback: bad data %q", cb.Data)
-		return
-	}
-	qID, err1 := strconv.ParseInt(parts[1], 10, 64)
-	idx, err2 := strconv.Atoi(parts[2])
-	if err1 != nil || err2 != nil {
-		answerCallbackQuery(cfg, cb.ID, "Unknown button")
-		hookLog("question callback: parse %q: %v %v", cb.Data, err1, err2)
-		return
-	}
-	var q Question
-	if err := in.db.First(&q, qID).Error; err != nil {
-		answerCallbackQuery(cfg, cb.ID, "That question is gone")
-		hookLog("question callback: %d: %v", qID, err)
-		in.editCallbackMessage(cb, "That question is gone")
-		return
-	}
-	if q.AnsweredAt != nil {
-		answerCallbackQuery(cfg, cb.ID, "Already answered")
-		in.showQuestionAnswered(cb, &q, q.Answer)
-		return
-	}
-	opts := questionOptions(&q)
-	if idx < 0 || idx >= len(opts) {
-		answerCallbackQuery(cfg, cb.ID, "Unknown option")
-		hookLog("question callback: %d option %d of %d", qID, idx, len(opts))
-		return
-	}
-	choice := opts[idx]
-	if err := in.answerOwnerQuestion(&q, choice); err != nil {
-		answerCallbackQuery(cfg, cb.ID, "Could not record that")
-		hookLog("enqueue answer: %v", err)
-		return
-	}
-	answerCallbackQuery(cfg, cb.ID, choice)
-	in.showQuestionAnswered(cb, &q, choice)
 }
 
 // ---------------------------------------------------------------------------
