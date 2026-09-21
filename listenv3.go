@@ -1572,7 +1572,7 @@ func renderModelStatus(cfg *Config, b *Bot) (string, [][]InlineKeyboardButton) {
 		}
 		buttons = append(buttons, []InlineKeyboardButton{{
 			Text:         clipButtonText(label),
-			CallbackData: "model:pick:" + accountTarget(p.Name),
+			CallbackData: "model:pick:" + accountButtonTarget(p),
 		}})
 	}
 	sb.WriteString("Tap an account to pick its model. /model &lt;slug&gt; sets Claude's instance default. ")

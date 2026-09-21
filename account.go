@@ -233,7 +233,7 @@ func renderAccounts(cards []accountCard) (string, [][]InlineKeyboardButton) {
 		if eng == engineClaude && !c.Disclaimer {
 			sb.WriteString("  ⚠️ bypass disclaimer not accepted\n")
 		}
-		target := accountTarget(c.Profile.Name)
+		target := accountButtonTarget(c.Profile)
 		row := []InlineKeyboardButton{{Text: fmt.Sprintf("%d Relogin", n), CallbackData: "account:login:" + target}}
 		if !c.IsDefault {
 			row = append(row, InlineKeyboardButton{Text: fmt.Sprintf("⭐ %d", n), CallbackData: "account:default:" + target})
@@ -417,6 +417,10 @@ func (in *instance) accountSetDefault(chatID, topicID int64, name string) {
 		in.post(chatID, topicID, "No account <b>"+htmlEscape(name)+"</b>.")
 		return
 	}
+	in.applyDefaultAccount(chatID, topicID, p)
+}
+
+func (in *instance) applyDefaultAccount(chatID, topicID int64, p Profile) {
 	key := p.Name
 	updated := updateConfig(func(c *Config) bool { c.DefaultProfile = key; return true })
 	if updated == nil {
@@ -452,7 +456,7 @@ func (in *instance) accountAskRemove(msg *TelegramMessage, name string) {
 	}
 	body := "Remove account <b>" + htmlEscape(shown) + "</b>? Its config dir stays on disk."
 	buttons := [][]InlineKeyboardButton{{
-		{Text: "🗑 Remove", CallbackData: "account:removeok:" + accountTarget(p.Name)},
+		{Text: "🗑 Remove", CallbackData: "account:removeok:" + accountButtonTarget(p)},
 		{Text: "Cancel", CallbackData: "account:cancel:-"},
 	}}
 	_, _ = sendMessageKeyboardGetID(cfg, msg.Chat.ID, msg.MessageThreadID, body, buttons) // safe-ignore: the command is a no-op if this fails
@@ -505,8 +509,8 @@ func (in *instance) handleAccountCallback(cb *CallbackQuery, parts []string) {
 		in.editCallbackMessage(cb, "Cancelled.")
 		return
 	}
-	// Every other button carries a profile reference, which is an email or a
-	// digest standing in for one too long for callback_data (profiles.go).
+	// Every other button carries identity/engine (or a digest if that overflows
+	// callback_data). A bare email is also accepted so stale buttons still work.
 	p, ok := resolveAccountTarget(in.config(), parts[2])
 	if !ok {
 		in.editCallbackMessage(cb, "That account is gone.")
@@ -514,9 +518,12 @@ func (in *instance) handleAccountCallback(cb *CallbackQuery, parts []string) {
 	}
 	switch parts[1] {
 	case "login":
-		in.startLogin(chatID, topicID, p.Name)
+		// p is already the unique profile the button named. Do not round-trip
+		// through startLogin's owner-facing lookup: Claude's map key is the
+		// bare email, which is ambiguous when another engine shares it.
+		in.runLogin(chatID, topicID, p)
 	case "default":
-		in.accountSetDefault(chatID, topicID, p.Name)
+		in.applyDefaultAccount(chatID, topicID, p)
 	case "removeok":
 		in.editCallbackMessage(cb, in.accountRemove(p.Name))
 	}
@@ -632,7 +639,11 @@ func (in *instance) startLogin(chatID, topicID int64, name string) {
 		in.post(chatID, topicID, "No account <b>"+htmlEscape(name)+"</b>."+addHint)
 		return
 	}
-	name = p.Name
+	in.runLogin(chatID, topicID, p)
+}
+
+func (in *instance) runLogin(chatID, topicID int64, p Profile) {
+	name := p.Name
 
 	ctx, cancel := context.WithTimeout(context.Background(), ptyLoginTimeout)
 	waiter := &loginWaiter{chatID: chatID, topicID: topicID, profile: name, codes: make(chan string, 1), cancel: cancel}

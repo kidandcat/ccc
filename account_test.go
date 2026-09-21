@@ -135,16 +135,16 @@ func TestRenderAccountsCard(t *testing.T) {
 			}
 		}
 	}
-	if got, want := buttons[0][0].CallbackData, "account:login:"+accountTarget("work"); got != want {
+	if got, want := buttons[0][0].CallbackData, "account:login:"+accountButtonTarget(cards[0].Profile); got != want {
 		t.Errorf("account 1 relogin callback = %q, want %q", got, want)
 	}
-	if got, want := buttons[1][0].CallbackData, "account:login:"+accountTarget("personal"); got != want {
+	if got, want := buttons[1][0].CallbackData, "account:login:"+accountButtonTarget(cards[1].Profile); got != want {
 		t.Errorf("account 2 relogin callback = %q, want %q", got, want)
 	}
-	if got, want := buttons[1][1].CallbackData, "account:default:"+accountTarget("personal"); got != want {
+	if got, want := buttons[1][1].CallbackData, "account:default:"+accountButtonTarget(cards[1].Profile); got != want {
 		t.Errorf("account 2 default callback = %q, want %q", got, want)
 	}
-	if got, want := buttons[2][0].CallbackData, "account:login:"+accountTarget("spare"); got != want {
+	if got, want := buttons[2][0].CallbackData, "account:login:"+accountButtonTarget(cards[2].Profile); got != want {
 		t.Errorf("account 3 relogin callback = %q, want %q", got, want)
 	}
 }
@@ -186,7 +186,7 @@ func TestRenderAccountsNumbersSameEmailDifferentEngines(t *testing.T) {
 	if buttons[1][1].Text != "⭐ 2" || buttons[2][1].Text != "⭐ 3" {
 		t.Errorf("default labels = %q %q", buttons[1][1].Text, buttons[2][1].Text)
 	}
-	if got, want := buttons[0][0].CallbackData, "account:login:jairo.caroaccino@agentero.com"; got != want {
+	if got, want := buttons[0][0].CallbackData, "account:login:jairo.caroaccino@agentero.com/claude"; got != want {
 		t.Errorf("1 relogin callback = %q, want %q", got, want)
 	}
 	if got, want := buttons[1][0].CallbackData, "account:login:jairo.caroaccino@agentero.com/codex"; got != want {
@@ -195,7 +195,10 @@ func TestRenderAccountsNumbersSameEmailDifferentEngines(t *testing.T) {
 	if got, want := buttons[1][1].CallbackData, "account:default:jairo.caroaccino@agentero.com/codex"; got != want {
 		t.Errorf("2 default callback = %q, want %q", got, want)
 	}
-	if got, want := buttons[2][0].CallbackData, "account:login:jairo@agentero.com"; got != want {
+	if got, want := buttons[2][1].CallbackData, "account:default:jairo@agentero.com/claude"; got != want {
+		t.Errorf("3 default callback = %q, want %q", got, want)
+	}
+	if got, want := buttons[2][0].CallbackData, "account:login:jairo@agentero.com/claude"; got != want {
 		t.Errorf("3 relogin callback = %q, want %q", got, want)
 	}
 }
@@ -911,6 +914,81 @@ func TestAccountLoginDisambiguation(t *testing.T) {
 	in.accountSetDefault(42, 0, "jairo@example.com")
 	if in.config().DefaultProfile != before {
 		t.Error("default with a shared email must not pick an engine silently")
+	}
+}
+
+func TestAccountLoginCallbackIncludesEngineWhenEmailIsShared(t *testing.T) {
+	in, _, api := testInstance(t)
+	in.setConfig(&Config{
+		BotToken: "TESTTOKEN", ChatID: 42, DataDir: in.dataDir,
+		DefaultProfile: "jairo.caroaccino@agentero.com",
+		Profiles: map[string]*Profile{
+			"jairo.caroaccino@agentero.com": {
+				Engine: engineClaude, Label: "jairo.caroaccino@agentero.com", ConfigDir: t.TempDir(),
+			},
+			"jairo.caroaccino@agentero.com/codex": {
+				Engine: engineCodex, Label: "jairo.caroaccino@agentero.com", ConfigDir: t.TempDir(),
+			},
+			"jairo@agentero.com": {
+				Engine: engineClaude, Label: "jairo@agentero.com", ConfigDir: t.TempDir(),
+			},
+		},
+	})
+	if err := saveConfig(in.config()); err != nil {
+		t.Fatal(err)
+	}
+	stubPTY(t, in)
+
+	cards := in.collectAccountCards()
+	_, buttons := renderAccounts(cards)
+	if len(buttons) < 3 {
+		t.Fatalf("buttons = %+v", buttons)
+	}
+	claudeLogin := buttons[0][0].CallbackData
+	if claudeLogin != "account:login:jairo.caroaccino@agentero.com/claude" {
+		t.Fatalf("1 Relogin callback = %q, want engine-qualified claude", claudeLogin)
+	}
+
+	cb := &CallbackQuery{ID: "login1", Data: claudeLogin}
+	cb.From.ID = 42
+	cb.Message = dmMessage(42, "")
+	in.handleCallback(cb)
+	waitForLogin(t, in)
+	got := strings.Join(api.texts(""), "\n")
+	if strings.Contains(got, "Several accounts") {
+		t.Errorf("1 Relogin must not ask to specify the engine:\n%s", got)
+	}
+	if !strings.Contains(got, "Starting") || !strings.Contains(strings.ToLower(got), "claude") {
+		t.Errorf("1 Relogin should start the Claude login:\n%s", got)
+	}
+
+	n := len(api.texts(""))
+	codexDefault := buttons[1][1].CallbackData
+	if !strings.HasPrefix(codexDefault, "account:default:jairo.caroaccino@agentero.com/codex") {
+		t.Fatalf("2 Default callback = %q", codexDefault)
+	}
+	def := &CallbackQuery{ID: "def2", Data: codexDefault}
+	def.From.ID = 42
+	def.Message = dmMessage(42, "")
+	in.handleCallback(def)
+	if in.config().DefaultProfile != "jairo.caroaccino@agentero.com/codex" {
+		t.Errorf("2 Default = %q, want the Codex key", in.config().DefaultProfile)
+	}
+	defMsg := strings.Join(api.texts("")[n:], "\n")
+	if strings.Contains(defMsg, "Several accounts") {
+		t.Errorf("2 Default must not ask to specify the engine:\n%s", defMsg)
+	}
+
+	// A stale button that still carried the bare Claude key must keep working.
+	n = len(api.texts(""))
+	stale := &CallbackQuery{ID: "stale", Data: "account:login:jairo.caroaccino@agentero.com"}
+	stale.From.ID = 42
+	stale.Message = dmMessage(42, "")
+	in.handleCallback(stale)
+	waitForLogin(t, in)
+	staleGot := strings.Join(api.texts("")[n:], "\n")
+	if strings.Contains(staleGot, "Several accounts") {
+		t.Errorf("legacy bare-email Relogin must still pick Claude, not ask:\n%s", staleGot)
 	}
 }
 

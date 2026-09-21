@@ -481,6 +481,23 @@ func accountDisplay(p Profile) string {
 // prefix the account buttons use ("account:default:").
 const accountTargetBudget = 64 - len("account:default:")
 
+// accountCallbackRef is the unambiguous profile reference an inline button
+// carries: always identity/engine. Claude's config-map key is the bare email,
+// which addressedAccount treats as ambiguous when another engine shares it —
+// Relogin/Default must never send that form.
+func accountCallbackRef(p Profile) string {
+	id := profileIdentity(p)
+	if id == "" {
+		id = p.Name
+	}
+	return id + "/" + profileEngine(p)
+}
+
+// accountButtonTarget is the callback_data suffix for a profile button.
+func accountButtonTarget(p Profile) string {
+	return accountTarget(accountCallbackRef(p))
+}
+
 // accountTarget is the profile reference an inline button carries. A profile is
 // keyed by an email now, and a long address would overflow callback_data, so an
 // oversized key travels as a short digest instead.
@@ -496,13 +513,20 @@ func accountTarget(name string) string {
 func resolveAccountTarget(config *Config, target string) (Profile, bool) {
 	if strings.HasPrefix(target, "#") {
 		for _, p := range listProfiles(config) {
-			if accountTarget(p.Name) == target {
+			if accountButtonTarget(p) == target || accountTarget(p.Name) == target {
 				return p, true
 			}
 		}
 		return Profile{}, false
 	}
-	return profileByKey(config, target)
+	if p, ok := profileByKey(config, target); ok {
+		return p, true
+	}
+	identity, engine := parseAccountRef(target)
+	if identity != "" && engine != "" {
+		return profileByIdentityEngine(config, identity, engine)
+	}
+	return Profile{}, false
 }
 
 // profileDirFor picks the config dir for a new account. Two different addresses

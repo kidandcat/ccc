@@ -1689,7 +1689,7 @@ func (r *Runner) markNeedsLogin(p Profile) {
 	// to reach the machine to fix an account.
 	shown := accountDisplay(p)
 	msg := fmt.Sprintf("🔑 %s account <b>%s</b> needs a new login (a turn was refused).", engineLabel(profileEngine(p)), htmlEscape(shown))
-	buttons := [][]InlineKeyboardButton{{{Text: "🔑 Relogin " + shown, CallbackData: "account:login:" + accountTarget(p.Name)}}}
+	buttons := [][]InlineKeyboardButton{{{Text: "🔑 Relogin " + shown, CallbackData: "account:login:" + accountButtonTarget(p)}}}
 	_, _ = sendMessageKeyboardGetID(cfg, cfg.ChatID, 0, msg, buttons) // safe-ignore: a failed notification must not fail the turn
 }
 

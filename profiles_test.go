@@ -538,6 +538,24 @@ func TestAccountKeysAndSharedEmailLookup(t *testing.T) {
 	if isAccountEmail("jairo@x.com/codex") {
 		t.Error("a composite key must not parse as an email")
 	}
+
+	claude, _ := profileByKey(cfg, "jairo@x.com")
+	codex, _ := profileByKey(cfg, "jairo@x.com/codex")
+	if got := accountCallbackRef(claude); got != "jairo@x.com/claude" {
+		t.Errorf("claude callback ref = %q", got)
+	}
+	if got := accountCallbackRef(codex); got != "jairo@x.com/codex" {
+		t.Errorf("codex callback ref = %q", got)
+	}
+	if p, ok := resolveAccountTarget(cfg, "jairo@x.com/claude"); !ok || profileEngine(p) != engineClaude {
+		t.Fatalf("button email/claude = %+v ok=%v", p, ok)
+	}
+	if p, ok := resolveAccountTarget(cfg, "jairo@x.com/codex"); !ok || profileEngine(p) != engineCodex {
+		t.Fatalf("button email/codex = %+v ok=%v", p, ok)
+	}
+	if p, ok := resolveAccountTarget(cfg, "jairo@x.com"); !ok || profileEngine(p) != engineClaude {
+		t.Fatalf("legacy bare-email button = %+v ok=%v", p, ok)
+	}
 }
 
 func TestClaudeEnvScrubsInheritedState(t *testing.T) {

@@ -726,7 +726,7 @@ func (in *instance) notifyNeedsLogin(p Profile, why string) {
 	}
 	shown := accountDisplay(p)
 	body := fmt.Sprintf("🔑 %s account <b>%s</b> needs a new login (%s).", engineLabel(profileEngine(p)), htmlEscape(shown), htmlEscape(why))
-	buttons := [][]InlineKeyboardButton{{{Text: "🔑 Relogin " + shown, CallbackData: "account:login:" + accountTarget(p.Name)}}}
+	buttons := [][]InlineKeyboardButton{{{Text: "🔑 Relogin " + shown, CallbackData: "account:login:" + accountButtonTarget(p)}}}
 	if _, err := sendMessageKeyboardGetID(cfg, cfg.ChatID, 0, body, buttons); err != nil {
 		hookLog("needs-login notification failed: %v", err)
 	}
