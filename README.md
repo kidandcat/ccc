@@ -24,8 +24,9 @@ still starts a worker without going through the orchestrator. Sessions report on
 to the orchestrator (`report_to_general`); the owner does not see the transcript.
 A live status card in the DM (one block per working session) is pinned
 while a worker is running, waiting, or on a background job; `/sessions`
-is the full list. The orchestrator posts a short DM summary; if it cannot, listen
-posts a short fallback from the worker's last message (never only a
+is the full list. The orchestrator posts the owner-facing result in the DM (a structured
+digest stays readable; it is not crushed into one paragraph); if it cannot,
+listen posts a short fallback from the worker's last message (never only a
 status line).
 There is no role, no `/role`, no «what should I be?» interview.
 

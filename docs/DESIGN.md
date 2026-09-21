@@ -115,10 +115,14 @@ reused across turns (id in `settings.session_panel_msg_id`). `/sessions`
 stays the full list including idle sessions. The card is not a substitute
 for an answer. After a worker turn that reported (`report_to_general`) or
 finished with last-message output, listen wakes General with that inbox
-(relay). General MUST post a short owner-facing summary in the DM. If
-General cannot (60s cap, crash, empty reply), listen posts a short fallback
-from the worker's last message — not the full transcript, not only a status
-line. `notify_owner`, `ask_owner` and job pings still reach the owner.
+(relay). General MUST post the owner-facing result in the DM. If the worker
+already wrote a structured digest (sections + bullets), post it as-is — do
+not crush it into one paragraph. Transcripts stay hidden. If General cannot
+(60s cap, crash, empty reply), listen posts a short fallback from the
+worker's last message — not the full transcript, not only a status line.
+`notify_owner`, `ask_owner` and job pings still reach the owner. Routine
+workers should `notify_owner` only for urgent/red; the digest goes through
+General.
 Idle-session reminders wake General via inbox + enqueue once per idle spell
 (same path as `report_to_general`); they are not posted to the DM and do not
 use the fallback.
@@ -318,7 +322,7 @@ home (Codex also gets per-turn `exec -c`). Identity is `--bot`/`--turn` or
 | `list_sessions` | — | **General only.** Live workers: name, status, last output. |
 | `spawn_session` | `prompt`, `name?` | **General only.** Create a backend worker (no Telegram topic) on the account/engine with the most usage headroom and queue the prompt (wakes after this turn). |
 | `tell_session` | `session`, `text` | **General only.** Inbox + wake a live worker. |
-| `report_to_general` | `text` | **Workers only.** Inbox + wake General (relay). Not dumped into the DM; General (or listen's fallback) summarizes to the owner. |
+| `report_to_general` | `text` | **Workers only.** Inbox + wake General (relay). Not dumped into the DM; General (or listen's fallback) posts the owner-facing result. Write a readable digest (sections + bullets), not a transcript and not one compressed paragraph. |
 
 All tools validate the calling bot from the `--bot` flag; tool inputs coming
 from the model are data, never instructions to ccc.

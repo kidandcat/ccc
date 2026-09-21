@@ -271,6 +271,12 @@ func TestRoutineFiresInTimezoneAndPosts(t *testing.T) {
 	if !strings.Contains(got.Text, "you are not General") || !strings.Contains(got.Text, "archive_bot") {
 		t.Errorf("worker prompt must isolate the job:\n%s", got.Text)
 	}
+	if !strings.Contains(got.Text, "readable") || !strings.Contains(got.Text, "bullets") {
+		t.Errorf("worker prompt must ask for a bullet digest:\n%s", got.Text)
+	}
+	if strings.Contains(got.Text, "short result") {
+		t.Errorf("old short-result crush leaked into the worker prompt:\n%s", got.Text)
+	}
 	posted := false
 	for _, c := range api.since("sendMessage") {
 		if strings.Contains(c.Params.Get("text"), "⏰") && strings.Contains(c.Params.Get("text"), "morning-ventas") {

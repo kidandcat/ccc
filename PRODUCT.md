@@ -18,7 +18,7 @@ Secondary: someone evaluating the public OSS repo (`kidandcat/ccc`) before cloni
 
 ## Product Purpose
 
-**ccc** is a personal assistant in Telegram. One DM; every subscription you already pay for (Claude, Grok, Codex, Antigravity). The bot's 1:1 DM is the **orchestrator**: you talk to it, it sees live sessions, and it can start a backend worker (`spawn_session`) or message one (`tell_session`). Sessions live in the backend — no Telegram topic. The owner never writes into a session chat. Workers report only to the orchestrator (`report_to_general`); the owner does not see the transcript. The orchestrator posts a short DM summary.
+**ccc** is a personal assistant in Telegram. One DM; every subscription you already pay for (Claude, Grok, Codex, Antigravity). The bot's 1:1 DM is the **orchestrator**: you talk to it, it sees live sessions, and it can start a backend worker (`spawn_session`) or message one (`tell_session`). Sessions live in the backend — no Telegram topic. The owner never writes into a session chat. Workers report only to the orchestrator (`report_to_general`); the owner does not see the transcript. The orchestrator posts the owner-facing result in the DM — a structured digest stays readable; it is not crushed into one paragraph.
 
 Success for this landing: a first-time visitor understands they get one assistant for every AI subscription they already pay for, in Telegram; believes the product is self-hosted OSS (not a hosted chat SaaS); and goes to https://github.com/kidandcat/ccc.
 

@@ -19,7 +19,7 @@ func queueBotMessage(db *gorm.DB, from *Bot, toName, body string, wake bool) (*B
 
 // queueOwnerRelay is a worker → General report the owner must hear. Quiet
 // stays: the body is not dumped into Telegram. listen wakes General; if
-// General does not post a summary, listen posts a short fallback.
+// General does not post the result, listen posts a short fallback.
 func queueOwnerRelay(db *gorm.DB, from *Bot, body string) (*Bot, *InboxMessage, error) {
 	chief, err := generalBot(db)
 	if err != nil {

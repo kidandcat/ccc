@@ -226,7 +226,7 @@ func (s *mcpServer) registerCrew(server *mcp.Server) {
 	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "report_to_general",
-		Description: "Send a status update to General (the dispatcher). Full reports stay with General; they are not posted to the owner. Use it for finished work, a blocker, or a question for the dispatcher. You cannot message other sessions.",
+		Description: "Send a status update to General (the dispatcher). It posts the owner-facing result; do not dump a transcript. For owner-facing results write a readable digest (short sections + bullets), not one paragraph. Use it for finished work, a blocker, or a question for the dispatcher. You cannot message other sessions.",
 	}, s.reportToGeneral)
 }
 

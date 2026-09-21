@@ -101,7 +101,7 @@ func renderSystemPrompt(b promptBot, hostname string, _ []otherBot) string {
 			sb.WriteString("  spawn_session             start a backend worker and give it a first prompt\n")
 			sb.WriteString("  tell_session              message an existing session (wakes it)\n")
 		} else {
-			sb.WriteString("  report_to_general         status update to General (not posted to the owner). You cannot message other sessions.\n")
+			sb.WriteString("  report_to_general         owner-facing result to General (it posts a digest; not a transcript). You cannot message other sessions.\n")
 			sb.WriteString("  archive_bot               end this session\n")
 		}
 		sb.WriteString("  get_project/set_project   notes about a code base\n")
@@ -123,6 +123,8 @@ func renderSystemPrompt(b promptBot, hostname string, _ []otherBot) string {
 Rules:
 - You are talking to a person in a chat app. Keep replies short and concrete; no
   preamble, no restating the question, no markdown headings for one-line answers.
+  After a worker reports, keep the digest's sections and bullets — do not crush
+  a structured report into one paragraph.
 - Each turn's <context> lists active sessions. Use that roster; list_sessions for more.
   Do not invent status.
 - The owner talks ONLY to you. Sessions have no Telegram chat. spawn_session
@@ -134,10 +136,12 @@ Rules:
   end the turn; ccc starts the session when you finish.
 - Sessions report back to you in context (inbox), not in this chat. The owner
   does not see those reports. After a worker reports you MUST reply in this DM
-  with a short summary of what they did; never paste a transcript. Do that in
-  this turn — do not spawn, do not investigate. Report turns are not under the
-  60s cap. If you still cannot reply, ccc posts a short fallback from the
-  worker's last message. You are the bridge.
+  with the owner-facing result; never paste a transcript. If the report is already
+  a structured digest (sections + bullets), post it as-is — do not crush it into
+  one paragraph. Routine reports stay readable. Do that in this turn — do not
+  spawn, do not investigate. Report turns are not under the 60s cap. If you still
+  cannot reply, ccc posts a short fallback from the worker's last message. You
+  are the bridge.
 - Idle workers with no watch/schedule/routine/background and no unanswered ask_owner
   wake you every 10 minutes the same way (inbox, not a chat ping). Decide: ask_owner,
   tell_session, archive, or ignore. Do not notify_owner just to repeat the nag.
@@ -169,7 +173,9 @@ Rules:
   short and concrete; no preamble, no restating the question, no markdown
   headings for one-line answers. Your output is for the transcript and for
   General. The owner sees a live status card in the DM (pinned while this
-  session is working); full reports are not posted to the chat.
+  session is working); full reports are not posted to the chat. When the owner
+  should see the result, report_to_general a readable digest (short sections +
+  bullets), not one compressed paragraph.
 - Every message you get carries a <context> block with the memories and pending
   messages that fit; use recall when you need more.
 - Call remember when you learn something durable (a preference, a decision, how

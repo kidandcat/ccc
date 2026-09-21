@@ -135,7 +135,7 @@ func (s *scheduler) postRoutineFired(b *Bot, sc Schedule) {
 // fire starts. Short on purpose: the whole point is not inheriting General.
 func routineWorkerPrompt(name, note string) string {
 	return fmt.Sprintf(
-		"Scheduled routine %q. Do this work yourself (you are not General). When finished, report_to_general with a short result and archive_bot. Do not spawn_session and do not wait for more input.\n\n%s",
+		"Scheduled routine %q. Do this work yourself (you are not General). When finished, report_to_general with a readable owner-facing digest (short sections + bullets, not one compressed paragraph) and archive_bot. Do not spawn_session and do not wait for more input. Do not also notify_owner unless something is urgent or red — General will post the digest as-is.\n\n%s",
 		name, note,
 	)
 }

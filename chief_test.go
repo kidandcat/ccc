@@ -318,6 +318,9 @@ func TestChiefPromptIsByteStable(t *testing.T) {
 	if !strings.Contains(first, "MUST reply in this DM") {
 		t.Errorf("chief prompt must require a user-visible summary after a worker reports:\n%s", first)
 	}
+	if !strings.Contains(first, "do not crush") {
+		t.Errorf("chief prompt must not crush structured worker digests:\n%s", first)
+	}
 	if !strings.Contains(first, "not under the") || !strings.Contains(first, "60s cap") {
 		t.Errorf("chief prompt must say report turns are not 60s-capped:\n%s", first)
 	}
