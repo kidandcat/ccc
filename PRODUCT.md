@@ -40,7 +40,7 @@ Not: a Claude Code plugin, a Slack bot, a web agent dashboard, or Claude backgro
 Confirmed (README / `docs/DESIGN.md`):
 
 - Orchestrator 60s cap; longer work goes to a session. If the cap fires and the orchestrator does not spawn, ccc starts the session itself. `/session <prompt>` starts a worker without the orchestrator.
-- Live session card in the Telegram DM (one block per working session), pinned while a worker is running, waiting, or on a background job. `/sessions` is the full list.
+- Live session card in the Telegram DM (one block per working session), pinned while a worker is running or on a background job. A session parked on `ask_owner` is not on that card. `/sessions` is the full list.
 - Idle sessions waiting on the owner (no pending `ask_owner`) wake the orchestrator **once per idle spell** after 10 minutes (inbox, not a chat ping). The orchestrator conversation is rotated after `idle_compact_s` like any other session. Parked questions stay in the DM as the original message; free text does not repost them. Reply to the original question to answer; similar pending questions are answered together.
 - `/stop` kills the active turn (orchestrator or a named worker). Hung CLIs get SIGTERM, then SIGKILL. Workers have a 30m cap (`worker_turn_timeout_s`).
 - `/access add` does not grant anyone. Extra users are config whitelist only (`allowed_user_ids`). There is no phone pairing hub.

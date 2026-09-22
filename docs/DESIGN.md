@@ -107,10 +107,12 @@ into the chat; `thinking` is never shown.
 Backend workers do not post progress or final answers to Telegram. The owner
 does not see General↔session messages (prompts, reports, transcripts). A
 **live status card** in the owner's DM is posted silently and edited in
-place: one block per working session (name, running/waiting/job, current
-tool or pending `ask_owner` line). It is **pinned** (`pinChatMessage`,
-`disable_notification`) while any worker is running, waiting, or has a
-background job, and unpinned when that work ends. The same message is
+place: one block per working session (name, running/job, current
+tool line). It is **pinned** (`pinChatMessage`,
+`disable_notification`) while any worker is running or has a
+background job, and unpinned when that work ends. A session parked on
+`ask_owner` is not a card and is not pinned; the question message is the
+only copy. The same message is
 reused across turns (id in `settings.session_panel_msg_id`). `/sessions`
 stays the full list including idle sessions. The card is not a substitute
 for an answer. After a worker turn that reported (`report_to_general`) or
@@ -976,8 +978,8 @@ gone. The owner talks only to General in the bot's 1:1 DM. Group messages
 are ignored. `spawn_session` and `/session` create a backend worker
 (`TopicID = -id`). Worker progress and final answers stay off Telegram;
 the owner does not see General↔session prompts or reports. A live status
-card in the DM (pinned while any worker is running, waiting, or on a
-background job) is edited in place; `/sessions` remains the full list.
+card in the DM (pinned while any worker is running or on a background
+job; a parked `ask_owner` is not a card) is edited in place; `/sessions` remains the full list.
 Full reports stay in General's inbox.
 `notify_owner`, `ask_owner` and job pings still reach the owner.
 Idle-session reminders stay in General's inbox (they are not a Telegram ping).

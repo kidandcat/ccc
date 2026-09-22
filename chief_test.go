@@ -223,11 +223,11 @@ func TestPostOwnerSessionStatusSkipsGeneral(t *testing.T) {
 	} else if len(ui.posts) > 0 {
 		got = ui.posts[len(ui.posts)-1]
 	}
-	if !strings.Contains(got, "waiting") {
-		t.Errorf("worker waiting = posts %v edits %v", ui.posts, ui.edits)
+	if strings.Contains(got, "waiting") || strings.Contains(got, "❓") {
+		t.Errorf("parked ask_owner must not stay on the card, got %q", got)
 	}
-	if len(ui.pins) == 0 {
-		t.Errorf("waiting is work and must pin, pins=%v", ui.pins)
+	if len(ui.pins) != 0 {
+		t.Errorf("a parked ask_owner must not pin, pins=%v", ui.pins)
 	}
 	setBotStatus(in.db, w.ID, botIdle)
 	r.postOwnerSessionStatus(w, errFatal, false)

@@ -108,15 +108,13 @@ func TestSessionPanelShowsWaitingQuestion(t *testing.T) {
 	setBotStatus(in.db, w.ID, botWaiting)
 	in.db.Create(&Question{BotID: w.ID, Question: "Raise the bid to €0.80?"})
 	p.sync(true)
-	if len(ui.posts) != 1 {
-		t.Fatalf("posts=%v", ui.posts)
+	if len(ui.posts) != 0 || len(ui.pins) != 0 {
+		t.Fatalf("a parked ask_owner must not get a card, posts=%v pins=%v", ui.posts, ui.pins)
 	}
-	got := ui.posts[0]
-	if !strings.Contains(got, "❓") || !strings.Contains(got, "waiting") || !strings.Contains(got, "Raise the bid") {
-		t.Errorf("waiting card = %q", got)
-	}
-	if len(ui.pins) != 1 {
-		t.Errorf("waiting is work and must pin, pins=%v", ui.pins)
+	for _, edit := range ui.edits {
+		if strings.Contains(edit, "Raise the bid") || strings.Contains(edit, "waiting") {
+			t.Errorf("question leaked onto the card: %q", edit)
+		}
 	}
 }
 

@@ -13,9 +13,11 @@ import (
 
 // The live session panel is one silent Telegram message in the owner's DM.
 // Each working session is a card (name, status, current line). The message is
-// pinned while any worker is running, waiting, or has a background job, and
-// unpinned when that work ends. /sessions stays the full list. Workers still
-// do not dump transcripts into the DM (DESIGN §3.2).
+// pinned while any worker is running or has a background job, and unpinned
+// when that work ends. A session parked on ask_owner is not a card: the
+// question is already one message in the DM, and it is not repeated here.
+// /sessions stays the full list. Workers still do not dump transcripts into
+// the DM (DESIGN §3.2).
 
 const (
 	settingSessionPanelMsgID = "session_panel_msg_id"
@@ -73,22 +75,6 @@ func panelSurfaceOf(ui botUI) panelSurface {
 	}
 }
 
-// pendingQuestionsByBot returns the first unanswered ask_owner per session.
-func pendingQuestionsByBot(db *gorm.DB) map[int64]Question {
-	if db == nil {
-		return nil
-	}
-	var rows []Question
-	db.Where("answered_at IS NULL").Order("id").Find(&rows)
-	out := map[int64]Question{}
-	for i := range rows {
-		if _, ok := out[rows[i].BotID]; !ok {
-			out[rows[i].BotID] = rows[i]
-		}
-	}
-	return out
-}
-
 func (p *sessionPanel) setActivity(botID int64, activity string) {
 	if p == nil {
 		return
@@ -130,13 +116,13 @@ func (p *sessionPanel) sync(force bool) {
 		return
 	}
 	msgID := p.msgID
-	p.lastHTML = html
-	p.lastEdit = time.Now()
-
 	if html == "" {
-		p.unpin()
+		p.clear()
+		p.lastEdit = time.Now()
 		return
 	}
+	p.lastHTML = html
+	p.lastEdit = time.Now()
 	if err := p.upsert(msgID, html); err != nil {
 		hookLog("session panel: %v", err)
 		return
@@ -199,6 +185,19 @@ func (p *sessionPanel) unpin() {
 	p.pinned = false
 }
 
+// clear drops a card that has nothing left to show, so a previous ask_owner
+// line cannot stay in the DM after the session is no longer working.
+func (p *sessionPanel) clear() {
+	id := p.msgID
+	if id != 0 {
+		if err := p.ui.Edit(0, id, "·"); err != nil {
+			hookLog("session panel: clear %d: %v", id, err)
+		}
+	}
+	p.lastHTML = ""
+	p.unpin()
+}
+
 func (p *sessionPanel) snapshot() []sessionCard {
 	bots, err := liveBots(p.db)
 	if err != nil {
@@ -211,7 +210,6 @@ func (p *sessionPanel) snapshot() []sessionCard {
 	}
 	p.mu.Unlock()
 
-	questions := pendingQuestionsByBot(p.db)
 	var jobs []BackgroundJob
 	p.db.Where("status = ?", jobRunning).Find(&jobs)
 	jobsByBot := map[int64][]BackgroundJob{}
@@ -237,12 +235,7 @@ func (p *sessionPanel) snapshot() []sessionCard {
 			}
 			c.Elapsed = runningElapsed(p.db, b.ID, now)
 		case botWaiting:
-			hot = true
-			if q, ok := questions[b.ID]; ok && strings.TrimSpace(q.Question) != "" {
-				c.Line = q.Question
-			} else {
-				c.Line = "waiting on you"
-			}
+			// The question message is the ask. Do not pin a second copy.
 		default:
 			if act := strings.TrimSpace(acts[b.ID]); act != "" {
 				hot = true
@@ -252,7 +245,7 @@ func (p *sessionPanel) snapshot() []sessionCard {
 		}
 		if js := jobsByBot[b.ID]; len(js) > 0 {
 			hot = true
-			if c.Status == botIdle {
+			if c.Status == botIdle || c.Status == botWaiting {
 				c.Status = "job"
 			}
 			if c.Line == "" {
@@ -410,7 +403,7 @@ func (p *sessionPanel) showTerminal(b *Bot, status string) {
 	p.lastHTML = html
 	p.lastEdit = time.Now()
 	if html == "" {
-		p.unpin()
+		p.clear()
 		return
 	}
 	if err := p.upsert(p.msgID, html); err != nil {

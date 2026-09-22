@@ -23,7 +23,8 @@ chat ping); it decides what to do. `/session <prompt>`
 still starts a worker without going through the orchestrator. Sessions report only
 to the orchestrator (`report_to_general`); the owner does not see the transcript.
 A live status card in the DM (one block per working session) is pinned
-while a worker is running, waiting, or on a background job; `/sessions`
+while a worker is running or on a background job. A session parked on
+ask_owner is not on that card; `/sessions`
 is the full list. The orchestrator posts the owner-facing result in the DM (a structured
 digest stays readable; it is not crushed into one paragraph); if it cannot,
 listen posts a short fallback from the worker's last message (never only a
