@@ -453,15 +453,6 @@ func isSkipOption(s string) bool {
 	return strings.EqualFold(s, skipOptionLabel) || strings.EqualFold(s, "Skip")
 }
 
-func questionIsFreeText(opts []string) bool {
-	for _, o := range opts {
-		if !isSkipOption(o) {
-			return false
-		}
-	}
-	return true
-}
-
 func (s *mcpServer) askOwner(_ context.Context, _ *mcp.CallToolRequest, in askOwnerIn) (*mcp.CallToolResult, any, error) {
 	q := strings.TrimSpace(in.Question)
 	if q == "" {
@@ -678,33 +669,6 @@ func pendingQuestion(db *gorm.DB, botID int64) (*Question, bool) {
 		return nil, false
 	}
 	return &q, true
-}
-
-// pendingAsk is one unanswered ask_owner on a live session, for the DM list.
-type pendingAsk struct {
-	Q    Question
-	Name string
-}
-
-const maxPendingAskList = 8
-
-// livePendingAsks is unanswered questions on live (not archived, not disabled)
-// sessions, oldest first. The DM lists these when the owner types; they are
-// not answered by that text.
-func livePendingAsks(db *gorm.DB) []pendingAsk {
-	var rows []Question
-	if err := db.Where("answered_at IS NULL").Order("id").Find(&rows).Error; err != nil {
-		return nil
-	}
-	out := make([]pendingAsk, 0, len(rows))
-	for i := range rows {
-		b, err := botByID(db, rows[i].BotID)
-		if err != nil || b.ArchivedAt != nil || b.Status == botDisabled {
-			continue
-		}
-		out = append(out, pendingAsk{Q: rows[i], Name: b.Name})
-	}
-	return out
 }
 
 // normalizeQuestionText is the similarity key: case-fold, collapse space, drop

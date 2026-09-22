@@ -315,9 +315,8 @@ func (s *scheduler) enqueueIdleRemind(chief, worker *Bot, now time.Time) error {
 // sessionIdleWaitingOnUser is the idle-remind predicate: a live worker that
 // is idle, has no watch/schedule/routine/background keeping it alive, and has
 // no queued work — so it is waiting on the owner. Parked ask_owner
-// (botWaiting) is not reminded: the question is already in the DM, and the
-// owner sees the list again when they next write. Nagging General would make
-// it re-ask.
+// (botWaiting) is not reminded: the question is already in the DM. Nagging
+// General would make it re-ask. Free text does not repost pending questions.
 func sessionIdleWaitingOnUser(db *gorm.DB, b *Bot) bool {
 	if b == nil || b.ArchivedAt != nil || isGeneralBot(b) {
 		return false

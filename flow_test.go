@@ -426,33 +426,6 @@ func TestLeftoverQuestionCallbackDoesNotAnswer(t *testing.T) {
 	}
 }
 
-func TestLivePendingAsksSkipsDisabled(t *testing.T) {
-	in, _, _ := testInstance(t)
-	live, err := in.createBot("live", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dead, err := in.createBot("dead", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := in.db.Model(dead).Update("status", botDisabled).Error; err != nil {
-		t.Fatal(err)
-	}
-	for _, row := range []Question{
-		{BotID: dead.ID, Question: "stale?", OptionsJSON: `["yes","Omitir"]`},
-		{BotID: live.ID, Question: "live?", OptionsJSON: `["yes","Omitir"]`},
-	} {
-		if err := in.db.Create(&row).Error; err != nil {
-			t.Fatal(err)
-		}
-	}
-	asks := livePendingAsks(in.db)
-	if len(asks) != 1 || asks[0].Name != "live" {
-		t.Fatalf("live pending = %+v, want only the live session", asks)
-	}
-}
-
 func assertNoKeyboard(t *testing.T, api *fakeBotAPI) {
 	t.Helper()
 	calls := api.since("sendMessage")
@@ -555,83 +528,8 @@ func TestFreeTextDoesNotAnswerWaitingQuestion(t *testing.T) {
 		t.Fatalf("free text must go to General, got %+v ok=%v", last, ok)
 	}
 	joined := strings.Join(api.texts(""), "\n")
-	if !strings.Contains(joined, "Pending decision") || !strings.Contains(joined, "Deploy to prod?") {
-		t.Errorf("DM must list pending asks, got %q", joined)
-	}
-}
-
-func TestFreeTextListsPendingAsksWithoutKeyboard(t *testing.T) {
-	in, _, api := testInstance(t)
-	b, err := in.createBot("ads", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	q := Question{BotID: b.ID, Question: "Raise the bid?", OptionsJSON: `["yes","no"]`, AskedMessageID: 9}
-	if err := in.db.Create(&q).Error; err != nil {
-		t.Fatal(err)
-	}
-
-	in.handleMessage(ownerMessage("hola"))
-
-	assertNoKeyboard(t, api)
-	joined := strings.Join(api.texts(""), "\n")
-	for _, want := range []string{"1. yes", "2. no", "Reply to the original question"} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("pending list body missing %q, got %q", want, joined)
-		}
-	}
-}
-
-func TestRenderPendingAsksNumbersMultipleSessions(t *testing.T) {
-	// The owner's screenshot: two sessions, long names, every option prefixed
-	// onto one row so Telegram truncated them all to "notion-cale...".
-	a := pendingAsk{
-		Name: "notion-calendar-menubar",
-		Q: Question{
-			ID:          11,
-			Question:    "¿me dejas quitar iconos de Centro de Control?",
-			OptionsJSON: `["Quitar Bluetooth, Pantalla, Sonido","Dejarlo","Otra idea","Omitir"]`,
-		},
-	}
-	b := pendingAsk{
-		Name: "General",
-		Q: Question{
-			ID:          22,
-			Question:    "¿aviso en el hilo de Slack o lo dejo?",
-			OptionsJSON: `["Avísale en el hilo","Déjalo, y no avises","Omitir"]`,
-		},
-	}
-	body := renderPendingAsks([]pendingAsk{a, b}, 2, 0)
-
-	if !strings.Contains(body, "❓ 2 pending decisions") {
-		t.Errorf("header = %q", body)
-	}
-	for _, want := range []string{
-		"<b>notion-calendar-menubar</b>",
-		"<b>General</b>",
-		"1. Quitar Bluetooth, Pantalla, Sonido",
-		"2. Dejarlo",
-		"3. Otra idea",
-		"4. Omitir",
-		"5. Avísale en el hilo",
-		"6. Déjalo, y no avises",
-		"7. Omitir",
-		"Reply to the original question",
-	} {
-		if !strings.Contains(body, want) {
-			t.Errorf("body missing %q:\n%s", want, body)
-		}
-	}
-	if strings.Contains(body, "notion-calendar-menubar:") {
-		t.Errorf("options must not be prefixed with the session name:\n%s", body)
-	}
-}
-
-func TestRenderPendingAsksExtraFooter(t *testing.T) {
-	item := pendingAsk{Name: "ads", Q: Question{ID: 1, Question: "Raise?", OptionsJSON: `["yes","Omitir"]`}}
-	body := renderPendingAsks([]pendingAsk{item}, 9, 8)
-	if !strings.Contains(body, "❓ 9 pending decisions") || !strings.Contains(body, "and 8 more") {
-		t.Errorf("extra footer = %q", body)
+	if strings.Contains(joined, "Pending decision") || strings.Contains(joined, "Deploy to prod?") {
+		t.Errorf("free text must not repost pending asks, got %q", joined)
 	}
 }
 

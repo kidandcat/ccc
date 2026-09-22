@@ -304,7 +304,7 @@ home (Codex also gets per-turn `exec -c`). Identity is `--bot`/`--turn` or
 | `recall` | `query`, `scope?`, `limit?` | Full-text (SQLite FTS5) search over memories visible to this session: all `user`, all `project`, own session. Returns key+text+scope. |
 | `forget` | `scope`, `key`, `project_path?` | Delete one memory. |
 | `notify_owner` | `text`, `urgency` (normal\|urgent) | Post in General (the DM), labelled with the session name. Interruptions only — not a report dump. |
-| `ask_owner` | `question`, `options?` (≤4 strings) | Post the question in General as text, with listed options in the message body. Returns immediately with `{"status":"asked"}`; the session should end its turn. The owner answers by replying to that question in the DM. A content answer arrives as `Answer to "<question>": …`. Replying **Omitir** or **SKIP** skips without choosing and unblocks the worker (`The owner skipped the question "…" without choosing…`); similar pending asks are skipped too. Free text in the DM is never an answer (it is always General) and, if anything is still pending, listen posts a list of unanswered questions as text — no timeout, no keyboard. Answering one also answers similar pending questions (same normalized text, answer maps onto their options) so General does not re-ask. Prompt contract: mandatory for every owner decision (yes/no, pick one, architectural fork); recommended option first; never ask in chat prose. |
+| `ask_owner` | `question`, `options?` (≤4 strings) | Post the question in General as text, with listed options in the message body. Returns immediately with `{"status":"asked"}`; the session should end its turn. The owner answers by replying to that question in the DM. A content answer arrives as `Answer to "<question>": …`. Replying **Omitir** or **SKIP** skips without choosing and unblocks the worker (`The owner skipped the question "…" without choosing…`); similar pending asks are skipped too. Free text in the DM is never an answer (it is always General) and does not repost unanswered questions. Answering one also answers similar pending questions (same normalized text, answer maps onto their options) so General does not re-ask. Prompt contract: mandatory for every owner decision (yes/no, pick one, architectural fork); recommended option first; never ask in chat prose. |
 | `set_name` | `name` | Rename this session: validate (§8 `/name`), update `bots.name`. Rotates the conversation (§14.14). `/name` in the DM only hits General, which refuses. No topic icon. |
 | `watch` | `name`, `command`, `interval_s` (≥60) | Register a deterministic watch (§7). Polling tool: no change = zero tokens. Lasts `watch_ttl_s` (default 4h); re-upserting the name renews it. `unwatch(name)`, `list_watches()`. |
 | `schedule_wakeup` | `in_seconds` or `at` (RFC3339), `note`, `cron?` | Wake at a time (§7). Each fire is a full turn. Not for polling. `cancel_schedule(id)`. |
@@ -474,9 +474,8 @@ older than 90 days.
   owner answers by replying to that message. The reply ticks the original
   question with ✓ and enqueues the answer. Replying **Omitir** or **SKIP**
   closes the question without choosing and unblocks the worker (skip
-  envelope, not `Answer to`). Free text in the DM never answers; if anything
-  is still pending, listen posts a list of unanswered questions as text (no
-  timeout, no keyboard). Answering one also answers similar pending questions
+  envelope, not `Answer to`). Free text in the DM never answers and does not
+  repost unanswered questions. Answering one also answers similar pending questions
   (same normalized text; the label maps onto their options; Omitir/SKIP
   skips siblings even if they have no skip option) so General does not re-ask.
 - An **edited** message is gated like any other update. If its text starts with
@@ -720,9 +719,9 @@ before and after and clears `session_id` once the turn has been persisted.
 while a session was `waiting` as the answer. That stole the next owner
 message (always meant for General) and, when several similar questions were
 pending, answered only one — then the 10-minute idle nag made General
-re-ask the rest. Now: a reply-to that question is the answer; free text
-lists the pending asks as text (no timeout, no keyboard) and goes to
-General. Answering one fans the same answer out to similar pending
+re-ask the rest. Now: a reply-to that question is the answer; free text goes to General and
+does not repost pending questions (the old "Pending decision" digest is
+gone). Answering one fans the same answer out to similar pending
 questions (normalized text match; the label must exist on the sibling,
 except Omitir/SKIP which skips siblings even without that option).
 Workers stay parked; General keeps taking DM turns. Idle-remind skips

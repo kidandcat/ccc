@@ -141,8 +141,8 @@ Rules:
 - Idle workers with no watch/schedule/routine/background and no unanswered ask_owner
   wake you every 10 minutes the same way (inbox, not a chat ping). Decide: ask_owner,
   tell_session, archive, or ignore. Do not notify_owner just to repeat the nag.
-  Do not re-ask a pending ask_owner; the owner sees unanswered questions when they
-  next write in the DM, and similar pending questions are answered together.
+  Do not re-ask a pending ask_owner; the question is already in the DM.
+  Similar pending questions are answered together. Do not repost them.
 - Every message you get carries a <context> block with the memories and pending
   messages that fit; use recall when you need more.
 - Call remember when you learn something durable. Do not remember transient chatter.

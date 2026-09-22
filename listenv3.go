@@ -492,7 +492,6 @@ func (in *instance) handleMessage(msg *TelegramMessage) {
 		in.reply(msg, "Could not start General: "+err.Error())
 		return
 	}
-	in.listPendingAsks()
 	in.deliver(b, msg, text)
 }
 
@@ -593,59 +592,6 @@ func (in *instance) answerOwnerQuestion(q *Question, answer string) error {
 		in.tickAskedMessage(&answered[i], answered[i].Answer)
 	}
 	return nil
-}
-
-// renderPendingAsks is the DM list of unanswered ask_owner rows. Options are
-// numbered in the body so Telegram truncation cannot make two choices look
-// the same. There is no keyboard; the owner replies to the original question.
-func renderPendingAsks(shown []pendingAsk, total, extra int) string {
-	var body strings.Builder
-	if total == 1 {
-		body.WriteString("❓ Pending decision")
-	} else {
-		fmt.Fprintf(&body, "❓ %d pending decisions", total)
-	}
-	n := 0
-	for _, item := range shown {
-		fmt.Fprintf(&body, "\n\n<b>%s</b>\n%s", htmlEscape(item.Name), renderTelegramHTML(item.Q.Question))
-		opts := questionOptions(&item.Q)
-		if questionIsFreeText(opts) {
-			body.WriteString("\n<i>Reply to the original question.</i>")
-			continue
-		}
-		for _, o := range opts {
-			n++
-			fmt.Fprintf(&body, "\n%d. %s", n, htmlEscape(o))
-		}
-		body.WriteString("\n<i>Reply to the original question.</i>")
-	}
-	if extra > 0 {
-		fmt.Fprintf(&body, "\n\n<i>and %d more</i>", extra)
-	}
-	return body.String()
-}
-
-// listPendingAsks posts unanswered ask_owner rows as one DM message. No
-// timeout: it stays until the owner replies. No-ops when nothing is pending
-// or Telegram is not configured.
-func (in *instance) listPendingAsks() {
-	asks := livePendingAsks(in.db)
-	if len(asks) == 0 {
-		return
-	}
-	cfg := in.config()
-	chat, thread, ok := destForTopic(cfg, 0)
-	if !ok {
-		return
-	}
-	shown := asks
-	extra := 0
-	if len(shown) > maxPendingAskList {
-		extra = len(shown) - maxPendingAskList
-		shown = shown[:maxPendingAskList]
-	}
-	body := renderPendingAsks(shown, len(asks), extra)
-	_, _ = sendMessageHTMLGetID(cfg, chat, thread, body)
 }
 
 // handleCallback processes an inline button tap. Callback data is ccc's own
