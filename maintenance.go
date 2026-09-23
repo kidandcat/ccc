@@ -83,6 +83,9 @@ type maintenanceReport struct {
 	BotMemoriesDeleted int64
 	ArchivesDeleted    int64
 	JobsDeleted        int64
+	SchedulesDeleted   int64
+	WatchesDeleted     int64
+	TurnsFailed        int64
 	Compactions        []compactionResult
 	// Problems are the scopes whose compaction was abandoned, with the reason.
 	Problems []string
@@ -91,8 +94,9 @@ type maintenanceReport struct {
 func (r maintenanceReport) String() string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "turns: %d deleted, %d trimmed\n", r.TurnsDeleted, r.TurnsTrimmed)
-	fmt.Fprintf(&sb, "cleanup: %d inbox, %d questions, %d bot memories, %d archived memories, %d background jobs\n",
-		r.InboxDeleted, r.QuestionsDeleted, r.BotMemoriesDeleted, r.ArchivesDeleted, r.JobsDeleted)
+	fmt.Fprintf(&sb, "cleanup: %d inbox, %d questions, %d bot memories, %d archived memories, %d background jobs, %d schedules, %d watches, %d orphan turns\n",
+		r.InboxDeleted, r.QuestionsDeleted, r.BotMemoriesDeleted, r.ArchivesDeleted, r.JobsDeleted,
+		r.SchedulesDeleted, r.WatchesDeleted, r.TurnsFailed)
 	if len(r.Compactions) == 0 {
 		sb.WriteString("memories: nothing over the compaction threshold\n")
 	}
@@ -133,6 +137,7 @@ func runMaintenance(db *gorm.DB, cfg *Config, deps maintenanceDeps, now time.Tim
 	rep.TurnsDeleted, rep.TurnsTrimmed = applyTurnRetention(db, now, &rep)
 	compactMemories(db, cfg, deps, now, &rep)
 	runCleanup(db, cfg, now, &rep)
+	checkpointWAL(db)
 	return rep
 }
 
@@ -591,6 +596,40 @@ func runCleanup(db *gorm.DB, cfg *Config, now time.Time, rep *maintenanceReport)
 	}
 	rep.JobsDeleted = del("background job cleanup", db.Where("status IN ? AND ended_at IS NOT NULL AND ended_at < ?",
 		[]string{jobDone, jobFailed}, jobCutoff).Delete(&BackgroundJob{}))
+
+	// One-shot wakeups and disabled watches used to accumulate forever.
+	// Routines stay: they have no fired_at until cancelled.
+	rep.SchedulesDeleted = del("schedule cleanup", db.Where("fired_at IS NOT NULL AND fired_at < ?",
+		now.AddDate(0, 0, -30)).Delete(&Schedule{}))
+	rep.WatchesDeleted = del("watch cleanup", db.Where("enabled = ?", false).Delete(&Watch{}))
+	rep.TurnsFailed = failQueuedOnArchivedBots(db)
+}
+
+// failQueuedOnArchivedBots marks queued turns whose session is already
+// archived. archiveBotRow does this in the same transaction; this catches
+// a turn that landed in the gap, including after a crash.
+func failQueuedOnArchivedBots(db *gorm.DB) int64 {
+	var ids []int64
+	if err := db.Model(&Bot{}).Where("archived_at IS NOT NULL").Pluck("id", &ids).Error; err != nil || len(ids) == 0 {
+		return 0
+	}
+	res := db.Model(&Turn{}).Where("bot_id IN ? AND status = ?", ids, turnQueued).
+		Updates(map[string]any{"status": turnFailed, "stop_reason": "session archived"})
+	if res.Error != nil {
+		return 0
+	}
+	return res.RowsAffected
+}
+
+func checkpointWAL(db *gorm.DB) {
+	if db == nil {
+		return
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return
+	}
+	_, _ = sqlDB.Exec("PRAGMA wal_checkpoint(TRUNCATE)") // safe-ignore: maintenance still succeeded if the checkpoint does not
 }
 
 // ---------------------------------------------------------------------------

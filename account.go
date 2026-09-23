@@ -122,7 +122,7 @@ func (in *instance) rememberProfileEmail(name, account string) string {
 		return name
 	}
 	renamed := false
-	updated := updateConfig(func(c *Config) bool {
+	updated, err := in.commitConfig(func(c *Config) bool {
 		if c.Profiles == nil {
 			c.Profiles = map[string]*Profile{}
 		}
@@ -166,12 +166,19 @@ func (in *instance) rememberProfileEmail(name, account string) string {
 		renamed = true
 		return true
 	})
-	if updated == nil {
+	if err != nil || updated == nil {
 		return name
 	}
-	in.setConfig(updated)
-	if renamed && name != email && in.db != nil {
-		in.db.Model(&Turn{}).Where("profile = ?", name).Update("profile", email)
+	if renamed && name != email {
+		// Cooldowns and needsLogin are keyed by the old name. Leaving them
+		// behind makes the doctor pick the renamed profile once and burn a turn.
+		renameProfileCooldown(name, email)
+		if r, ok := in.runner.(*Runner); ok {
+			r.renameNeedsLogin(name, email)
+		}
+		if in.db != nil {
+			in.db.Model(&Turn{}).Where("profile = ?", name).Update("profile", email)
+		}
 	}
 	return email
 }
@@ -379,7 +386,7 @@ func (in *instance) accountAdd(msg *TelegramMessage, arg string) {
 		in.reply(msg, "Could not create the config dir: "+htmlEscape(err.Error()))
 		return
 	}
-	updated := updateConfig(func(c *Config) bool {
+	updated, err := in.commitConfig(func(c *Config) bool {
 		if c.Profiles == nil {
 			c.Profiles = map[string]*Profile{}
 		}
@@ -391,11 +398,14 @@ func (in *instance) accountAdd(msg *TelegramMessage, arg string) {
 		}
 		return true
 	})
-	if updated == nil {
-		in.reply(msg, "Could not write the configuration.")
+	if err != nil || updated == nil {
+		detail := "could not write the configuration"
+		if err != nil {
+			detail = err.Error()
+		}
+		in.reply(msg, "Could not write the configuration: "+htmlEscape(detail))
 		return
 	}
-	in.setConfig(updated)
 	// Claude profiles share transcripts so same-engine failover can resume a
 	// conversation this profile never started (DESIGN §4). Other engines keep
 	// their own isolated homes.
@@ -403,7 +413,11 @@ func (in *instance) accountAdd(msg *TelegramMessage, arg string) {
 		linkSharedProjects(updated)
 	}
 	in.reply(msg, "➕ Added <b>"+htmlEscape(canon)+"</b> ("+htmlEscape(engineLabel(engine))+"). Logging it in now...")
-	in.startLogin(msg.Chat.ID, msg.MessageThreadID, key)
+	// The map key for Claude is the bare email. Looking that up again is
+	// ambiguous once another engine already uses it, and the login never starts.
+	in.runLogin(msg.Chat.ID, msg.MessageThreadID, Profile{
+		Name: key, Engine: engine, ConfigDir: dir, Label: canon,
+	})
 }
 
 func (in *instance) accountSetDefault(chatID, topicID int64, name string) {
@@ -422,12 +436,11 @@ func (in *instance) accountSetDefault(chatID, topicID int64, name string) {
 
 func (in *instance) applyDefaultAccount(chatID, topicID int64, p Profile) {
 	key := p.Name
-	updated := updateConfig(func(c *Config) bool { c.DefaultProfile = key; return true })
-	if updated == nil {
+	updated, err := in.commitConfig(func(c *Config) bool { c.DefaultProfile = key; return true })
+	if err != nil || updated == nil {
 		in.post(chatID, topicID, "Could not write the configuration.")
 		return
 	}
-	in.setConfig(updated)
 	in.post(chatID, topicID, "⭐ Default account: <b>"+htmlEscape(accountDisplay(p))+"</b>")
 }
 
@@ -473,7 +486,7 @@ func (in *instance) accountRemove(name string) string {
 	if busy := in.busyBotsByProfile()[name]; len(busy) > 0 {
 		return "🚫 <b>" + htmlEscape(shown) + "</b> started a turn for " + htmlEscape(strings.Join(busy, ", ")) + "; not removed."
 	}
-	updated := updateConfig(func(c *Config) bool {
+	updated, cfgErr := in.commitConfig(func(c *Config) bool {
 		if c.Profiles == nil || c.Profiles[name] == nil {
 			return false
 		}
@@ -488,10 +501,9 @@ func (in *instance) accountRemove(name string) string {
 		}
 		return true
 	})
-	if updated == nil {
+	if cfgErr != nil || updated == nil {
 		return "Could not write the configuration."
 	}
-	in.setConfig(updated)
 	return "🗑 Removed <b>" + htmlEscape(shown) + "</b> (its config dir was left on disk)."
 }
 
@@ -541,6 +553,9 @@ type loginWaiter struct {
 	profile string
 	codes   chan string
 	cancel  context.CancelFunc
+	// acceptsCode is set only by AskForCode. Device-code and no-URL logins
+	// never read the channel; arming it anyway swallowed the owner's next DM.
+	acceptsCode bool
 }
 
 // loginState is the instance's at-most-one-at-a-time login slot.
@@ -571,6 +586,12 @@ func (in *instance) takeLoginCode(chatID, topicID int64, text string) bool {
 	if w.chatID != chatID || w.topicID != topicID {
 		return false
 	}
+	in.login.mu.Lock()
+	accepts := w.acceptsCode
+	in.login.mu.Unlock()
+	if !accepts {
+		return false
+	}
 	select {
 	case w.codes <- text:
 		return true
@@ -592,6 +613,11 @@ func (t telegramPrompter) Progress(text string) {
 }
 
 func (t telegramPrompter) AskForCode(ctx context.Context, url string) (string, error) {
+	t.in.login.mu.Lock()
+	if t.waiter != nil {
+		t.waiter.acceptsCode = true
+	}
+	t.in.login.mu.Unlock()
 	t.in.post(t.chatID, t.topicID, "🔗 Open this on the device with the right account, "+
 		"then send me the code it gives you if asked (or /cancel):\n\n"+htmlEscape(url))
 	select {

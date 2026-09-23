@@ -105,6 +105,47 @@ func installSystemdService(home string) error {
 	return nil
 }
 
+// serviceRestartCommand is how an already-installed service is bounced so the
+// binary now on disk (make install overwrites ~/bin/ccc while listen is still
+// mapped to the old inode) is the one that comes back. macOS is launchd's
+// kickstart -k; Linux is systemd --user. KeepAlive / Restart= bring it up
+// either way, but kickstart and systemctl restart do not wait on a crash loop.
+func serviceRestartCommand(mac bool, uid int) (string, []string) {
+	if mac {
+		return "launchctl", []string{"kickstart", "-k", fmt.Sprintf("gui/%d/com.ccc", uid)}
+	}
+	return "systemctl", []string{"--user", "restart", "ccc"}
+}
+
+// restartService stops the running `ccc listen` and starts it again.
+// The caller is a different process from the service (the shell after
+// `make install`, or a bot), so this must not os.Exit itself.
+func restartService() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("home directory: %w", err)
+	}
+	mac := isMacOS()
+	if mac {
+		if _, err := os.Stat(filepath.Join(home, "Library", "LaunchAgents", "com.ccc.plist")); err != nil {
+			return fmt.Errorf("service is not installed — run: ccc install")
+		}
+	} else if _, err := os.Stat(filepath.Join(home, ".config", "systemd", "user", "ccc.service")); err != nil {
+		return fmt.Errorf("service is not installed — run: ccc install")
+	}
+	name, args := serviceRestartCommand(mac, os.Getuid())
+	out, err := exec.Command(name, args...).CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			return fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+		}
+		return fmt.Errorf("%s %s: %w (%s)", name, strings.Join(args, " "), err, msg)
+	}
+	fmt.Println("Restarted ccc. It comes back on its own; in-flight turns are retried.")
+	return nil
+}
+
 // renderSystemdUnit builds the unit text. It holds NO secrets: the
 // env_passthrough values (DESIGN §3.1) live in <config_dir>/env, written 0600
 // by `ccc env sync`, and the unit reads them with `EnvironmentFile=-` (the `-`

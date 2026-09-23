@@ -1080,24 +1080,27 @@ func betterProfile(a, b profileStat) bool {
 
 // pickSpawnEngine is the engine a new worker joins: the account with the most
 // 5-hour headroom (usagefetch cache, then disk), across every configured
-// engine. A cold cache (no usage snapshot at all) falls back to defaultEngine
-// so the first spawn of a new install is stable. Once any account has numbers,
-// an engine whose usage is still unknown is treated as idle — otherwise a
-// configured Codex/Grok account is starved by the default Claude profile at
-// 42% while the unused engine sits at unknownUtilization (50). Antigravity
-// n/a stays unknown so it does not steal spawns. A running turn may still
-// failover across engines when its pool is exhausted (DESIGN §4).
+// engine that can actually run a turn. A profile with no credentials or no
+// resolvable binary is skipped — an empty usage cache used to score it as
+// 0% and it won every spawn. A cold cache (no usage snapshot at all) falls
+// back to defaultEngine so the first spawn of a new install is stable.
+// Unknown usage ranks as fully used, behind any account with real numbers.
+// A running turn may still failover across engines when its pool is exhausted
+// (DESIGN §4).
 func pickSpawnEngine(db *gorm.DB, cfg *Config) string {
 	def := defaultEngine(cfg)
 	now := time.Now()
 	for _, p := range listProfiles(cfg) {
+		if !profileSpawnEligible(p) {
+			continue
+		}
 		refreshProfileUsage(p)
 	}
 	var working map[string]int
 	if db != nil {
 		working = runningTurnsByProfileDB(db)
 	}
-	stats := collectProfileStats(cfg, working, now)
+	stats := eligibleSpawnStats(cfg, working, now)
 	if !spawnUsageKnown(stats) {
 		return def
 	}
@@ -1106,6 +1109,44 @@ func pickSpawnEngine(db *gorm.DB, cfg *Config) string {
 		return profileEngine(p)
 	}
 	return def
+}
+
+// profileSpawnEligible is true when a turn on this profile can start: the
+// engine binary resolves, and the profile has credentials. A row left behind
+// by a failed /account add must not be selected.
+func profileSpawnEligible(p Profile) bool {
+	if _, err := resolveEngineBin(profileEngine(p)); err != nil {
+		return false
+	}
+	return profileCredentialsPresent(p)
+}
+
+// profileCredentialsPresent is the login check spawn can afford. Claude reads
+// the credentials file or the keychain (the same signal as usage fetch).
+// Grok, Codex and Antigravity look at the auth file. `claude auth status` is
+// not used: it is a process per profile per spawn.
+func profileCredentialsPresent(p Profile) bool {
+	switch profileEngine(p) {
+	case engineGrok, engineCodex, engineAntigravity:
+		ok, _, err := profileLoggedIn(p)
+		return err == nil && ok
+	default:
+		_, err := loadClaudeOAuth(p)
+		return err == nil
+	}
+}
+
+// eligibleSpawnStats is collectProfileStats minus profiles that cannot run.
+func eligibleSpawnStats(cfg *Config, working map[string]int, now time.Time) []profileStat {
+	var stats []profileStat
+	for _, s := range collectProfileStats(cfg, working, now) {
+		p, ok := profileByKey(cfg, s.Name)
+		if !ok || !profileSpawnEligible(p) {
+			continue
+		}
+		stats = append(stats, s)
+	}
+	return stats
 }
 
 func spawnUsageKnown(stats []profileStat) bool {
@@ -1118,21 +1159,19 @@ func spawnUsageKnown(stats []profileStat) bool {
 }
 
 // spawnStatsAssumeIdleUnknown copies stats so chooseProfile can run on them
-// without mutating the caller's slice. Unknown usage (fetch miss, no disk
-// cache) becomes 0% so a configured but unused engine is not ignored; a
-// structural n/a (Antigravity, API-key Codex) is left at unknownUtilization.
+// without mutating the caller's slice. Usage we do not actually know (fetch
+// miss, empty cache, structural n/a) is ranked as fully used, behind every
+// account that has real numbers. Scoring it as 0% made a dead engine win.
 func spawnStatsAssumeIdleUnknown(stats []profileStat) []profileStat {
 	out := make([]profileStat, len(stats))
 	copy(out, stats)
 	for i := range out {
-		if out[i].Usage.Unavailable != "" {
-			continue
-		}
 		if out[i].Usage.FiveHourKnown || out[i].Usage.SevenDayKnown || len(out[i].Usage.Windows) > 0 {
 			continue
 		}
-		out[i].FiveHour = 0
-		out[i].SevenDay = 0
+		// 101, not 100: a window that is genuinely full must still win the tie.
+		out[i].FiveHour = 101
+		out[i].SevenDay = 101
 	}
 	return out
 }
@@ -1144,7 +1183,7 @@ func spawnStatsAssumeIdleUnknown(stats []profileStat) []profileStat {
 func nextEngineByHeadroom(cfg *Config, working map[string]int, exclude map[string]bool) (string, bool) {
 	now := time.Now()
 	var open []profileStat
-	for _, s := range collectProfileStats(cfg, working, now) {
+	for _, s := range eligibleSpawnStats(cfg, working, now) {
 		if exclude[s.Engine] {
 			continue
 		}
@@ -1169,12 +1208,29 @@ var (
 	cooldowns  = map[string]time.Time{} // profile name -> available again at
 )
 
-// noteProfileLimit puts a profile on cooldown after a limit signal: until its
-// cached five-hour reset time when we have one, else defaultLimitCooldown.
+// noteProfileLimit puts a profile on cooldown after a limit signal. The usage
+// snapshot is refreshed first. The cooldown runs until the latest reset among
+// windows that are actually full: a weekly 100% must not come back when the
+// 5-hour window resets in 40 minutes. With no full window on record, the
+// fallback is defaultLimitCooldown.
 func noteProfileLimit(p Profile, now time.Time) {
-	until := now.Add(defaultLimitCooldown)
-	if r := readProfileUsage(p).FiveHourResetAt; r.After(now) {
-		until = r
+	u := refreshProfileUsage(p)
+	var until time.Time
+	consider := func(pct int, known bool, reset time.Time) {
+		if !known || pct < 100 || !reset.After(now) {
+			return
+		}
+		if until.IsZero() || reset.After(until) {
+			until = reset
+		}
+	}
+	consider(u.FiveHour, u.FiveHourKnown, u.FiveHourResetAt)
+	consider(u.SevenDay, u.SevenDayKnown, u.SevenDayResetAt)
+	for _, w := range u.Windows {
+		consider(w.Percent, true, w.ResetAt)
+	}
+	if until.IsZero() {
+		until = now.Add(defaultLimitCooldown)
 	}
 	cooldownMu.Lock()
 	if cur, ok := cooldowns[p.Name]; !ok || until.After(cur) {
@@ -1182,6 +1238,25 @@ func noteProfileLimit(p Profile, now time.Time) {
 	}
 	cooldownMu.Unlock()
 	hookLog("profile %s on usage cooldown until %s", p.Name, until.Format(time.RFC3339))
+}
+
+// renameProfileCooldown moves an in-memory cooldown when a profile is re-keyed
+// (the doctor learns an email and the map key changes). The cooldown map is
+// not on disk, so a rename that only updates Turn rows would forget it.
+func renameProfileCooldown(oldName, newName string) {
+	if oldName == "" || oldName == newName {
+		return
+	}
+	cooldownMu.Lock()
+	defer cooldownMu.Unlock()
+	until, ok := cooldowns[oldName]
+	if !ok {
+		return
+	}
+	if cur, exists := cooldowns[newName]; !exists || until.After(cur) {
+		cooldowns[newName] = until
+	}
+	delete(cooldowns, oldName)
 }
 
 // profileCooledUntil returns when a profile becomes available again (zero when

@@ -148,6 +148,10 @@ ccc install                   # launchd on macOS; systemd --user on Linux
                               # snapshots env_passthrough into ~/.config/ccc/env
 ```
 
+`make install` replaces `~/bin/ccc` but the running service keeps the old
+process. Bounce it with `ccc restart` (or `/restart` in the DM, owner only).
+In-flight turns are retried when it comes back.
+
 On macOS that starts the job immediately. Logs: `~/Library/Caches/ccc/ccc.log`.
 
 On Linux, keep it running after you log out:
@@ -411,7 +415,7 @@ listen starts. Restart the service to change the list.
 
 ```bash
 ccc config set allowed_user_ids 123456789,987654321
-# then restart listen (launchd / systemd --user)
+# then: ccc restart
 ccc config set allowed_user_ids ""    # owner only again
 ```
 
@@ -598,6 +602,7 @@ ccc listen                    Run the instance (the service does this)
 ccc setup <bot_token>         Interactive bootstrap (owner DM, service)
 ccc config [get|set] …        Non-interactive bootstrap
 ccc install                   Install the service (launchd / systemd --user)
+ccc restart                   Restart it so a new binary (make install) is loaded
 ccc env sync                  Snapshot env_passthrough secrets into ~/.config/ccc/env
                               (run from a login shell: bash -lc 'ccc env sync')
 ccc maintain                  Run the daily growth-control job once, now

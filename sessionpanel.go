@@ -46,6 +46,9 @@ type sessionPanel struct {
 	lastEdit time.Time
 	msgID    int64
 	pinned   bool
+	// redraw fires once when an activity tick landed inside the rate limit,
+	// so the card does not stay on the previous line for the whole command.
+	redraw *time.Timer
 }
 
 type sessionCard struct {
@@ -99,103 +102,164 @@ func (p *sessionPanel) clearActivity(botID int64) {
 
 // sync redraws the pinned panel from live workers. force skips the progress
 // rate limit (status changes); activity ticks stay at progressInterval.
+// The rate check happens before the database snapshot, and the Telegram
+// round-trip happens without drawMu so one stalled edit cannot freeze
+// every worker's stream reader.
 func (p *sessionPanel) sync(force bool) {
 	if p == nil || p.ui == nil || p.db == nil {
+		return
+	}
+	p.drawMu.Lock()
+	if p.rateLimitedLocked(force) {
+		p.scheduleRedrawLocked()
+		p.drawMu.Unlock()
 		return
 	}
 	cards := p.snapshot()
 	html := renderSessionPanel(cards)
 	working := panelHasWork(cards)
-
-	p.drawMu.Lock()
-	defer p.drawMu.Unlock()
 	if !force && p.msgID != 0 && html == p.lastHTML {
-		return
-	}
-	if !force && p.msgID != 0 && !p.lastEdit.IsZero() && time.Since(p.lastEdit) < progressInterval {
+		p.drawMu.Unlock()
 		return
 	}
 	msgID := p.msgID
 	if html == "" {
-		p.clear()
+		pinned := p.pinned
+		p.lastHTML = ""
 		p.lastEdit = time.Now()
+		p.drawMu.Unlock()
+		p.paintClear(msgID, pinned)
 		return
 	}
 	p.lastHTML = html
 	p.lastEdit = time.Now()
-	if err := p.upsert(msgID, html); err != nil {
+	p.drawMu.Unlock()
+	p.paint(msgID, html, working)
+}
+
+func (p *sessionPanel) rateLimitedLocked(force bool) bool {
+	if force || p.msgID == 0 || p.lastEdit.IsZero() {
+		return false
+	}
+	return time.Since(p.lastEdit) < progressInterval
+}
+
+func (p *sessionPanel) scheduleRedrawLocked() {
+	if p.redraw != nil {
+		return
+	}
+	wait := progressInterval - time.Since(p.lastEdit)
+	if wait < time.Millisecond {
+		wait = time.Millisecond
+	}
+	p.redraw = time.AfterFunc(wait, func() {
+		p.drawMu.Lock()
+		p.redraw = nil
+		p.drawMu.Unlock()
+		p.sync(false)
+	})
+}
+
+// editTargetGone is the only edit failure that means the card message is
+// gone. A 429, a 5xx or a network error must keep msgID so the next tick
+// edits the same message instead of pinning a second card.
+func editTargetGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "message to edit not found") ||
+		strings.Contains(s, "message can't be edited") ||
+		strings.Contains(s, "message_id_invalid")
+}
+
+func (p *sessionPanel) paint(msgID int64, html string, working bool) {
+	if p == nil || p.ui == nil {
+		return
+	}
+	newID, replaced, err := p.postOrEdit(msgID, html)
+	if err != nil {
 		hookLog("session panel: %v", err)
 		return
 	}
-	if working {
-		p.pin()
-	} else {
-		p.unpin()
+	p.drawMu.Lock()
+	if replaced {
+		p.pinned = false
+	}
+	if newID != 0 && newID != p.msgID {
+		p.msgID = newID
+		if p.db != nil {
+			_ = setSetting(p.db, settingSessionPanelMsgID, strconv.FormatInt(newID, 10)) // safe-ignore: a lost id just posts a new card next time
+		}
+	} else if newID != 0 {
+		p.msgID = newID
+	}
+	id := p.msgID
+	wantPin := working && id != 0 && !p.pinned
+	wantUnpin := !working && id != 0 && p.pinned
+	p.drawMu.Unlock()
+	if wantPin {
+		if err := p.ui.Pin(id); err != nil {
+			hookLog("session panel: pin %d: %v", id, err)
+		} else {
+			p.drawMu.Lock()
+			if p.msgID == id {
+				p.pinned = true
+			}
+			p.drawMu.Unlock()
+		}
+	}
+	if wantUnpin {
+		if err := p.ui.Unpin(id); err != nil {
+			hookLog("session panel: unpin %d: %v", id, err)
+		}
+		p.drawMu.Lock()
+		if p.msgID == id {
+			p.pinned = false
+		}
+		p.drawMu.Unlock()
 	}
 }
 
-func (p *sessionPanel) upsert(msgID int64, html string) error {
-	if p == nil || p.ui == nil {
-		return nil
-	}
+func (p *sessionPanel) postOrEdit(msgID int64, html string) (int64, bool, error) {
 	if msgID != 0 {
 		err := p.ui.Edit(0, msgID, html)
 		if err == nil {
-			return nil
+			return msgID, false, nil
 		}
-		// Deleted or too old to edit: post a replacement.
+		if !editTargetGone(err) {
+			return msgID, false, err
+		}
 		hookLog("session panel: edit %d failed (%v); posting a new card", msgID, err)
-		p.msgID = 0
-		p.pinned = false
 	}
 	id, err := p.ui.PostSilent(0, html)
 	if err != nil {
-		return err
+		return 0, false, err
 	}
-	if id == 0 {
-		return nil
-	}
-	p.msgID = id
-	if p.db != nil {
-		_ = setSetting(p.db, settingSessionPanelMsgID, strconv.FormatInt(id, 10)) // safe-ignore: a lost id just posts a new card next time
-	}
-	return nil
+	return id, true, nil
 }
 
-func (p *sessionPanel) pin() {
-	id := p.msgID
-	if id == 0 || p.pinned {
+// paintClear drops a card that has nothing left to show. Network calls are
+// outside drawMu; the caller has already cleared lastHTML.
+func (p *sessionPanel) paintClear(id int64, pinned bool) {
+	if p == nil || p.ui == nil {
 		return
 	}
-	if err := p.ui.Pin(id); err != nil {
-		hookLog("session panel: pin %d: %v", id, err)
-		return
-	}
-	p.pinned = true
-}
-
-func (p *sessionPanel) unpin() {
-	id := p.msgID
-	if id == 0 || !p.pinned {
-		return
-	}
-	if err := p.ui.Unpin(id); err != nil {
-		hookLog("session panel: unpin %d: %v", id, err)
-	}
-	p.pinned = false
-}
-
-// clear drops a card that has nothing left to show, so a previous ask_owner
-// line cannot stay in the DM after the session is no longer working.
-func (p *sessionPanel) clear() {
-	id := p.msgID
 	if id != 0 {
-		if err := p.ui.Edit(0, id, "·"); err != nil {
+		if err := p.ui.Edit(0, id, "·"); err != nil && !editTargetGone(err) {
 			hookLog("session panel: clear %d: %v", id, err)
 		}
 	}
-	p.lastHTML = ""
-	p.unpin()
+	if pinned && id != 0 {
+		if err := p.ui.Unpin(id); err != nil {
+			hookLog("session panel: unpin %d: %v", id, err)
+		}
+	}
+	p.drawMu.Lock()
+	if p.msgID == id {
+		p.pinned = false
+	}
+	p.drawMu.Unlock()
 }
 
 func (p *sessionPanel) snapshot() []sessionCard {
@@ -392,25 +456,24 @@ func (p *sessionPanel) showTerminal(b *Bot, status string) {
 		return
 	}
 	p.clearActivity(b.ID)
+	p.drawMu.Lock()
 	cards := p.snapshot()
 	if panelHasWork(cards) {
+		p.drawMu.Unlock()
 		p.sync(true)
 		return
 	}
-	p.drawMu.Lock()
-	defer p.drawMu.Unlock()
 	html := renderSessionPanel([]sessionCard{terminalCard(b, status)})
+	msgID := p.msgID
+	pinned := p.pinned
 	p.lastHTML = html
 	p.lastEdit = time.Now()
+	p.drawMu.Unlock()
 	if html == "" {
-		p.clear()
+		p.paintClear(msgID, pinned)
 		return
 	}
-	if err := p.upsert(p.msgID, html); err != nil {
-		hookLog("session panel: %v", err)
-		return
-	}
-	p.unpin()
+	p.paint(msgID, html, false)
 }
 
 func (r *Runner) syncPanel(force bool) {

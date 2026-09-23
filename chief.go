@@ -51,6 +51,11 @@ func chiefTimeoutFor(b *Bot, t *Turn) time.Duration {
 	if !isGeneralBot(b) {
 		return 0
 	}
+	// A folded turn that includes a report must not inherit the 60s cap,
+	// even when an owner message in the same fold keeps user semantics.
+	if t != nil && t.FoldNoCap {
+		return 0
+	}
 	// The cap is for owner work. Session reports, idle nags, watches and
 	// schedules are the dispatcher's job: killing them at 60s left the owner
 	// with only "session ended" while General never summarized.
@@ -121,9 +126,14 @@ func lastOwnerRequest(db *gorm.DB, botID int64, timedOut *Turn) string {
 			return s
 		}
 	}
+	q := db.Where("bot_id = ? AND source = ? AND status <> ?", botID, sourceUser, turnQueued)
+	// A message queued after the timeout (the owner saying "thanks") must
+	// not become the handoff prompt. Only turns that already existed count.
+	if timedOut != nil && timedOut.ID != 0 {
+		q = q.Where("id < ?", timedOut.ID)
+	}
 	var turns []Turn
-	if err := db.Where("bot_id = ? AND source = ?", botID, sourceUser).
-		Order("id DESC").Limit(30).Find(&turns).Error; err != nil {
+	if err := q.Order("id DESC").Limit(30).Find(&turns).Error; err != nil {
 		return ""
 	}
 	for _, t := range turns {
@@ -159,14 +169,42 @@ func chiefHandoffSince(db *gorm.DB, chiefID int64, current *Turn, input string) 
 	return since
 }
 
-func chiefHandedOffSince(db *gorm.DB, chiefID int64, since time.Time) bool {
-	q := db.Model(&InboxMessage{}).Where("from_bot_id = ? AND wake = ?", chiefID, true)
+func chiefHandedOffSince(db *gorm.DB, chiefID int64, since time.Time, owner string) bool {
+	var rows []InboxMessage
+	q := db.Where("from_bot_id = ? AND wake = ?", chiefID, true)
 	if !since.IsZero() {
 		q = q.Where("created_at >= ?", since)
 	}
-	var n int64
-	q.Count(&n)
-	return n > 0
+	if err := q.Find(&rows).Error; err != nil || len(rows) == 0 {
+		return false
+	}
+	// Any later inbox row is not a handoff of this request. The delegation
+	// has to carry the owner's text; a tell_session about something else
+	// (or only half of it) must not swallow the rest.
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return false
+	}
+	for _, row := range rows {
+		if strings.Contains(row.Text, owner) {
+			return true
+		}
+	}
+	return false
+}
+
+// chiefHandoffOwner is the request a delegation has to cover before a
+// timeout counts as already handed off.
+func chiefHandoffOwner(db *gorm.DB, botID int64, t *Turn, input string) string {
+	if t != nil && t.Source == sourceUser {
+		if s := strings.TrimSpace(t.Input); s != "" && !isChiefTimeoutFollowUp(s) {
+			return s
+		}
+	}
+	if s := strings.TrimSpace(input); s != "" && !isChiefTimeoutFollowUp(s) && t != nil && t.Source == sourceUser {
+		return s
+	}
+	return lastOwnerRequest(db, botID, t)
 }
 
 func idleRemindText(name string) string {

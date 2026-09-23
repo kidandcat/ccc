@@ -408,7 +408,11 @@ var securityOutput = func(args ...string) ([]byte, error) {
 }
 
 var securityAdd = func(service, account string, secret []byte) error {
-	cmd := exec.Command("security", "add-generic-password", "-U", "-a", account, "-s", service, "-w", string(secret))
+	// -w as the last flag reads the password from stdin (twice: enter and
+	// confirm). Putting the JSON on argv shows the refresh token in ps.
+	cmd := exec.Command("security", "add-generic-password", "-U", "-a", account, "-s", service, "-w")
+	pw := append(append([]byte{}, secret...), '\n')
+	cmd.Stdin = bytes.NewReader(append(append([]byte{}, pw...), pw...))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("security add-generic-password: %w (%s)", err, truncate(string(out), 120))

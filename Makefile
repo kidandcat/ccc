@@ -61,7 +61,7 @@ install: build
 	@if [ "$(UNAME)" = "Darwin" ]; then \
 		codesign -f -s - ~/bin/ccc 2>/dev/null || true; \
 	fi
-	@echo "✅ Installed to ~/bin/ccc"
+	@echo "✅ Installed to ~/bin/ccc — run: ccc restart"
 
 install-voice: build-voice
 	mkdir -p ~/bin
@@ -69,7 +69,7 @@ install-voice: build-voice
 	@if [ "$(UNAME)" = "Darwin" ]; then \
 		codesign -f -s - ~/bin/ccc 2>/dev/null || true; \
 	fi
-	@echo "✅ Installed to ~/bin/ccc (with voice support)"
+	@echo "✅ Installed to ~/bin/ccc (with voice support) — run: ccc restart"
 
 clean:
 	rm -f ccc ccc-linux-amd64

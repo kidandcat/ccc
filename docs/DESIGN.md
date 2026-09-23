@@ -510,6 +510,7 @@ older than 90 days.
 | `/secret list` | DM | Owner only. Names only. |
 | `/secret delete <name>` | DM | Owner only. |
 | `/status` | DM | Instance health: profiles (with per-engine usage/limits), running turns, queue, doctor findings. |
+| `/restart` | DM | Owner only. Exit listen after confirming the update offset. launchd KeepAlive / systemd Restart= starts the binary now on disk (`make install` does not, by itself). In-flight turns are retried (14.26). `ccc restart` does the same from a shell. |
 
 ### Account management from Telegram (login without a terminal)
 Engine is defined when the account is added (`/account add <identity> <engine>`),
@@ -572,7 +573,7 @@ never by assuming a position.
   no owner notify, no pairing code. Messages, EDITS and callback queries are
   gated the same way.
 - Allowed users may talk in the DM (General); only the owner can use
-  `/account`, `/access`, `/model` and `/secret`.
+  `/account`, `/access`, `/model`, `/secret` and `/restart`.
 - Until `chat_id` is configured there is no owner, so nobody is allowed.
 
 ## 9. System prompt and context envelope
@@ -923,7 +924,11 @@ reattached, but Telegram never heard and the work was dropped.
 `recoverAfterRestart` now posts 🔁 in General. Each `turns.status=running`
 row is requeued in place (same id, so it stays older than anything that
 arrived while it ran) and pinged ▶️ in its bot's topic; historical
-`failed` rows are not touched. A bot whose process is gone cannot resume
+`failed` rows are not touched. Shutdown makes that premise true: `Close`
+SIGTERMs each live turn's process group (they are `Setpgid`, so the
+signal to listen would not reach them) and confirms the Telegram update
+offset before exiting, so the retry is once, not a surviving engine plus
+a redelivered message. A bot whose process is gone cannot resume
 in-process — the retry is a new `claude -p` / `grok` / `agy` spawn of the
 same input on the same session UUID. Live background jobs ping ▶️;
 a job that fails (except an explicit cancel) pings ❌ immediately, because
@@ -1023,6 +1028,14 @@ routine fires run on a reused `routine-<name>` worker (fresh conversation),
 chooseProfile is 5h then 7d then load, spawn picks the engine with most
 headroom, auto-spawn is `source=user` only, watch TTL on General is silent.
 Not per-machine hygiene.
+
+**14.34 `make install` does not bounce listen.** The service keeps the inode
+it exec'd. `ccc restart` (shell) asks launchd `kickstart -k` or
+`systemctl --user restart ccc` to start the binary now at `~/bin/ccc`.
+`/restart` in the DM does the same from inside the process: it replies,
+confirms the Telegram offset (so the new process does not run `/restart`
+again), then exits 0. KeepAlive / `Restart=` bring it back. Mid-flight
+turns are retried, same as any other restart (14.26).
 
 **14.35 Workers are unattended.** A session that called `ask_owner` stayed
 `waiting` until the owner replied, including when the question did not

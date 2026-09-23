@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,10 @@ import (
 
 	"gorm.io/gorm"
 )
+
+// errRoutineBusy means the previous fire of this routine is still running.
+// The caller must not clear session_id or enqueue another turn on top of it.
+var errRoutineBusy = errors.New("routine worker still running")
 
 // defaultRoutineTZ is what a routine uses when the bot omits timezone.
 // Both the Mac and the work VM must fire "9:00" as 9:00 in Madrid, not
@@ -83,6 +88,9 @@ func upsertRoutine(db *gorm.DB, botID int64, name, prompt, cronExpr, tz string, 
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse cron %q: %w", cronExpr, err)
 	}
+	// UTC so a later reader does not depend on which offset the driver
+	// happened to serialize. Comparison is still by instant, not text.
+	fireAt = fireAt.UTC()
 	prompt = truncate(prompt, 2000)
 	var row Schedule
 	err = db.Where("bot_id = ? AND name = ?", botID, name).First(&row).Error
@@ -168,6 +176,9 @@ func (s *scheduler) routineWorkerBot(owner *Bot, sessionName string) (*Bot, erro
 	var existing Bot
 	err := s.in.db.Where("name = ?", sessionName).First(&existing).Error
 	if err == nil && !isGeneralBot(&existing) {
+		if s.routineWorkerBusy(&existing) {
+			return nil, errRoutineBusy
+		}
 		if existing.ArchivedAt != nil {
 			if err := unarchiveBotRow(s.in.db, existing.ID); err != nil {
 				return nil, err
@@ -194,6 +205,26 @@ func (s *scheduler) routineWorkerBot(owner *Bot, sessionName string) (*Bot, erro
 		b.Engine = eng
 	}
 	return b, nil
+}
+
+func (s *scheduler) routineWorkerBusy(b *Bot) bool {
+	if b == nil || s == nil || s.in == nil {
+		return false
+	}
+	if r, ok := s.in.runner.(*Runner); ok && r.Running(b.ID) {
+		return true
+	}
+	// A queued turn has not minted a session yet. Only a turn that is
+	// actually running will write its session id back after we clear it.
+	if b.Status == botRunning {
+		return true
+	}
+	if s.in.db == nil {
+		return false
+	}
+	var n int64
+	s.in.db.Model(&Turn{}).Where("bot_id = ? AND status = ?", b.ID, turnRunning).Count(&n)
+	return n > 0
 }
 
 // ---------------------------------------------------------------------------

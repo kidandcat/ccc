@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,6 +45,10 @@ const (
 	maxBackgroundPerBot = 8
 	// backgroundOutputLimit is how much combined stdout/stderr is stored.
 	backgroundOutputLimit = 64 * 1024
+	// jobLogReadCap is how much of the log is loaded before redaction.
+	// Truncating first splits a secret that straddles the 64KiB boundary,
+	// and the leftover prefix no longer matches the redactor.
+	jobLogReadCap = 1 << 20
 	// backgroundWakeLimit is how much of that reaches the model on wakeup.
 	backgroundWakeLimit = 8 * 1024
 	// backgroundListLimit is how many recent jobs list_background returns.
@@ -111,6 +116,18 @@ func (r *bgRuntime) redactOf(id int64) []string {
 	return r.handles[id].redact
 }
 
+// spawned reports whether this process started the wrapper (cmd != nil).
+// A reattached row only has a PID, which is not safe to signal blindly.
+func (r *bgRuntime) spawned(id int64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.handles == nil {
+		return false
+	}
+	h := r.handles[id]
+	return h != nil && h.cmd != nil
+}
+
 func (r *bgRuntime) pidOf(id int64) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -137,6 +154,92 @@ func killProcessGroup(pid int) {
 	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
 		_ = syscall.Kill(pid, syscall.SIGTERM) // safe-ignore: best-effort; the process may already be gone
 	}
+}
+
+// systemBootTime is the last time this machine booted. Tests replace it.
+// A background job's PID is not identity across a reboot: the number is
+// handed out again to whatever starts first.
+var systemBootTime = readSystemBootTime
+
+func readSystemBootTime() (time.Time, bool) {
+	if b, err := os.ReadFile("/proc/stat"); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			if !strings.HasPrefix(line, "btime ") {
+				continue
+			}
+			n, err := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(line, "btime ")), 10, 64)
+			if err == nil && n > 0 {
+				return time.Unix(n, 0), true
+			}
+		}
+	}
+	out, err := exec.Command("sysctl", "-n", "kern.boottime").Output()
+	if err != nil {
+		return time.Time{}, false
+	}
+	var sec, usec int64
+	if _, err := fmt.Sscanf(string(out), "{ sec = %d, usec = %d", &sec, &usec); err != nil || sec <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(sec, usec*1000), true
+}
+
+// jobPredatesBoot reports whether started is from before the current boot.
+// A nil start (legacy row) is not treated as predating: we still refuse to
+// signal it unless the process is the wrapper.
+func jobPredatesBoot(started *time.Time) bool {
+	if started == nil || started.IsZero() {
+		return false
+	}
+	boot, ok := systemBootTime()
+	if !ok {
+		return false
+	}
+	return started.Before(boot.Add(-2 * time.Second))
+}
+
+func processArgs(pid int) (string, bool) {
+	if pid <= 0 {
+		return "", false
+	}
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(string(out)), true
+}
+
+// processIsJobWrapper is true when pid is the /bin/sh wrapper this package
+// starts (argv0 "bgwrap", and the job directory when we know it).
+func processIsJobWrapper(pid int, jobDir string) bool {
+	args, ok := processArgs(pid)
+	if !ok || !strings.Contains(args, "bgwrap") {
+		return false
+	}
+	if jobDir != "" && !strings.Contains(args, jobDir) {
+		return false
+	}
+	return true
+}
+
+// killOwnedJobPID signals pid only when it is still our wrapper. A reused
+// PID (after reboot, or after the wrapper exited) must not be killed.
+// jobDir empty skips the directory check. Returns whether a signal was sent.
+func killOwnedJobPID(pid int, started *time.Time, jobDir string) bool {
+	if pid <= 0 || jobPredatesBoot(started) || !processIsJobWrapper(pid, jobDir) {
+		return false
+	}
+	killProcessGroup(pid)
+	return true
+}
+
+// backgroundProcessAlive is processAlive plus the boot-time check. A PID
+// that outlived the job's start across a reboot is someone else's process.
+func backgroundProcessAlive(j *BackgroundJob, dir string) bool {
+	if j == nil || jobPredatesBoot(j.StartedAt) {
+		return false
+	}
+	return processAlive(jobPID(j, dir))
 }
 
 // processAlive is kill(pid, 0): the process exists (or we lack permission
@@ -178,15 +281,33 @@ func readExitCode(dir string) (int, bool) {
 }
 
 func readJobLog(dir string) string {
-	b, err := os.ReadFile(filepath.Join(dir, bgLogFile))
+	f, err := os.Open(filepath.Join(dir, bgLogFile))
 	if err != nil {
 		return ""
 	}
-	out := string(b)
-	if len(out) > backgroundOutputLimit {
-		return out[:backgroundOutputLimit] + "\n…(output truncated)"
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, jobLogReadCap))
+	if err != nil {
+		return ""
 	}
-	return out
+	return string(b)
+}
+
+func clipJobOutput(s string) string {
+	if len(s) <= backgroundOutputLimit {
+		return s
+	}
+	return s[:backgroundOutputLimit] + "\n…(output truncated)"
+}
+
+// redactJobOutput redacts first, then clips. A vault read error withholds
+// the text instead of storing it raw.
+func redactJobOutput(raw string, extra []string) (string, error) {
+	redacted, err := redactVaultOutput(raw, extra)
+	if err != nil {
+		return "", err
+	}
+	return clipJobOutput(redacted), nil
 }
 
 func readPIDFile(dir string) int {
@@ -420,13 +541,14 @@ func (s *scheduler) applyBackgroundCancels() {
 	}
 	for i := range jobs {
 		j := jobs[i]
-		if pid := s.bg.pidOf(j.ID); pid > 0 {
-			killProcessGroup(pid)
+		if s.bg.spawned(j.ID) {
+			if pid := s.bg.pidOf(j.ID); pid > 0 {
+				killProcessGroup(pid)
+			}
 			continue
 		}
-		if j.PID > 0 {
-			killProcessGroup(j.PID)
-		}
+		dir := backgroundJobDir(s.in.config(), j.ID)
+		killOwnedJobPID(jobPID(&j, dir), j.StartedAt, dir)
 	}
 }
 
@@ -438,6 +560,10 @@ func (s *scheduler) startQueuedBackground() {
 	for i := range jobs {
 		j := jobs[i]
 		b, err := botByID(s.in.db, j.BotID)
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			// database is locked and the like: leave the row queued.
+			continue
+		}
 		if err != nil || b.ArchivedAt != nil {
 			now := time.Now()
 			s.in.db.Model(&BackgroundJob{}).Where("id = ?", j.ID).Updates(map[string]any{
@@ -533,7 +659,7 @@ func (s *scheduler) reattachBackgroundJobs() {
 		if !s.bg.adopt(j.ID, j.PID, nil) { // reattach: redact from the live vault at finish
 			continue
 		}
-		if _, done := readExitCode(dir); !done && processAlive(jobPID(&j, dir)) {
+		if _, done := readExitCode(dir); !done && backgroundProcessAlive(&j, dir) {
 			s.notifyJobResumed(&j)
 		}
 		go s.watchBackgroundJob(&j)
@@ -566,8 +692,17 @@ func (s *scheduler) watchBackgroundJob(j *BackgroundJob) {
 			return
 		}
 		if !killed && s.shouldStopJob(j) {
-			if pid := jobPID(j, dir); pid > 0 {
-				killProcessGroup(pid)
+			if s.bg.spawned(j.ID) {
+				if pid := s.bg.pidOf(j.ID); pid > 0 {
+					killProcessGroup(pid)
+				}
+			} else if pid := jobPID(j, dir); pid > 0 {
+				if !killOwnedJobPID(pid, j.StartedAt, dir) {
+					// Not our wrapper. Do not signal. Finish the row so a
+					// reused PID cannot sit "running" until its deadline.
+					s.finishBackgroundJob(j, jobFailed, -1, "", "process is not the job wrapper")
+					return
+				}
 			}
 			killed = true
 		}
@@ -601,7 +736,12 @@ func (s *scheduler) shouldStopJob(j *BackgroundJob) bool {
 func (s *scheduler) finishIfComplete(j *BackgroundJob, dir string) bool {
 	var latest BackgroundJob
 	if err := s.in.db.First(&latest, j.ID).Error; err != nil {
-		return true
+		// A missing row is done. A lock timeout is not: returning true
+		// dropped the watcher and left the job running until the next boot.
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return true
+		}
+		return false
 	}
 	if latest.Status != jobRunning {
 		return true
@@ -610,6 +750,11 @@ func (s *scheduler) finishIfComplete(j *BackgroundJob, dir string) bool {
 
 	if code, ok := readExitCode(dir); ok {
 		s.finishFromArtifacts(j, dir, code, true)
+		return true
+	}
+	if jobPredatesBoot(j.StartedAt) {
+		out, errText := jobOutputOrWithheld(dir, s.bg.redactOf(j.ID), "process did not survive reboot")
+		s.finishBackgroundJob(j, jobFailed, -1, out, errText)
 		return true
 	}
 	pid := jobPID(j, dir)
@@ -630,10 +775,28 @@ func (s *scheduler) finishIfComplete(j *BackgroundJob, dir string) bool {
 	return true
 }
 
+func jobOutputOrWithheld(dir string, extra []string, reason string) (string, string) {
+	out, err := redactJobOutput(readJobLog(dir), extra)
+	if err != nil {
+		return "", reason + " (output withheld)"
+	}
+	return out, reason
+}
+
 func (s *scheduler) finishFromArtifacts(j *BackgroundJob, dir string, code int, haveCode bool) {
-	out := redactVaultOutput(readJobLog(dir), s.bg.redactOf(j.ID))
+	out, rerr := redactJobOutput(readJobLog(dir), s.bg.redactOf(j.ID))
 	status, errText, exit := classifyBackgroundFinish(j, code, haveCode)
-	errText = redactVaultOutput(errText, s.bg.redactOf(j.ID))
+	if rerr != nil {
+		out = ""
+		if errText != "" {
+			errText += " "
+		}
+		errText += "(output withheld)"
+	} else if redacted, err := redactVaultOutput(errText, s.bg.redactOf(j.ID)); err != nil {
+		errText = "(output withheld)"
+	} else {
+		errText = redacted
+	}
 	s.finishBackgroundJob(j, status, exit, out, errText)
 }
 

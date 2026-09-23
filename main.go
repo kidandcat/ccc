@@ -112,9 +112,13 @@ type TelegramUpdate struct {
 
 // TelegramResponse represents a generic Bot API response.
 type TelegramResponse struct {
-	OK          bool            `json:"ok"`
-	Description string          `json:"description,omitempty"`
-	Result      json.RawMessage `json:"result,omitempty"`
+	OK          bool   `json:"ok"`
+	Description string `json:"description,omitempty"`
+	ErrorCode   int    `json:"error_code,omitempty"`
+	Parameters  *struct {
+		RetryAfter int `json:"retry_after"`
+	} `json:"parameters,omitempty"`
+	Result json.RawMessage `json:"result,omitempty"`
 }
 
 // InlineKeyboardButton represents a Telegram inline keyboard button.
@@ -170,6 +174,11 @@ func main() {
 
 	case "install":
 		must(installService())
+
+	case "restart":
+		// Bounce the service so a binary just written by `make install`
+		// replaces the one launchd/systemd still has mapped.
+		must(restartService())
 
 	case "env":
 		// `ccc env sync` snapshots the env_passthrough secrets for the service.

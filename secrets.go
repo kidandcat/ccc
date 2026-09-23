@@ -29,9 +29,11 @@ import (
 const (
 	redactMinLen      = 4
 	maxSecretBytes    = 64 * 1024
-	secretRunTimeout  = 2 * time.Minute
 	secretRedactToken = "***"
 )
+
+// secretRunTimeout is how long `run` waits. Tests shorten it.
+var secretRunTimeout = 2 * time.Minute
 
 var secretsFileMu sync.Mutex
 
@@ -267,12 +269,16 @@ func redactSecrets(s string, values []string) string {
 	return s
 }
 
-func redactVaultOutput(s string, extra []string) string {
-	values := extra
-	if all, err := vaultValues(); err == nil {
-		values = append(values, all...)
+func redactVaultOutput(s string, extra []string) (string, error) {
+	all, err := vaultValues()
+	if err != nil {
+		// A missing or corrupt vault must not publish the raw output.
+		// After a restart the in-memory redact list is empty, so the vault
+		// is the only source of values to hide.
+		return "", err
 	}
-	return redactSecrets(s, values)
+	values := append(append([]string{}, extra...), all...)
+	return redactSecrets(s, values), nil
 }
 
 func overlayEnv(base []string, extra map[string]string) []string {
@@ -381,15 +387,43 @@ func runWithSecrets(ctx context.Context, cfg *Config, cwd, command string, envMa
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
+	// CommandContext only signals the shell. A command that backgrounds
+	// itself would keep the stdout pipe open and CombinedOutput would
+	// wait until that grandchild exits. Kill the group, and don't wait
+	// forever for the pipes to close.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = 3 * time.Second
+	cmd.Cancel = func() error {
+		if cmd.Process == nil || cmd.Process.Pid <= 0 {
+			return nil
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
 	out, runErr := cmd.CombinedOutput()
-	output = redactVaultOutput(string(out), redact)
+	redacted, rerr := redactVaultOutput(string(out), redact)
+	if rerr != nil {
+		redacted = ""
+	}
+	// A timed-out command comes back as ExitError (-1). That branch used
+	// to swallow the timeout and report a normal exit.
+	if ctx.Err() != nil {
+		if rerr != nil {
+			return -1, "", fmt.Errorf("timed out after %s (output withheld)", secretRunTimeout)
+		}
+		return -1, redacted, fmt.Errorf("timed out after %s", secretRunTimeout)
+	}
+	if rerr != nil {
+		return -1, "", fmt.Errorf("output withheld: %w", rerr)
+	}
+	output = redacted
 	exit = 0
 	if runErr != nil {
 		if ee, ok := runErr.(*exec.ExitError); ok {
 			exit = ee.ExitCode()
 			runErr = nil
-		} else if ctx.Err() != nil {
-			return -1, output, fmt.Errorf("timed out after %s", secretRunTimeout)
 		}
 	}
 	return exit, output, runErr

@@ -693,9 +693,16 @@ func (s *mcpServer) sendFile(_ context.Context, _ *mcp.CallToolRequest, in sendF
 	if err != nil {
 		return toolErr("bad path: %v", err), nil, nil
 	}
-	if reason, ok := sendFileForbidden(s.config, abs); ok {
+	// Stat and the send follow symlinks. Check the target, not the link path,
+	// or `ln -s ~/.ssh/id_ed25519 /tmp/notes.txt` walks past the filter.
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return toolErr("cannot read %s: %v", abs, err), nil, nil
+	}
+	if reason, ok := sendFileForbidden(s.config, resolved); ok {
 		return toolErr("refusing to send that file: %s", reason), nil, nil
 	}
+	abs = resolved
 	info, err := os.Stat(abs)
 	if err != nil {
 		return toolErr("cannot read %s: %v", abs, err), nil, nil
@@ -726,7 +733,9 @@ func (s *mcpServer) sendFile(_ context.Context, _ *mcp.CallToolRequest, in sendF
 // originally missed: the name list had .credentials.json but not auth.json,
 // and the directory list covered ~/.claude but not ~/.codex / ~/.grok.
 func sendFileForbidden(config *Config, abs string) (string, bool) {
-	abs = filepath.Clean(abs)
+	// Stat and the upload follow symlinks. Check the target, not the name
+	// the caller typed (ln -s ~/.ssh/id_ed25519 /tmp/notes.txt).
+	abs = resolveSendPath(abs)
 	lower := strings.ToLower(filepath.Base(abs))
 	for _, bad := range credentialFileNames {
 		if lower == bad {
@@ -735,7 +744,12 @@ func sendFileForbidden(config *Config, abs string) (string, bool) {
 	}
 	home, _ := os.UserHomeDir()
 	home = filepath.Clean(home)
-	guarded := []string{filepath.Join(dataDir(config), "profiles")}
+	// background logs and ccc.db live in the data dir. Bot workspaces do
+	// too, and those files are what send_file is for, so they stay allowed.
+	if pathInside(abs, dataDir(config)) && !insideBotWorkspace(abs, config) {
+		return "it is inside ccc data", true
+	}
+	guarded := []string{}
 	if home != "" && home != "." {
 		guarded = append(guarded,
 			filepath.Join(home, ".ssh"),
@@ -771,12 +785,52 @@ var credentialFileNames = []string{
 	"id_rsa", "id_ed25519", ".env",
 }
 
+// resolveSendPath is filepath.EvalSymlinks, including when only the parent
+// exists (the tests pass paths that have not been created yet).
+func resolveSendPath(abs string) string {
+	abs = filepath.Clean(abs)
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved)
+	}
+	// Walk up to the nearest existing ancestor. One level is not enough:
+	// data/profiles/work does not exist, and /var is a symlink to /private/var,
+	// so the file and its guard resolved differently.
+	var rest []string
+	cur := abs
+	for {
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs
+		}
+		rest = append([]string{filepath.Base(cur)}, rest...)
+		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+			parts := append([]string{resolved}, rest...)
+			return filepath.Clean(filepath.Join(parts...))
+		}
+		cur = parent
+	}
+}
+
+// insideBotWorkspace reports whether abs is <data_dir>/bots/<name>/workspace
+// or a file under it. The rest of the data dir is not sendable.
+func insideBotWorkspace(abs string, cfg *Config) bool {
+	root := resolveSendPath(filepath.Join(dataDir(cfg), "bots"))
+	rel, err := filepath.Rel(root, resolveSendPath(abs))
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	return len(parts) >= 2 && parts[1] == "workspace"
+}
+
 func pathInside(abs, dir string) bool {
 	if dir == "" {
 		return false
 	}
-	abs = filepath.Clean(abs)
-	dir = filepath.Clean(dir)
+	// Temp dirs and home on macOS are symlinks (/var -> /private/var).
+	// Compare the targets or a resolved file never matches its guard.
+	abs = resolveSendPath(abs)
+	dir = resolveSendPath(dir)
 	if abs == dir {
 		return true
 	}

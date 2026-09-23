@@ -6,10 +6,16 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gorm.io/gorm"
-	"time"
 )
+
+func init() {
+	// The scheduler loop dispatches watches onto their own goroutines.
+	// These tests assert the result of runDueWatches before returning.
+	watchesAsync = false
+}
 
 // testScheduler wires a scheduler onto a test instance. The runner stays fake,
 // so a watch that fires records a turn instead of spawning claude.

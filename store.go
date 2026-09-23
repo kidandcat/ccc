@@ -81,6 +81,10 @@ type Turn struct {
 	// TriggerMessageID is the Telegram message that produced this turn, so the
 	// runner can react to it with ✅ when the turn completes. 0 = no message.
 	TriggerMessageID int64
+	// FoldNoCap is set when foldQueue merged a report into this turn. The
+	// envelope still uses user semantics if any part was the owner, but
+	// General's 60s cap must not apply. Not a column.
+	FoldNoCap bool `gorm:"-"`
 }
 
 // Turn statuses and sources.
@@ -299,7 +303,7 @@ func openStore(path string) (*gorm.DB, error) {
 			return nil, fmt.Errorf("create data dir: %w", err)
 		}
 	}
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)"
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=journal_size_limit(8388608)"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
@@ -602,6 +606,10 @@ const (
 	// settingLastMaintenance is the date (YYYY-MM-DD) maintenance last ran, so
 	// a restart does not re-run it and a missed day is caught up on.
 	settingLastMaintenance = "last_maintenance"
+	// settingTelegramOffset is the getUpdates offset already handed to a
+	// handler. listen reads it on boot so a crash before the next long-poll
+	// does not run the same owner message twice.
+	settingTelegramOffset = "telegram_update_offset"
 )
 
 func getSetting(db *gorm.DB, key, def string) string {
@@ -784,23 +792,38 @@ func archiveBotRow(db *gorm.DB, botID int64) error {
 		return fmt.Errorf("General cannot be archived")
 	}
 	now := time.Now()
-	if err := db.Model(&Bot{}).Where("id = ?", botID).
-		Updates(map[string]any{"archived_at": now, "status": botDisabled}).Error; err != nil {
+	var running []BackgroundJob
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&Bot{}).Where("id = ?", botID).
+			Updates(map[string]any{"archived_at": now, "status": botDisabled}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&Turn{}).Where("bot_id = ? AND status = ?", botID, turnQueued).
+			Updates(map[string]any{"status": turnFailed, "stop_reason": "session archived"}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&Watch{}).Where("bot_id = ?", botID).Update("enabled", false).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&Schedule{}).Where("bot_id = ? AND fired_at IS NULL", botID).Update("fired_at", now).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("bot_id = ? AND status IN ?", botID, []string{jobQueued, jobRunning}).Find(&running).Error; err != nil {
+			return err
+		}
+		return tx.Model(&BackgroundJob{}).Where("bot_id = ? AND status IN ?", botID, []string{jobQueued, jobRunning}).
+			Updates(map[string]any{"status": jobFailed, "error": "session archived", "ended_at": now, "cancel_requested": true}).Error
+	})
+	if err != nil {
 		return err
 	}
-	db.Model(&Turn{}).Where("bot_id = ? AND status = ?", botID, turnQueued).
-		Updates(map[string]any{"status": turnFailed, "stop_reason": "session archived"})
-	db.Model(&Watch{}).Where("bot_id = ?", botID).Update("enabled", false)
-	db.Model(&Schedule{}).Where("bot_id = ? AND fired_at IS NULL", botID).Update("fired_at", now)
-	var running []BackgroundJob
-	db.Where("bot_id = ? AND status IN ?", botID, []string{jobQueued, jobRunning}).Find(&running)
 	for i := range running {
 		if running[i].PID > 0 {
-			killProcessGroup(running[i].PID)
+			// PID alone is not identity: after a reboot the number may
+			// belong to an unrelated process. Only signal a live wrapper.
+			killOwnedJobPID(running[i].PID, running[i].StartedAt, "")
 		}
 	}
-	db.Model(&BackgroundJob{}).Where("bot_id = ? AND status IN ?", botID, []string{jobQueued, jobRunning}).
-		Updates(map[string]any{"status": jobFailed, "error": "session archived", "ended_at": now, "cancel_requested": true})
 	return nil
 }
 

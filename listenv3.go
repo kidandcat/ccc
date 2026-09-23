@@ -41,10 +41,18 @@ type instance struct {
 	panel *sessionPanel
 	// edits remembers the edited messages already dispatched as commands.
 	edits editLog
+	// nextUpdateOffset is the getUpdates offset that confirms every update
+	// already handed to a handler, including a /restart. Confirming it before
+	// exit is what stops the new process from running /restart again.
+	nextUpdateOffset int
 
 	mu  sync.Mutex
 	cfg *Config
 }
+
+// stopListen ends this process. launchd KeepAlive / systemd Restart= start
+// the binary now on disk. Tests replace it so a /restart does not kill them.
+var stopListen = func() { os.Exit(0) }
 
 // editLog is the dedupe for edited commands: an edit is identified by
 // (chat, message, edit_date), so editing the same message again runs the new
@@ -217,11 +225,12 @@ func listenV3() error {
 	setBotCommandsV3(cfg.BotToken)
 	listenLog("ccc v3 listening (dm: %d, db: %s)", cfg.ChatID, dbPath(cfg))
 
-	// Conversational turns that were mid-flight died with us: they are
-	// requeued (same row, so they stay oldest) and retried. Background
-	// jobs do not die: they are detached, and recoverAfterRestart
-	// reattaches them. Both get a Telegram ping so a LaunchAgent restart
-	// is not silent.
+	// Conversational turns that were mid-flight are signaled in Close
+	// (their process group does not get our SIGTERM otherwise, because of
+	// Setpgid) and then requeued here, same row, so they stay oldest.
+	// Background jobs do not die: they are detached, and
+	// recoverAfterRestart reattaches them. Both get a Telegram ping so a
+	// LaunchAgent restart is not silent.
 	in.recoverAfterRestart()
 	if _, err := in.ensureGeneralBot(); err != nil {
 		listenLog("ensure General: %v", err)
@@ -241,12 +250,16 @@ func listenV3() error {
 	go func() {
 		sig := <-sigChan
 		listenLog("Shutting down (signal: %v)", sig)
+		// Confirm before exit so Telegram does not redeliver a message
+		// whose turn Close is about to kill and recover will retry.
+		confirmTelegramOffset(in.config(), in.nextUpdateOffset)
 		runner.Close()
 		sched.Close()
-		os.Exit(0)
+		stopListen()
 	}()
 
-	offset := 0
+	offset := getSettingInt(db, settingTelegramOffset, 0)
+	in.nextUpdateOffset = offset
 	client := &http.Client{Timeout: 35 * time.Second}
 	for {
 		// edited_message is requested too: an edit is an inbound update from a
@@ -276,6 +289,10 @@ func listenV3() error {
 		}
 		for _, u := range updates.Result {
 			offset = u.UpdateID + 1
+			// In memory before the handler so a signal during it confirms
+			// this update. On disk only after the handler returns: a crash
+			// mid-handler redelivers, and Enqueue dedupes on message id.
+			in.nextUpdateOffset = offset
 			switch {
 			case u.CallbackQuery != nil:
 				in.handleCallback(u.CallbackQuery)
@@ -284,6 +301,7 @@ func listenV3() error {
 				// stranger's edit must not slip past — hence the explicit call
 				// before handleEditedMessage decides what to do with it.
 				if in.gate(u.EditedMessage.From.ID) == roleDenied {
+					in.rememberUpdateOffset(offset)
 					continue
 				}
 				in.handleEditedMessage(u.EditedMessage)
@@ -291,6 +309,7 @@ func listenV3() error {
 				msg := u.Message
 				in.handleMessage(&msg)
 			}
+			in.rememberUpdateOffset(offset)
 		}
 	}
 }
@@ -423,6 +442,7 @@ func setBotCommandsV3(botToken string) {
 		{"command": "model", "description": "Each account's model, or set one (owner only)"},
 		{"command": "cancel", "description": "Cancel an in-progress account login"},
 		{"command": "secret", "description": "Owner vault: /secret add <name> | list | delete <name>"},
+		{"command": "restart", "description": "Restart ccc and load the installed binary"},
 	}
 	payload := map[string]any{"commands": commands}
 	body, err := json.Marshal(payload)
@@ -453,9 +473,14 @@ func (in *instance) handleMessage(msg *TelegramMessage) {
 		return
 	}
 
-	// Attachments are saved into the bot's workspace before anything else, so
-	// the text path below sees a normal message carrying a path.
-	if handled := in.handleAttachment(msg); handled {
+	// A reply to an ask_owner question is for that session, including when
+	// the reply is a file. Resolving it after handleAttachment used to drop
+	// the file on General and leave the question unanswered.
+	var questionBot *Bot
+	if b, ok := in.botForQuestionReply(msg); ok {
+		questionBot = b
+	}
+	if handled := in.handleAttachment(msg, questionBot); handled {
 		return
 	}
 
@@ -482,8 +507,8 @@ func (in *instance) handleMessage(msg *TelegramMessage) {
 
 	// Reply-to a pending ask_owner question: the owner is answering that
 	// session, not chatting with General. Free text never answers.
-	if b, ok := in.botForQuestionReply(msg); ok {
-		in.deliver(b, msg, text)
+	if questionBot != nil {
+		in.deliver(questionBot, msg, text)
 		return
 	}
 
@@ -698,7 +723,7 @@ func sanitizeBotName(name string) string {
 // handleAttachment saves photos/documents into the bot's workspace inbox/ and
 // enqueues a turn carrying the path (DESIGN §8). Voice notes are transcribed
 // when the voice build is present.
-func (in *instance) handleAttachment(msg *TelegramMessage) bool {
+func (in *instance) handleAttachment(msg *TelegramMessage, b *Bot) bool {
 	if msg.Voice == nil && msg.Document == nil && len(msg.Photo) == 0 {
 		return false
 	}
@@ -706,9 +731,12 @@ func (in *instance) handleAttachment(msg *TelegramMessage) bool {
 		return false
 	}
 	cfg := in.config()
-	b, err := in.ensureGeneralBot()
-	if err != nil {
-		return false
+	if b == nil {
+		var err error
+		b, err = in.ensureGeneralBot()
+		if err != nil {
+			return false
+		}
 	}
 	inbox := filepath.Join(botCwd(cfg, b), "inbox")
 	if err := os.MkdirAll(inbox, 0o755); err != nil {
@@ -789,6 +817,7 @@ func botCwd(cfg *Config, b *Bot) string {
 // talking to a bot: accounts, access, model and the vault.
 var ownerOnlyCommands = map[string]bool{
 	"/account": true, "/access": true, "/model": true, "/secret": true,
+	"/restart": true,
 }
 
 func (in *instance) handleCommand(msg *TelegramMessage, text string, role accessRole) {
@@ -809,6 +838,9 @@ func (in *instance) handleCommand(msg *TelegramMessage, text string, role access
 		return
 	case "/secret":
 		in.handleSecretCommand(msg, rest)
+		return
+	case "/restart":
+		in.handleRestartCommand(msg)
 		return
 	case "/cancel":
 		in.reply(msg, "Nothing to cancel.")
@@ -942,6 +974,53 @@ func (in *instance) handleCommand(msg *TelegramMessage, text string, role access
 	default:
 		in.reply(msg, "Unknown command.")
 	}
+}
+
+// handleRestartCommand bounces this listen process. The service (KeepAlive
+// or systemd Restart=) starts the binary on disk, which is how `make install`
+// actually takes effect. The offset is confirmed first so the new process
+// does not see /restart again and loop.
+func (in *instance) handleRestartCommand(msg *TelegramMessage) {
+	in.reply(msg, "Restarting. In-flight turns are retried.")
+	confirmTelegramOffset(in.config(), in.nextUpdateOffset)
+	listenLog("restart requested from Telegram")
+	if r, ok := in.runner.(*Runner); ok {
+		r.Close()
+	}
+	if in.sched != nil {
+		in.sched.Close()
+	}
+	stopListen()
+}
+
+// rememberUpdateOffset is the offset the next getUpdates must pass, persisted
+// so a crash between handling a message and the next long-poll still skips
+// it. Enqueue dedupes on the message id as well; this is the other half.
+func (in *instance) rememberUpdateOffset(offset int) {
+	in.nextUpdateOffset = offset
+	if in.db == nil || offset <= 0 {
+		return
+	}
+	if err := setSetting(in.db, settingTelegramOffset, strconv.Itoa(offset)); err != nil {
+		listenLog("persist update offset: %v", err)
+	}
+}
+
+// confirmTelegramOffset acknowledges every update before offset so Telegram
+// does not redeliver them. timeout=0 returns immediately; anything newer than
+// offset stays unconfirmed and is delivered to the next process.
+func confirmTelegramOffset(cfg *Config, offset int) {
+	if cfg == nil || cfg.BotToken == "" || offset <= 0 {
+		return
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := telegramClientGet(client, cfg.BotToken,
+		fmt.Sprintf("%s?offset=%d&timeout=0", telegramURL(cfg.BotToken, "getUpdates"), offset))
+	if err != nil {
+		listenLog("confirm offset before exit: %v", err)
+		return
+	}
+	resp.Body.Close() // safe-ignore: the ack already happened when Telegram accepted the request
 }
 
 // handleStopCommand implements `/stop [name|all]`. Bare `/stop` kills
@@ -1385,14 +1464,13 @@ func (in *instance) applyEngineModel(engine, slug string) string {
 	if strings.EqualFold(slug, "default") {
 		slug = ""
 	}
-	updated := updateConfig(func(c *Config) bool {
+	updated, err := in.commitConfig(func(c *Config) bool {
 		setEngineModel(c, engine, slug)
 		return true
 	})
-	if updated == nil {
+	if err != nil || updated == nil {
 		return "Could not write the configuration."
 	}
-	in.setConfig(updated)
 	if engine == engineClaude {
 		if slug == "" {
 			return "🧠 Claude model reset to <code>(engine default)</code>"

@@ -564,6 +564,34 @@ func TestRenderSystemPromptGrokGetsMCP(t *testing.T) {
 	}
 }
 
+func plantClaudeCreds(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"claudeAiOauth":{"accessToken":"test-access-token"}}`)
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func plantEngineAuth(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"email":"a@b.c"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func prependFakeBin(t *testing.T, name string) {
+	t.Helper()
+	dir := t.TempDir()
+	writeFakeCLI(t, dir, name, "#!/bin/sh\nexit 0\n")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 func writeFakeCLI(t *testing.T, dir, name, script string) string {
 	t.Helper()
 	if script == "" {
@@ -764,9 +792,14 @@ func TestCreateBotPicksEngineWithMostHeadroom(t *testing.T) {
 	dir := t.TempDir()
 	in.cfg.DefaultEngine = engineGrok
 	in.cfg.DefaultProfile = "work"
+	grokDir := filepath.Join(dir, "grok")
+	claudeDir := filepath.Join(dir, "claude")
+	plantEngineAuth(t, grokDir)
+	plantClaudeCreds(t, claudeDir)
+	prependFakeBin(t, "grok")
 	in.cfg.Profiles = map[string]*Profile{
-		"work":     {Engine: engineGrok, ConfigDir: filepath.Join(dir, "grok")},
-		"personal": {Engine: engineClaude, ConfigDir: filepath.Join(dir, "claude")},
+		"work":     {Engine: engineGrok, ConfigDir: grokDir},
+		"personal": {Engine: engineClaude, ConfigDir: claudeDir},
 	}
 	for _, p := range listProfiles(in.cfg) {
 		switch profileEngine(p) {
@@ -785,16 +818,21 @@ func TestCreateBotPicksEngineWithMostHeadroom(t *testing.T) {
 	}
 }
 
-func TestCreateBotDoesNotStarveUnusedEngine(t *testing.T) {
+func TestCreateBotUnknownUsageLosesToKnown(t *testing.T) {
 	in, _, _ := testInstance(t)
 	usageMemClear()
 	t.Cleanup(usageMemClear)
 	dir := t.TempDir()
 	in.cfg.DefaultEngine = ""
 	in.cfg.DefaultProfile = "you@example.com"
+	claudeDir := filepath.Join(dir, "claude")
+	codexDir := filepath.Join(dir, "codex")
+	plantClaudeCreds(t, claudeDir)
+	plantEngineAuth(t, codexDir)
+	prependFakeBin(t, "codex")
 	in.cfg.Profiles = map[string]*Profile{
-		"you@example.com": {Engine: engineClaude, ConfigDir: filepath.Join(dir, "claude")},
-		"codex":           {Engine: engineCodex, ConfigDir: filepath.Join(dir, "codex")},
+		"you@example.com": {Engine: engineClaude, ConfigDir: claudeDir},
+		"codex":           {Engine: engineCodex, ConfigDir: codexDir},
 	}
 	for _, p := range listProfiles(in.cfg) {
 		if profileEngine(p) == engineClaude {
@@ -805,8 +843,8 @@ func TestCreateBotDoesNotStarveUnusedEngine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if botEngine(b) != engineCodex {
-		t.Errorf("engine = %q, want codex (unknown unused engine must not lose to claude at 42%%)", b.Engine)
+	if botEngine(b) != engineClaude {
+		t.Errorf("engine = %q, want claude (unknown usage must not beat a known 42%%)", b.Engine)
 	}
 }
 
@@ -814,10 +852,15 @@ func TestNextEngineByHeadroomCrossesEngines(t *testing.T) {
 	usageMemClear()
 	t.Cleanup(usageMemClear)
 	dir := t.TempDir()
+	claudeDir := filepath.Join(dir, "claude")
+	codexDir := filepath.Join(dir, "codex")
+	plantClaudeCreds(t, claudeDir)
+	plantEngineAuth(t, codexDir)
+	prependFakeBin(t, "codex")
 	cfg := &Config{
 		Profiles: map[string]*Profile{
-			"you@example.com": {Engine: engineClaude, ConfigDir: filepath.Join(dir, "claude")},
-			"codex":           {Engine: engineCodex, ConfigDir: filepath.Join(dir, "codex")},
+			"you@example.com": {Engine: engineClaude, ConfigDir: claudeDir},
+			"codex":           {Engine: engineCodex, ConfigDir: codexDir},
 		},
 	}
 	for _, p := range listProfiles(cfg) {

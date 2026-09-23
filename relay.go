@@ -184,6 +184,9 @@ type relayTransfer struct {
 	Created  time.Time
 	DataChan chan []byte
 	DoneChan chan struct{}
+	// receiver is set while one /d/ request is reading DataChan. A second
+	// concurrent download would split the bytes and double-close DoneChan.
+	receiver bool
 }
 
 func runRelayServer(port string) {
@@ -279,16 +282,15 @@ func runRelayServer(port string) {
 		}
 
 		token := strings.TrimPrefix(r.URL.Path, "/stream/")
-		relayTransfers.RLock()
+		relayTransfers.Lock()
 		t, exists := relayTransfers.transfers[token]
-		relayTransfers.RUnlock()
-
 		if !exists || t.Status != "ready" {
+			relayTransfers.Unlock()
 			http.Error(w, "Transfer not ready", http.StatusBadRequest)
 			return
 		}
-
 		t.Status = "streaming"
+		relayTransfers.Unlock()
 		fmt.Printf("📤 Streaming: %s (%s)\n", t.Filename, token[:8])
 
 		var bytesSent int64
@@ -340,23 +342,24 @@ func runRelayServer(port string) {
 		token := pathParts[0]
 		relayTransfers.Lock()
 		t, exists := relayTransfers.transfers[token]
-		if exists && t.Status == "waiting" {
+		if !exists {
+			relayTransfers.Unlock()
+			http.Error(w, "File not found - sender may have disconnected", http.StatusNotFound)
+			return
+		}
+		if t.receiver || (t.Status != "waiting" && t.Status != "ready") {
+			relayTransfers.Unlock()
+			http.Error(w, "Transfer in progress, please wait and retry", http.StatusConflict)
+			return
+		}
+		if t.Status == "waiting" {
 			t.Status = "ready"
 			// Create fresh channels for this download
 			t.DataChan = make(chan []byte, 100)
 			t.DoneChan = make(chan struct{})
 		}
+		t.receiver = true
 		relayTransfers.Unlock()
-
-		if !exists {
-			http.Error(w, "File not found - sender may have disconnected", http.StatusNotFound)
-			return
-		}
-
-		if t.Status != "ready" && t.Status != "streaming" {
-			http.Error(w, "Transfer in progress, please wait and retry", http.StatusConflict)
-			return
-		}
 
 		fmt.Printf("📥 Download started: %s (%s) from %s\n", t.Filename, token[:8], r.UserAgent())
 
@@ -407,14 +410,18 @@ func runRelayServer(port string) {
 
 		// Signal sender we're done (success or failure)
 		relayTransfers.Lock()
-		if t, exists := relayTransfers.transfers[token]; exists {
-			close(t.DoneChan)
+		if cur, exists := relayTransfers.transfers[token]; exists {
+			cur.receiver = false
+			select {
+			case <-cur.DoneChan:
+			default:
+				close(cur.DoneChan)
+			}
+			cur.Status = "waiting"
 			if writeErr == nil {
-				t.Status = "waiting"
-				fmt.Printf("📥 Download complete: %s (%s) - %d bytes sent\n", t.Filename, token[:8], bytesWritten)
+				fmt.Printf("📥 Download complete: %s (%s) - %d bytes sent\n", cur.Filename, token[:8], bytesWritten)
 			} else {
-				t.Status = "waiting" // Still allow retry
-				fmt.Printf("📥 Download failed: %s (%s) - allowing retry\n", t.Filename, token[:8])
+				fmt.Printf("📥 Download failed: %s (%s) - allowing retry\n", cur.Filename, token[:8])
 			}
 		}
 		relayTransfers.Unlock()

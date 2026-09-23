@@ -57,9 +57,14 @@ func redactTokenError(err error, token string) error {
 	return fmt.Errorf("%s", strings.ReplaceAll(err.Error(), token, "***"))
 }
 
+// telegramHTTP bounds every outbound Bot API call. http.DefaultClient has
+// no timeout; a half-open connection after sleep/wake stalled the panel
+// and every worker whose stream callback was waiting on it.
+var telegramHTTP = &http.Client{Timeout: 25 * time.Second}
+
 // telegramGet performs an HTTP GET and redacts the bot token from any errors
 func telegramGet(token string, url string) (*http.Response, error) {
-	resp, err := http.Get(url)
+	resp, err := telegramHTTP.Get(url)
 	if err != nil {
 		return nil, redactTokenError(err, token)
 	}
@@ -82,7 +87,7 @@ func updateCCC(config *Config, chatID, threadID int64, offset int) {
 	binaryName := fmt.Sprintf("ccc-%s-%s", runtime.GOOS, runtime.GOARCH)
 	downloadURL := fmt.Sprintf("https://github.com/kidandcat/ccc/releases/latest/download/%s", binaryName)
 
-	resp, err := http.Get(downloadURL)
+	resp, err := telegramHTTP.Get(downloadURL)
 	if err != nil {
 		sendMessage(config, chatID, threadID, fmt.Sprintf("❌ Download failed: %v", err))
 		return
@@ -172,16 +177,48 @@ func updateCCC(config *Config, chatID, threadID int64, offset int) {
 
 func telegramAPI(config *Config, method string, params url.Values) (*TelegramResponse, error) {
 	apiURL := telegramURL(config.BotToken, method)
-	resp, err := http.PostForm(apiURL, params)
-	if err != nil {
-		return nil, redactTokenError(err, config.BotToken)
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		resp, err := telegramHTTP.PostForm(apiURL, params)
+		if err != nil {
+			return nil, redactTokenError(err, config.BotToken)
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
+		resp.Body.Close()
+		var result TelegramResponse
+		if uerr := json.Unmarshal(body, &result); uerr != nil {
+			if resp.StatusCode == 429 {
+				time.Sleep(telegramRetryWait(nil, attempt))
+				lastErr = fmt.Errorf("telegram %s: HTTP 429", method)
+				continue
+			}
+			return nil, fmt.Errorf("telegram %s: HTTP %d: %w", method, resp.StatusCode, uerr)
+		}
+		if resp.StatusCode == 429 || result.ErrorCode == 429 {
+			time.Sleep(telegramRetryWait(&result, attempt))
+			lastErr = fmt.Errorf("telegram %s: %s", method, result.Description)
+			continue
+		}
+		if resp.StatusCode >= 500 {
+			return nil, fmt.Errorf("telegram %s: HTTP %d", method, resp.StatusCode)
+		}
+		return &result, nil
 	}
-	defer resp.Body.Close()
+	if lastErr == nil {
+		lastErr = fmt.Errorf("telegram %s: rate limited", method)
+	}
+	return nil, lastErr
+}
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
-	var result TelegramResponse
-	json.Unmarshal(body, &result)
-	return &result, nil
+func telegramRetryWait(result *TelegramResponse, attempt int) time.Duration {
+	if result != nil && result.Parameters != nil && result.Parameters.RetryAfter > 0 {
+		d := time.Duration(result.Parameters.RetryAfter) * time.Second
+		if d > 30*time.Second {
+			return 30 * time.Second
+		}
+		return d
+	}
+	return time.Duration(attempt+1) * 500 * time.Millisecond
 }
 
 func sendMessage(config *Config, chatID int64, threadID int64, text string) error {
@@ -518,7 +555,7 @@ func sendFile(config *Config, chatID int64, threadID int64, filePath string, cap
 	io.Copy(part, file)
 	writer.Close()
 
-	resp, err := http.Post(
+	resp, err := telegramHTTP.Post(
 		telegramURL(config.BotToken, "sendDocument"),
 		writer.FormDataContentType(),
 		body,
@@ -659,7 +696,7 @@ func setBotCommands(botToken string) {
 	defaultBody, _ := json.Marshal(map[string]interface{}{
 		"commands": commands,
 	})
-	resp, err := http.Post(
+	resp, err := telegramHTTP.Post(
 		telegramURL(botToken, "setMyCommands"),
 		"application/json",
 		bytes.NewReader(defaultBody),
@@ -673,7 +710,7 @@ func setBotCommands(botToken string) {
 		"commands": commands,
 		"scope":    map[string]string{"type": "all_group_chats"},
 	})
-	resp, err = http.Post(
+	resp, err = telegramHTTP.Post(
 		telegramURL(botToken, "setMyCommands"),
 		"application/json",
 		bytes.NewReader(groupBody),

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,18 +20,50 @@ var cfgMu sync.Mutex
 // handlers mutate the config concurrently (profiles, model), and racing
 // whole-file saves silently drop each other's changes.
 // mutate runs on a freshly-loaded copy; return true to persist it. Returns the
-// fresh (possibly mutated) config, or nil if the config could not be loaded.
+// fresh (possibly mutated) config, or nil if the config could not be loaded
+// or saved. Prefer commitConfig so the in-memory swap happens under cfgMu.
 func updateConfig(mutate func(*Config) bool) *Config {
-	cfgMu.Lock()
-	defer cfgMu.Unlock()
-	config, err := loadConfig()
-	if err != nil || config == nil {
+	cfg, err := updateConfigErr(mutate)
+	if err != nil {
 		return nil
 	}
-	if mutate(config) {
-		saveConfig(config) // safe-ignore: best-effort persist under the lock; caller keeps the fresh copy either way
+	return cfg
+}
+
+func updateConfigErr(mutate func(*Config) bool) (*Config, error) {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return writeConfigLocked(mutate)
+}
+
+// commitConfig is updateConfig plus the in-memory swap, both under cfgMu.
+// A save error is returned and the live config is left unchanged, so a full
+// disk cannot report "Added" for an account that will vanish on restart.
+func (in *instance) commitConfig(mutate func(*Config) bool) (*Config, error) {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	config, err := writeConfigLocked(mutate)
+	if err != nil {
+		return nil, err
 	}
-	return config
+	in.setConfig(config)
+	return config, nil
+}
+
+func writeConfigLocked(mutate func(*Config) bool) (*Config, error) {
+	config, err := loadConfig()
+	if err != nil {
+		return nil, err
+	}
+	if config == nil {
+		return nil, fmt.Errorf("config could not be loaded")
+	}
+	if mutate != nil && mutate(config) {
+		if err := saveConfig(config); err != nil {
+			return nil, err
+		}
+	}
+	return config, nil
 }
 
 // configDir returns ~/.config/ccc (created if needed)

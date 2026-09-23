@@ -308,6 +308,8 @@ COMMANDS:
     config get <key>        Show one value
     config                  Show the whole configuration
     install                 Install the background service (launchd / systemd --user)
+    restart                 Restart the service so it loads the binary on disk
+                            (run after make install)
     env sync                Snapshot env_passthrough secrets into <config>/env
                             (run from a login shell: bash -lc 'ccc env sync')
     doctor [--fix]          Check dependencies and configuration; --fix also
@@ -328,6 +330,7 @@ TELEGRAM (the bot's 1:1 DM is General):
     /sessions /status /usage                                    anywhere
     /memory stats|restore <id>                                  memory upkeep
     /account add <id> <engine> /access /model [engine] <slug>  owner only (/model lists each account)
+    /restart                owner only: bounce listen (picks up a new binary)
     /secret add <name> | list | delete <name>                   owner vault (value is never shown)
 
 FLAGS:

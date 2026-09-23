@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -36,12 +38,26 @@ const (
 	watchDiffLimit = 8 * 1024
 )
 
+// watchesAsync is false in tests so runDueWatches stays deterministic.
+// Production leaves it true: a hung watch must not stall the loop.
+var watchesAsync = true
+
 // scheduler owns the loop. It is constructed by listenV3 and stopped with it.
 type scheduler struct {
 	in     *instance
 	stop   chan struct{}
 	doctor *doctorState
 	bg     bgRuntime
+	// firing is held across fireDueSchedules so Close can wait out a claim
+	// that has not committed yet. It is not held across Telegram calls.
+	firing sync.WaitGroup
+	// watchRunning keeps a slow watch off the scheduler loop. The loop only
+	// dispatches; the command runs on its own goroutine.
+	watchMu      sync.Mutex
+	watchRunning map[int64]bool
+	watchWG      sync.WaitGroup
+	maintMu      sync.Mutex
+	maintRunning bool
 }
 
 func newScheduler(in *instance) *scheduler {
@@ -50,10 +66,22 @@ func newScheduler(in *instance) *scheduler {
 
 func (s *scheduler) Close() {
 	// Leave running jobs alone: they are detached and a new listen reattaches.
+	// Wait briefly for an in-flight schedule claim so a restart cannot fire
+	// the same row twice. killGrace bounds it; a stuck watch must not pin
+	// shutdown forever.
 	select {
 	case <-s.stop:
 	default:
 		close(s.stop)
+	}
+	done := make(chan struct{})
+	go func() {
+		s.firing.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(killGrace):
 	}
 }
 
@@ -113,7 +141,33 @@ func (s *scheduler) runDueWatches(now time.Time) {
 		if w.LastRunAt != nil && now.Sub(*w.LastRunAt) < time.Duration(w.IntervalS)*time.Second {
 			continue
 		}
-		s.runWatch(&w, now)
+		s.watchMu.Lock()
+		if s.watchRunning == nil {
+			s.watchRunning = map[int64]bool{}
+		}
+		if s.watchRunning[w.ID] {
+			s.watchMu.Unlock()
+			continue
+		}
+		s.watchRunning[w.ID] = true
+		s.watchMu.Unlock()
+		run := func() {
+			defer func() {
+				s.watchMu.Lock()
+				delete(s.watchRunning, w.ID)
+				s.watchMu.Unlock()
+			}()
+			s.runWatch(&w, now)
+		}
+		if !watchesAsync {
+			run()
+			continue
+		}
+		s.watchWG.Add(1)
+		go func() {
+			defer s.watchWG.Done()
+			run()
+		}()
 	}
 }
 
@@ -129,7 +183,13 @@ func (s *scheduler) runWatch(w *Watch, now time.Time) {
 	hash := hashOutput(output)
 
 	updates := map[string]any{"last_run_at": now, "last_hash": hash, "last_output": output}
-	s.in.db.Model(&Watch{}).Where("id = ?", w.ID).Updates(updates)
+	// The command may have been replaced or the watch removed while this
+	// run was in flight. Writing the old hash back would make the next run
+	// look like a change, and a deleted row must not wake the bot.
+	res := s.in.db.Model(&Watch{}).Where("id = ? AND command = ?", w.ID, w.Command).Updates(updates)
+	if res.Error != nil || res.RowsAffected == 0 {
+		return
+	}
 
 	if w.LastHash == "" && w.LastRunAt == nil {
 		// First run: record the baseline without waking anybody. A watch is a
@@ -137,6 +197,10 @@ func (s *scheduler) runWatch(w *Watch, now time.Time) {
 		return
 	}
 	if hash == w.LastHash {
+		return
+	}
+	var cur Watch
+	if err := s.in.db.First(&cur, w.ID).Error; err != nil || cur.Command != w.Command || !cur.Enabled {
 		return
 	}
 	input := renderWatchChange(w, w.LastOutput, output, runErr)
@@ -517,11 +581,61 @@ func parseCron(expr string) (cron.Schedule, error) {
 	return cronParser.Parse(expr)
 }
 
+// errScheduleRetired means the row was claimed by retiring it (bad cron).
+// The caller must not enqueue and must not put the row back.
+var errScheduleRetired = errors.New("schedule retired")
+
+// schedulesDue loads every unfired schedule and compares instants in Go.
+// fire_at is stored as text with a zone offset (the sqlite driver format).
+// "fire_at <= ?" is a lexicographic compare, so "+00:00" and "+02:00" sort
+// in the wrong order and a wakeup fires hours early or hours late.
+func schedulesDue(db *gorm.DB, now time.Time) ([]Schedule, error) {
+	var pending []Schedule
+	if err := db.Where("fired_at IS NULL").Find(&pending).Error; err != nil {
+		return nil, err
+	}
+	due := make([]Schedule, 0, len(pending))
+	for _, sc := range pending {
+		if sc.FireAt.IsZero() || sc.FireAt.After(now) {
+			continue
+		}
+		due = append(due, sc)
+	}
+	return due, nil
+}
+
+// claimSchedule moves fire_at (or sets fired_at) before any enqueue or
+// Telegram call. A crash in the notify window must not see the row as due
+// again. On a later enqueue failure the caller restores the previous row.
+func claimSchedule(db *gorm.DB, sc Schedule, now time.Time) error {
+	if strings.TrimSpace(sc.RecurringCron) != "" {
+		next, err := cronNextIn(sc.RecurringCron, sc.Timezone, now)
+		if err != nil {
+			hookLog("schedule %d: unparseable cron %q, retiring it", sc.ID, sc.RecurringCron)
+			if uerr := db.Model(&Schedule{}).Where("id = ?", sc.ID).Update("fired_at", now).Error; uerr != nil {
+				return uerr
+			}
+			return errScheduleRetired
+		}
+		return db.Model(&Schedule{}).Where("id = ?", sc.ID).Update("fire_at", next.UTC()).Error
+	}
+	return db.Model(&Schedule{}).Where("id = ?", sc.ID).Update("fired_at", now).Error
+}
+
+func restoreSchedule(db *gorm.DB, sc Schedule) {
+	db.Model(&Schedule{}).Where("id = ?", sc.ID).Updates(map[string]any{
+		"fire_at":  sc.FireAt.UTC(),
+		"fired_at": gorm.Expr("NULL"),
+	})
+}
+
 // fireDueSchedules fires every schedule whose time has come. Unnamed wakeups
 // enqueue on the owning bot; named routines start a fresh worker.
 func (s *scheduler) fireDueSchedules(now time.Time) {
-	var due []Schedule
-	if err := s.in.db.Where("fired_at IS NULL AND fire_at <= ?", now).Find(&due).Error; err != nil {
+	s.firing.Add(1)
+	defer s.firing.Done()
+	due, err := schedulesDue(s.in.db, now)
+	if err != nil {
 		return
 	}
 	for i := range due {
@@ -531,34 +645,41 @@ func (s *scheduler) fireDueSchedules(now time.Time) {
 			s.in.db.Model(&Schedule{}).Where("id = ?", sc.ID).Update("fired_at", now)
 			continue
 		}
+		// Claim before enqueue and before the ⏰ post. Those used to sit
+		// between the turn insert and the fire_at update, so a restart in
+		// that window fired the routine twice.
+		if err := claimSchedule(s.in.db, sc, now); err != nil {
+			if !errors.Is(err, errScheduleRetired) {
+				hookLog("schedule %d: claim: %v", sc.ID, err)
+			}
+			continue
+		}
 		note := strings.TrimSpace(sc.Note)
 		if note == "" {
 			note = "(no note)"
 		}
 		name := strings.TrimSpace(sc.Name)
+		var enqErr error
 		if name != "" {
-			if err := s.startRoutineWorker(b, name, note); err != nil {
-				hookLog("schedule %d: routine worker: %v", sc.ID, err)
+			enqErr = s.startRoutineWorker(b, name, note)
+			if enqErr == nil {
+				s.postRoutineFired(b, sc)
 			}
-			s.postRoutineFired(b, sc)
 		} else {
 			input := fmt.Sprintf("Scheduled wakeup: %s", note)
-			if _, err := s.in.runner.Enqueue(b.ID, sourceSchedule, input, 0); err != nil {
-				hookLog("schedule %d: enqueue failed: %v", sc.ID, err)
-				continue
-			}
+			_, enqErr = s.in.runner.Enqueue(b.ID, sourceSchedule, input, 0)
 		}
-		// A recurring schedule rolls forward instead of being retired, so one
-		// row keeps firing for the life of the bot. Named routines interpret
-		// cron in their timezone so 9:00 means 9:00 in Madrid on the UTC VM.
-		if sc.RecurringCron != "" {
-			if next, err := cronNextIn(sc.RecurringCron, sc.Timezone, now); err == nil {
-				s.in.db.Model(&Schedule{}).Where("id = ?", sc.ID).Update("fire_at", next)
-				continue
-			}
-			hookLog("schedule %d: unparseable cron %q, retiring it", sc.ID, sc.RecurringCron)
+		if errors.Is(enqErr, errRoutineBusy) {
+			// The previous fire is still running. fire_at already moved, so
+			// this occurrence is skipped instead of resetting the session
+			// out from under the live turn.
+			hookLog("schedule %d: skipped, previous fire still running", sc.ID)
+			enqErr = nil
 		}
-		s.in.db.Model(&Schedule{}).Where("id = ?", sc.ID).Update("fired_at", now)
+		if enqErr != nil {
+			hookLog("schedule %d: enqueue failed: %v", sc.ID, enqErr)
+			restoreSchedule(s.in.db, sc)
+		}
 	}
 }
 
@@ -575,10 +696,25 @@ func (s *scheduler) runMaintenanceIfDue(now time.Time) {
 	if !maintenanceDue(s.in.db, s.in.config(), now) {
 		return
 	}
-	// Claim the day before doing the work: a slow pass must not be started
-	// twice by the next tick.
-	markMaintenanceRun(s.in.db, now)
-	go s.runMaintenanceNow(now)
+	// Do not mark the day done until the pass finishes. A SIGTERM in the
+	// middle used to skip maintenance entirely until tomorrow. The in-memory
+	// flag stops the next tick from starting a second pass.
+	s.maintMu.Lock()
+	if s.maintRunning {
+		s.maintMu.Unlock()
+		return
+	}
+	s.maintRunning = true
+	s.maintMu.Unlock()
+	go func() {
+		defer func() {
+			s.maintMu.Lock()
+			s.maintRunning = false
+			s.maintMu.Unlock()
+		}()
+		s.runMaintenanceNow(now)
+		markMaintenanceRun(s.in.db, now)
+	}()
 }
 
 // runMaintenanceNow is the job itself, off the scheduler's goroutine: the

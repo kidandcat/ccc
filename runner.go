@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -200,6 +201,10 @@ type Runner struct {
 	active map[int64]*activeTurn
 	wake   map[int64]chan struct{}
 	done   chan struct{}
+	// halt is a /stop that arrived while no engine process was registered:
+	// the sleep between failover attempts, or the gap between Start and
+	// r.active. Without it the next attempt runs the turn to the end.
+	halt map[int64]bool
 	// needsLogin holds profiles a turn found logged out; they are skipped until
 	// the owner re-logs in (the doctor loop in Phase 2b clears them).
 	needsLogin map[string]bool
@@ -216,6 +221,7 @@ func newRunner(db *gorm.DB, cfg *Config, ui botUI) *Runner {
 		active:     map[int64]*activeTurn{},
 		wake:       map[int64]chan struct{}{},
 		done:       make(chan struct{}),
+		halt:       map[int64]bool{},
 		needsLogin: map[string]bool{},
 	}
 	if s := panelSurfaceOf(ui); s != nil {
@@ -230,19 +236,68 @@ func (r *Runner) config() *Config {
 	return r.cfg
 }
 
-// Close stops the per-bot loops. Running turns are left to finish.
+// Close stops the per-bot loops and signals every live engine process group.
+// recoverAfterRestart requeues status=running rows on the assumption that
+// those processes died with us. Leaving them alive (Setpgid) made a restart
+// run the same turn twice. Close waits out killGrace so os.Exit does not
+// orphan the group.
 func (r *Runner) Close() {
 	r.mu.Lock()
 	select {
 	case <-r.done:
+		r.mu.Unlock()
+		return
 	default:
 		close(r.done)
 	}
+	turns := make([]*activeTurn, 0, len(r.active))
+	for _, at := range r.active {
+		turns = append(turns, at)
+	}
 	r.mu.Unlock()
+	for _, at := range turns {
+		killActiveTurn(at)
+	}
+	if len(turns) == 0 {
+		return
+	}
+	timer := time.NewTimer(killGrace + time.Second)
+	defer timer.Stop()
+	for _, at := range turns {
+		if at == nil || at.exited == nil {
+			continue
+		}
+		select {
+		case <-at.exited:
+		case <-timer.C:
+			return
+		}
+	}
 }
 
 // Enqueue records an input for a bot and wakes its loop.
+// A non-zero triggerMessageID is the Telegram message that produced the
+// turn. Redelivery (a restart before getUpdates confirmed the offset) must
+// return that turn instead of starting a second one. Trigger 0 is every
+// internal source and is not deduped.
 func (r *Runner) Enqueue(botID int64, source, text string, triggerMessageID int64) (*Turn, error) {
+	if b, err := botByID(r.db, botID); err == nil && b.ArchivedAt != nil {
+		return nil, fmt.Errorf("session is archived")
+	}
+	if triggerMessageID != 0 {
+		var existing Turn
+		err := r.db.Where("bot_id = ? AND trigger_message_id = ?", botID, triggerMessageID).
+			Order("id").First(&existing).Error
+		if err == nil {
+			if existing.Status == turnQueued {
+				r.kick(botID)
+			}
+			return &existing, nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+	}
 	t := &Turn{
 		BotID:            botID,
 		Source:           source,
@@ -286,6 +341,12 @@ func (r *Runner) Running(botID int64) bool {
 func (r *Runner) interruptActive(botID int64, timedOut bool) bool {
 	r.mu.Lock()
 	at := r.active[botID]
+	if !timedOut {
+		if r.halt == nil {
+			r.halt = map[int64]bool{}
+		}
+		r.halt[botID] = true
+	}
 	if at != nil {
 		if timedOut {
 			at.timedOut = true
@@ -295,6 +356,39 @@ func (r *Runner) interruptActive(botID int64, timedOut bool) bool {
 	}
 	r.mu.Unlock()
 	return killActiveTurn(at)
+}
+
+func (r *Runner) turnHalted(botID int64) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.halt[botID]
+}
+
+func (r *Runner) clearHalt(botID int64) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	delete(r.halt, botID)
+	r.mu.Unlock()
+}
+
+// sleepUnlessHalted waits d or until /stop lands, whichever is first.
+// True means the turn was stopped and the caller must not start another attempt.
+func (r *Runner) sleepUnlessHalted(botID int64, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		if r.turnHalted(botID) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return r.turnHalted(botID)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // interruptCapped SIGTERMs a turn that hit worker_turn_timeout_s. Distinct
@@ -631,6 +725,13 @@ func (r *Runner) runNext(botID int64) bool {
 	if err != nil {
 		return false
 	}
+	if b.ArchivedAt != nil {
+		// A turn queued in the gap after archive (or delivered to a retired
+		// session) would otherwise stay queued forever: runNext skips
+		// archived bots and nothing else sweeps status=queued.
+		r.failArchivedQueue(botID)
+		return false
+	}
 	if sessionSkipsTurns(b) {
 		return false
 	}
@@ -643,6 +744,14 @@ func (r *Runner) runNext(botID int64) bool {
 	}
 	r.execute(b, head, input, triggers)
 	return true
+}
+
+func (r *Runner) failArchivedQueue(botID int64) {
+	if r == nil || r.db == nil {
+		return
+	}
+	r.db.Model(&Turn{}).Where("bot_id = ? AND status = ?", botID, turnQueued).
+		Updates(map[string]any{"status": turnFailed, "stop_reason": "session archived"})
 }
 
 // foldQueue takes every input queued for a bot right now and folds it into the
@@ -661,6 +770,8 @@ func foldQueue(db *gorm.DB, botID int64) (*Turn, string, []int64, bool) {
 	head := queued[0]
 	inputs := []string{head.Input}
 	var triggers []int64
+	hasUser := turnSourceIsUser(head.Source)
+	hasReport := turnSourceIsReport(head.Source)
 	if head.TriggerMessageID != 0 {
 		triggers = append(triggers, head.TriggerMessageID)
 	}
@@ -669,15 +780,45 @@ func foldQueue(db *gorm.DB, botID int64) (*Turn, string, []int64, bool) {
 		if extra.TriggerMessageID != 0 {
 			triggers = append(triggers, extra.TriggerMessageID)
 		}
+		if turnSourceIsUser(extra.Source) {
+			hasUser = true
+		}
+		if turnSourceIsReport(extra.Source) {
+			hasReport = true
+		}
 		db.Model(&Turn{}).Where("id = ?", extra.ID).
 			Updates(map[string]any{"status": turnDone, "stop_reason": "merged into turn " + fmt.Sprint(head.ID)})
 		db.Model(&InboxMessage{}).Where("turn_id = ?", extra.ID).Update("turn_id", head.ID)
 	}
+	// Any owner text keeps user envelope semantics (it must not ride inside
+	// source="bot"). Any report drops General's 60s cap, which would kill
+	// the summary and can auto-spawn a duplicate worker.
+	if hasUser && head.Source != sourceUser {
+		head.Source = sourceUser
+		db.Model(&Turn{}).Where("id = ?", head.ID).Update("source", sourceUser)
+	}
+	if hasReport {
+		head.FoldNoCap = true
+	}
 	return &head, strings.Join(inputs, "\n\n"), triggers, true
+}
+
+func turnSourceIsUser(source string) bool {
+	return source == sourceUser
+}
+
+func turnSourceIsReport(source string) bool {
+	switch source {
+	case sourceBot, sourceWatch, sourceBackground, sourceSchedule, sourceRoutine:
+		return true
+	default:
+		return strings.HasPrefix(source, sourceRoutine+":")
+	}
 }
 
 // execute runs one turn end to end, including profile failover (DESIGN §3.4).
 func (r *Runner) execute(b *Bot, t *Turn, input string, triggers []int64) {
+	defer r.clearHalt(b.ID)
 	now := time.Now()
 	nameAtStart := b.Name
 	r.db.Model(&Turn{}).Where("id = ?", t.ID).
@@ -710,6 +851,11 @@ func (r *Runner) execute(b *Bot, t *Turn, input string, triggers []int64) {
 	engine := botEngine(b)
 
 	for attempt := 0; attempt < maxFailoverAttempts; attempt++ {
+		if r.turnHalted(b.ID) {
+			class = "stopped"
+			lastErr = "stopped by /stop"
+			break
+		}
 		p, ok := r.pickAccount(engine, tried)
 		if !ok {
 			triedEngines[engine] = true
@@ -786,7 +932,11 @@ func (r *Runner) execute(b *Bot, t *Turn, input string, triggers []int64) {
 			noteProfileLimit(p, time.Now())
 			continue
 		case errTransient:
-			time.Sleep(10 * time.Second)
+			if r.sleepUnlessHalted(b.ID, 10*time.Second) {
+				class = "stopped"
+				lastErr = "stopped by /stop"
+				break
+			}
 			delete(tried, p.Name)
 			continue
 		default:
@@ -1082,7 +1232,7 @@ func (r *Runner) persistChiefTimeout(b *Bot, t *Turn, input string, end time.Tim
 	if followUp {
 		return
 	}
-	if spawned == nil && chiefHandedOffSince(r.db, b.ID, chiefHandoffSince(r.db, b.ID, t, input)) {
+	if spawned == nil && chiefHandedOffSince(r.db, b.ID, chiefHandoffSince(r.db, b.ID, t, input), chiefHandoffOwner(r.db, b.ID, t, input)) {
 		// General already spawn_session / tell_session during this turn.
 		return
 	}
@@ -1111,7 +1261,7 @@ func (r *Runner) ensureChiefTimeoutHandoff(b *Bot, t *Turn, input string) *Bot {
 		return nil
 	}
 	since := chiefHandoffSince(r.db, b.ID, t, input)
-	if chiefHandedOffSince(r.db, b.ID, since) {
+	if chiefHandedOffSince(r.db, b.ID, since, chiefHandoffOwner(r.db, b.ID, t, input)) {
 		return nil
 	}
 	spawned, err := r.autoSpawnChiefTimeout(b, t, input)
@@ -1357,8 +1507,15 @@ func (r *Runner) spawn(p Profile, b *Bot, t *Turn, sessionID string, resume bool
 
 	exited := make(chan struct{})
 	r.mu.Lock()
-	r.active[b.ID] = &activeTurn{cmd: cmd, pid: cmd.Process.Pid, exited: exited}
+	at := &activeTurn{cmd: cmd, pid: cmd.Process.Pid, exited: exited}
+	if r.halt[b.ID] {
+		at.stopped = true
+	}
+	r.active[b.ID] = at
 	r.mu.Unlock()
+	if at.stopped {
+		killActiveTurn(at)
+	}
 
 	stopWatch := make(chan struct{})
 	defer close(stopWatch)
@@ -1387,6 +1544,15 @@ func (r *Runner) spawn(p Profile, b *Bot, t *Turn, sessionID string, resume bool
 		}
 		raw.Write(line)
 	}
+	if scanErr := scanner.Err(); scanErr != nil {
+		// ErrTooLong (or a read error) stops Scan while the child is still
+		// writing. Wait would then block forever once the pipe fills.
+		res.spawnErr = fmt.Errorf("read engine output: %w", scanErr)
+		_, _ = io.Copy(io.Discard, stdout) // safe-ignore: draining is best-effort so Wait can return
+		if cmd.Process != nil && cmd.Process.Pid > 0 {
+			signalGroup(cmd.Process.Pid, syscall.SIGTERM)
+		}
+	}
 	// An engine that only prints the final answer still delivers it.
 	if res.Text == "" && !sawJSON {
 		res.Text = strings.TrimSpace(raw.String())
@@ -1395,7 +1561,7 @@ func (r *Runner) spawn(p Profile, b *Bot, t *Turn, sessionID string, resume bool
 	close(exited)
 
 	r.mu.Lock()
-	at := r.active[b.ID]
+	at = r.active[b.ID]
 	if at != nil {
 		res.stopped = at.stopped
 		res.timedOut = at.timedOut && !at.stopped
@@ -1688,6 +1854,18 @@ func failureMessage(class, detail string) string {
 // ---------------------------------------------------------------------------
 // Profiles
 // ---------------------------------------------------------------------------
+
+func (r *Runner) renameNeedsLogin(oldName, newName string) {
+	if r == nil || oldName == "" || newName == "" || oldName == newName {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.needsLogin[oldName] {
+		r.needsLogin[newName] = true
+		delete(r.needsLogin, oldName)
+	}
+}
 
 func (r *Runner) markNeedsLogin(p Profile) {
 	r.mu.Lock()

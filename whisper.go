@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/mutablelogic/go-whisper/pkg/schema"
 	whisper "github.com/mutablelogic/go-whisper/pkg/whisper"
@@ -20,12 +22,21 @@ const voiceSupported = true
 const whisperModelName = "ggml-small.bin"
 const whisperModelURL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
 
+// whisperMu serializes the download. Two first voice notes used to Create
+// the same .tmp and Rename it while the other was still writing.
+var (
+	whisperMu   sync.Mutex
+	whisperHTTP = &http.Client{Timeout: 15 * time.Minute}
+)
+
 func getModelsDir() string {
 	return filepath.Join(cacheDir(), "models")
 }
 
 // ensureModel downloads the whisper model if not present
 func ensureModel() (string, error) {
+	whisperMu.Lock()
+	defer whisperMu.Unlock()
 	modelsDir := getModelsDir()
 	modelPath := filepath.Join(modelsDir, whisperModelName)
 	if _, err := os.Stat(modelPath); err == nil {
@@ -37,7 +48,7 @@ func ensureModel() (string, error) {
 	}
 
 	fmt.Printf("Downloading whisper model %s...\n", whisperModelName)
-	resp, err := http.Get(whisperModelURL)
+	resp, err := whisperHTTP.Get(whisperModelURL)
 	if err != nil {
 		return "", fmt.Errorf("failed to download model: %w", err)
 	}
@@ -47,11 +58,11 @@ func ensureModel() (string, error) {
 		return "", fmt.Errorf("failed to download model: HTTP %d", resp.StatusCode)
 	}
 
-	tmpPath := modelPath + ".tmp"
-	f, err := os.Create(tmpPath)
+	f, err := os.CreateTemp(modelsDir, whisperModelName+".*")
 	if err != nil {
 		return "", fmt.Errorf("failed to create model file: %w", err)
 	}
+	tmpPath := f.Name()
 
 	written, err := io.Copy(f, resp.Body)
 	f.Close()

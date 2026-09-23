@@ -188,13 +188,21 @@ func (s *ptySession) send(text string) error {
 	return err
 }
 
-// Close kills the child and releases the pty.
+// Close kills the child and releases the pty. Wait reaps it; Kill alone
+// leaves a zombie for the life of listen.
 func (s *ptySession) Close() {
 	if s.cmd != nil && s.cmd.Process != nil {
-		s.cmd.Process.Kill() // safe-ignore: the child is being abandoned; a dead process is the goal
+		_ = s.cmd.Process.Kill() // safe-ignore: the child is being abandoned; a dead process is the goal
 	}
-	s.tty.Close() // safe-ignore: same
-	<-s.done
+	if s.tty != nil {
+		_ = s.tty.Close() // safe-ignore: same
+	}
+	if s.done != nil {
+		<-s.done
+	}
+	if s.cmd != nil {
+		_ = s.cmd.Wait() // safe-ignore: Wait reaps; the error is the kill we just sent
+	}
 }
 
 // waitFor blocks until the flattened screen contains one of the phrases, the

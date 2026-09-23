@@ -48,11 +48,11 @@ func upsertCCCMCPBlock(path, command string) error {
 		command = "ccc"
 	}
 	block := fmt.Sprintf("[mcp_servers.ccc]\ncommand = %s\nargs = [\"mcp\"]\nenabled = true\n", tomlQuote(command))
-	raw, err := os.ReadFile(path)
+	existing, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	raw = stripTOMLTable(raw, "mcp_servers.ccc")
+	raw := stripTOMLTable(existing, "mcp_servers.ccc")
 	raw = bytes.TrimSpace(raw)
 	var buf bytes.Buffer
 	if len(raw) > 0 {
@@ -60,10 +60,16 @@ func upsertCCCMCPBlock(path, command string) error {
 		buf.WriteString("\n\n")
 	}
 	buf.WriteString(block)
+	next := buf.Bytes()
+	if bytes.Equal(bytes.TrimSpace(existing), bytes.TrimSpace(next)) {
+		return nil
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, buf.Bytes(), 0o600)
+	// WriteFile truncates in place. Two sessions launching on the same
+	// account would let one CLI read a half-written config.toml.
+	return writeFileAtomic(path, next, 0o600)
 }
 
 // stripTOMLTable drops [table] and [table.*] child tables.
