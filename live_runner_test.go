@@ -191,50 +191,27 @@ func TestLiveAskOwner(t *testing.T) {
 			"options [\"yes\",\"no\"]. As soon as it returns, end your turn without doing anything else.")
 	t.Logf("turn output: %s", truncate(turn.Output, 200))
 
-	var q Question
-	if err := r.db.Where("bot_id = ?", b.ID).First(&q).Error; err != nil {
-		t.Fatalf("ask_owner did not create a questions row: %v", err)
+	// Workers do not park. The tool archives the session and relays the question.
+	var n int64
+	if err := r.db.Model(&Question{}).Where("bot_id = ?", b.ID).Count(&n).Error; err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(strings.ToLower(q.Question), "deploy") {
-		t.Errorf("stored question = %q", q.Question)
+	if n != 0 {
+		t.Errorf("worker ask_owner created %d questions, want none", n)
 	}
-	if q.AnsweredAt != nil {
-		t.Error("the question should still be unanswered")
-	}
-	opts := questionOptions(&q)
-	if len(opts) != 2 || opts[0] != "yes" || opts[1] != "no" {
-		t.Errorf("options = %v, want yes / no", opts)
-	}
-
-	// The turn ended, and the bot is parked waiting for the answer.
 	after, err := botByID(r.db, b.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.Status != botWaiting {
-		t.Errorf("bot status = %q, want waiting after ask_owner", after.Status)
+	if after.ArchivedAt == nil {
+		t.Fatal("ask_owner must archive the worker")
 	}
-
-	// A queued input must not run while the bot waits.
-	if _, err := r.Enqueue(b.ID, sourceUser, "are you there?", 0); err != nil {
+	var inbox []InboxMessage
+	if err := r.db.Where("from_bot_id = ? AND relay = ?", b.ID, true).Find(&inbox).Error; err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(2 * time.Second)
-	var queued int64
-	r.db.Model(&Turn{}).Where("bot_id = ? AND status = ?", b.ID, turnQueued).Count(&queued)
-	if queued != 1 {
-		t.Errorf("%d turns queued, want the input to stay queued while the bot waits", queued)
-	}
-
-	// Answering releases it.
-	answer := answerQuestion(r.db, &q, "no")
-	if !strings.Contains(answer, "Should I deploy") || !strings.Contains(answer, "no") {
-		t.Errorf("answer envelope = %q", answer)
-	}
-	var stored Question
-	r.db.First(&stored, q.ID)
-	if stored.AnsweredAt == nil {
-		t.Error("the answer was not recorded")
+	if len(inbox) != 1 || !strings.Contains(strings.ToLower(inbox[0].Text), "deploy") {
+		t.Fatalf("handoff = %+v", inbox)
 	}
 }
 

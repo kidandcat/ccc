@@ -69,6 +69,11 @@ func (s *scheduler) Run() {
 	s.expireWatches(now)
 	s.compactIdleSessions(now)
 	s.remindIdleSessions(now)
+	// Old ask_owner left workers parked in waiting. They do not resume;
+	// General gets the question and starts a continuation. Once per boot.
+	if n := s.in.releaseParkedWorkers(); n > 0 {
+		listenLog("handed off %d parked worker(s) to General", n)
+	}
 	ticker := time.NewTicker(schedulerTick)
 	bgTicker := time.NewTicker(backgroundTick)
 	defer ticker.Stop()

@@ -63,33 +63,53 @@ func TestRenderSystemPromptCarriesIdentity(t *testing.T) {
 func TestSystemPromptRequiresAskOwnerForDecisions(t *testing.T) {
 	worker := renderSystemPrompt(promptBot{Name: "a", Cwd: "/tmp"}, "host", nil)
 	chief := renderSystemPrompt(promptBot{Name: "General", Cwd: "/tmp", Chief: true}, "host", nil)
+	if strings.Contains(worker, askOwnerRule) {
+		t.Errorf("worker prompt must not park on ask_owner:\n%s", worker)
+	}
+	if !strings.Contains(worker, workerUnattendedRule) {
+		t.Errorf("worker prompt missing unattended rule:\n%s", worker)
+	}
+	for _, want := range []string{
+		"Never wait on the owner",
+		"report_to_general",
+		"archive_bot",
+		"recommended one first",
+		"architectural",
+		"starts a new session",
+		"does not resume",
+	} {
+		if !strings.Contains(worker, want) {
+			t.Errorf("worker prompt missing %q:\n%s", want, worker)
+		}
+	}
+	if !strings.Contains(chief, askOwnerRule) {
+		t.Errorf("chief prompt missing ask_owner rule:\n%s", chief)
+	}
+	for _, want := range []string{
+		"ask_owner",
+		"A or B?",
+		"Yes/no",
+		"recommended first",
+		"architectural",
+		"end the turn",
+		"never an answer",
+		"answers by writing a reply",
+		"to the question in the DM",
+		"Workers are unattended",
+		"spawn_session a continuation",
+		"Do not leave the work parked",
+		"Do not re-ask a pending ask_owner",
+	} {
+		if !strings.Contains(chief, want) {
+			t.Errorf("chief prompt missing %q:\n%s", want, chief)
+		}
+	}
 	for name, got := range map[string]string{"worker": worker, "chief": chief} {
-		if !strings.Contains(got, askOwnerRule) {
-			t.Errorf("%s prompt missing shared ask_owner rule:\n%s", name, got)
-		}
-		for _, want := range []string{
-			"ask_owner",
-			"A or B?",
-			"Yes/no",
-			"recommended first",
-			"architectural",
-			"end the turn",
-			"never an answer",
-			"answers by writing a reply",
-			"to the question in the DM",
-		} {
-			if !strings.Contains(got, want) {
-				t.Errorf("%s prompt missing %q:\n%s", name, want, got)
-			}
-		}
 		for _, leak := range []string{"Telegram buttons", "Omitir", "native Telegram buttons"} {
 			if strings.Contains(got, leak) {
 				t.Errorf("%s prompt still mentions %q:\n%s", name, leak, got)
 			}
 		}
-	}
-	if !strings.Contains(worker, "optional listed options") {
-		t.Errorf("worker tool list should name listed options:\n%s", worker)
 	}
 	if strings.Contains(worker, "Prefer ask_owner over guessing on anything architectural") {
 		t.Error("old ask_owner wording leaked into the worker prompt")

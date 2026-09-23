@@ -633,13 +633,18 @@ func TestQuestionsSimilarNormalized(t *testing.T) {
 	}
 }
 
-func TestAskOwnerPostsOptionsAsTextNotButtons(t *testing.T) {
-	in, _, api := testInstance(t)
-	b, err := in.createBot("deployer", "")
+func generalMCP(t *testing.T, in *instance) *mcpServer {
+	t.Helper()
+	g, err := ensureGeneralBotRow(in.db, in.config())
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &mcpServer{db: in.db, config: in.cfg, botID: b.ID}
+	return &mcpServer{db: in.db, config: in.cfg, botID: g.ID}
+}
+
+func TestAskOwnerPostsOptionsAsTextNotButtons(t *testing.T) {
+	in, _, api := testInstance(t)
+	s := generalMCP(t, in)
 	res, _, err := s.askOwner(t.Context(), nil, askOwnerIn{
 		Question: "Deploy to prod?",
 		Options:  []string{"ship it", "hold"},
@@ -651,7 +656,7 @@ func TestAskOwnerPostsOptionsAsTextNotButtons(t *testing.T) {
 		t.Fatalf("ask_owner failed: %+v", res.Content)
 	}
 	var q Question
-	if err := in.db.Where("bot_id = ?", b.ID).First(&q).Error; err != nil {
+	if err := in.db.Where("bot_id = ?", s.botID).First(&q).Error; err != nil {
 		t.Fatal(err)
 	}
 	opts := questionOptions(&q)
@@ -669,11 +674,7 @@ func TestAskOwnerPostsOptionsAsTextNotButtons(t *testing.T) {
 
 func TestAskOwnerKeepsFourOptions(t *testing.T) {
 	in, _, _ := testInstance(t)
-	b, err := in.createBot("deployer", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := &mcpServer{db: in.db, config: in.cfg, botID: b.ID}
+	s := generalMCP(t, in)
 	if _, _, err := s.askOwner(t.Context(), nil, askOwnerIn{
 		Question: "Which host?",
 		Options:  []string{"vps2", "vps3", "fecha", "mac"},
@@ -681,7 +682,7 @@ func TestAskOwnerKeepsFourOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	var q Question
-	if err := in.db.Where("bot_id = ?", b.ID).First(&q).Error; err != nil {
+	if err := in.db.Where("bot_id = ?", s.botID).First(&q).Error; err != nil {
 		t.Fatal(err)
 	}
 	opts := questionOptions(&q)
@@ -691,24 +692,20 @@ func TestAskOwnerKeepsFourOptions(t *testing.T) {
 }
 
 func TestReplySkipUnblocksWithoutChoosing(t *testing.T) {
-	in, runner, api := testInstance(t)
+	in, runner, _ := testInstance(t)
 	b, err := in.createBot("deployer", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	setBotStatus(in.db, b.ID, botWaiting)
-	s := &mcpServer{db: in.db, config: in.cfg, botID: b.ID}
-	if _, _, err := s.askOwner(t.Context(), nil, askOwnerIn{
-		Question: "Deploy to prod?",
-		Options:  []string{"ship it", "hold"},
-	}); err != nil {
+	opts, err := json.Marshal([]string{"ship it", "hold"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	var q Question
-	if err := in.db.Where("bot_id = ?", b.ID).First(&q).Error; err != nil {
+	q := Question{BotID: b.ID, Question: "Deploy to prod?", OptionsJSON: string(opts), AskedMessageID: 5}
+	if err := in.db.Create(&q).Error; err != nil {
 		t.Fatal(err)
 	}
-	assertNoKeyboard(t, api)
 	msg := ownerMessage(skipOptionLabel)
 	msg.ReplyToMessage = &TelegramMessage{MessageID: int(q.AskedMessageID)}
 	in.handleMessage(msg)
@@ -788,16 +785,12 @@ func TestReplySkipFansOutToSimilar(t *testing.T) {
 
 func TestAskOwnerFreeTextHasNoKeyboard(t *testing.T) {
 	in, _, api := testInstance(t)
-	b, err := in.createBot("writer", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := &mcpServer{db: in.db, config: in.cfg, botID: b.ID}
+	s := generalMCP(t, in)
 	if _, _, err := s.askOwner(t.Context(), nil, askOwnerIn{Question: "What should the title be?"}); err != nil {
 		t.Fatal(err)
 	}
 	var q Question
-	if err := in.db.Where("bot_id = ?", b.ID).First(&q).Error; err != nil {
+	if err := in.db.Where("bot_id = ?", s.botID).First(&q).Error; err != nil {
 		t.Fatal(err)
 	}
 	opts := questionOptions(&q)
@@ -809,6 +802,125 @@ func TestAskOwnerFreeTextHasNoKeyboard(t *testing.T) {
 		t.Errorf("free-text question must keep the reply hint, got %q", joined)
 	}
 	assertNoKeyboard(t, api)
+}
+
+func TestWorkerAskOwnerHandsOffAndArchives(t *testing.T) {
+	in, _, api := testInstance(t)
+	b, err := in.createBot("deployer", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &mcpServer{db: in.db, config: in.cfg, botID: b.ID}
+	res, _, err := s.askOwner(t.Context(), nil, askOwnerIn{
+		Question: "Deploy to prod?",
+		Options:  []string{"ship it", "hold"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("worker ask_owner failed: %+v", res.Content)
+	}
+	var n int64
+	in.db.Model(&Question{}).Where("bot_id = ?", b.ID).Count(&n)
+	if n != 0 {
+		t.Fatalf("worker ask_owner parked %d questions, want none", n)
+	}
+	after, err := botByID(in.db, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ArchivedAt == nil {
+		t.Fatal("worker ask_owner must archive the session")
+	}
+	if after.Status == botWaiting {
+		t.Fatal("archived worker must not stay waiting")
+	}
+	var inbox []InboxMessage
+	if err := in.db.Where("from_bot_id = ? AND relay = ?", b.ID, true).Find(&inbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(inbox) != 1 {
+		t.Fatalf("handoff inbox = %d, want 1", len(inbox))
+	}
+	for _, want := range []string{"Deploy to prod?", "ship it", "spawn_session", "do not wait"} {
+		if !strings.Contains(strings.ToLower(inbox[0].Text), strings.ToLower(want)) {
+			t.Errorf("handoff missing %q:\n%s", want, inbox[0].Text)
+		}
+	}
+	joined := strings.Join(api.texts(""), "\n")
+	if strings.Contains(joined, "Reply to this message") {
+		t.Errorf("worker ask_owner must not post a question, got %q", joined)
+	}
+	if !strings.Contains(joined, "ended") {
+		t.Errorf("owner should see the session end, got %q", joined)
+	}
+	assertNoKeyboard(t, api)
+}
+
+func TestReleaseParkedWorkerHandsOff(t *testing.T) {
+	in, _, api := testInstance(t)
+	b, err := in.createBot("stuck", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setBotStatus(in.db, b.ID, botWaiting)
+	opts, err := json.Marshal([]string{"ship it", "hold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := Question{BotID: b.ID, Question: "Decrypt with KMS?", OptionsJSON: string(opts), AskedMessageID: 9}
+	if err := in.db.Create(&q).Error; err != nil {
+		t.Fatal(err)
+	}
+	if n := in.releaseParkedWorkers(); n != 1 {
+		t.Fatalf("released %d, want 1", n)
+	}
+	after, err := botByID(in.db, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ArchivedAt == nil {
+		t.Fatal("parked worker must be archived")
+	}
+	if err := in.db.First(&q, q.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if q.AnsweredAt == nil || q.Answer != "handed to General" {
+		t.Fatalf("question not closed: %+v", q)
+	}
+	var inbox []InboxMessage
+	if err := in.db.Where("from_bot_id = ?", b.ID).Find(&inbox).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(inbox) != 1 || !strings.Contains(inbox[0].Text, "Decrypt with KMS?") || !inbox[0].Wake {
+		t.Fatalf("handoff = %+v", inbox)
+	}
+	if n := in.releaseParkedWorkers(); n != 0 {
+		t.Fatalf("second release = %d, want 0", n)
+	}
+	edits := api.since("editMessageText")
+	if len(edits) != 1 || !strings.Contains(edits[0].Params.Get("text"), "stopped waiting") {
+		t.Fatalf("old question should be edited, edits=%v", edits)
+	}
+	// General's own question stays open.
+	g, err := ensureGeneralBotRow(in.db, in.config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gq := Question{BotID: g.ID, Question: "Ship the digest?", AskedMessageID: 11}
+	if err := in.db.Create(&gq).Error; err != nil {
+		t.Fatal(err)
+	}
+	if n := in.releaseParkedWorkers(); n != 0 {
+		t.Fatalf("General's question was released: %d", n)
+	}
+	if err := in.db.First(&gq, gq.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if gq.AnsweredAt != nil {
+		t.Fatal("General's question must stay open")
+	}
 }
 
 func TestSendToBotDoesNotDumpIntoTelegram(t *testing.T) {

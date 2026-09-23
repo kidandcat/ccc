@@ -188,7 +188,7 @@ func (s *mcpServer) register(server *mcp.Server) {
 	}, s.notifyOwner)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "ask_owner",
-		Description: "Ask the owner a question via Telegram and END YOUR TURN. Mandatory for every decision (yes/no, pick one, architectural fork). Never ask in chat or transcript prose. Pass optional listed options, recommended first. The owner answers by replying to the question in the DM. The answer arrives as your next message.",
+		Description: "General only: ask the owner a question via Telegram and END YOUR TURN. Pass optional listed options, recommended first. The owner answers by replying to the question in the DM. Workers must not call this. A worker call does not wait: it archives the session and hands the question to General, which decides and starts a new session. Workers that need a decision use report_to_general (question, options, resume state) and then archive_bot.",
 	}, s.askOwner)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "set_name",
@@ -473,6 +473,13 @@ func (s *mcpServer) askOwner(_ context.Context, _ *mcp.CallToolRequest, in askOw
 		}
 		opts = append(opts, truncate(o, 60))
 	}
+	// Workers are unattended. Asking the owner used to park the session in
+	// waiting until a reply; that blocked the work. Hand the question to
+	// General and end the session instead. General asks the owner if it
+	// cannot decide, then starts a new session that continues.
+	if !isGeneralBot(b) {
+		return s.handOffWorkerDecision(b, q, opts)
+	}
 	optionsJSON, err := json.Marshal(opts)
 	if err != nil {
 		return toolErr("invalid options"), nil, nil
@@ -493,6 +500,156 @@ func (s *mcpServer) askOwner(_ context.Context, _ *mcp.CallToolRequest, in askOw
 		s.db.Model(&Question{}).Where("id = ?", row.ID).Update("asked_message_id", msgID)
 	}
 	return text(`{"status":"asked","question_id":%d} — end your turn now; the answer arrives as your next message`, row.ID), nil, nil
+}
+
+// handOffWorkerDecision ends a worker that tried to ask the owner. The
+// question goes to General (relay). This session is archived so it cannot
+// sit in waiting. No Question row: nothing stays parked on a reply.
+func (s *mcpServer) handOffWorkerDecision(b *Bot, question string, opts []string) (*mcp.CallToolResult, any, error) {
+	if _, err := ensureGeneralBotRow(s.db, s.config); err != nil {
+		return toolErr("General dispatcher is not running"), nil, nil
+	}
+	body := workerDecisionHandoff(b, question, opts, lastTurnOutput(s.db, b.ID))
+	if _, _, err := queueOwnerRelay(s.db, b, body); err != nil {
+		return toolErr("%s", err.Error()), nil, nil
+	}
+	if err := archiveBotRow(s.db, b.ID); err != nil {
+		return toolErr("could not end the session: %v", err), nil, nil
+	}
+	s.post(0, "📦 Session <b>"+htmlEscape(b.Name)+"</b> ended. The decision went to General.")
+	if mcpProcess {
+		go terminateSelfProcessGroup()
+	}
+	return text("handed to General and archived this session. Stop now. Do not call more tools. A new session continues after General decides."), nil, nil
+}
+
+// workerDecisionHandoff is the inbox General gets when a worker stops for a
+// decision. It is an instruction to the dispatcher, not a digest for the owner.
+func workerDecisionHandoff(b *Bot, question string, options []string, last string) string {
+	var sb strings.Builder
+	name := "session"
+	if b != nil && strings.TrimSpace(b.Name) != "" {
+		name = b.Name
+	}
+	fmt.Fprintf(&sb, "Session %q stopped. Workers do not wait on the owner.\n", name)
+	if b != nil && strings.TrimSpace(b.Cwd) != "" {
+		fmt.Fprintf(&sb, "cwd: %s\n", b.Cwd)
+	}
+	if q := strings.TrimSpace(question); q != "" {
+		fmt.Fprintf(&sb, "Question: %s\n", q)
+	}
+	if len(options) > 0 {
+		sb.WriteString("Options (recommended first):\n")
+		for i, o := range options {
+			fmt.Fprintf(&sb, "%d. %s\n", i+1, o)
+		}
+	}
+	if last = strings.TrimSpace(last); last != "" {
+		fmt.Fprintf(&sb, "\nLast output:\n%s\n", truncate(last, 1500))
+	}
+	sb.WriteString("\nThis session is archived. Decide and spawn_session a new one that continues from this cwd with the decision. ")
+	sb.WriteString("If you need the owner, ask_owner yourself, then spawn_session on the answer. ")
+	sb.WriteString("Do not tell this session. Do not leave the work parked.\n")
+	return sb.String()
+}
+
+func parkedWorkerHandoff(b *Bot, qs []Question, last string) string {
+	if len(qs) == 0 {
+		return workerDecisionHandoff(b, "stuck waiting with no question recorded", nil, last)
+	}
+	if len(qs) == 1 {
+		return workerDecisionHandoff(b, qs[0].Question, questionOptions(&qs[0]), last)
+	}
+	var sb strings.Builder
+	for i := range qs {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		fmt.Fprintf(&sb, "Question: %s\n", qs[i].Question)
+		for j, o := range questionOptions(&qs[i]) {
+			fmt.Fprintf(&sb, "%d. %s\n", j+1, o)
+		}
+	}
+	return workerDecisionHandoff(b, strings.TrimRight(sb.String(), "\n"), nil, last)
+}
+
+func lastTurnOutput(db *gorm.DB, botID int64) string {
+	if db == nil || botID == 0 {
+		return ""
+	}
+	var t Turn
+	if err := db.Where("bot_id = ?", botID).Order("id desc").First(&t).Error; err != nil {
+		return ""
+	}
+	return t.Output
+}
+
+// releaseParkedWorkers archives workers that are sitting on an owner question
+// (or stuck in waiting) and wakes General with the handoff. Runs once at
+// listen boot so a session parked by the old ask_owner path does not stay
+// blocked after upgrade. General's own questions are left open.
+func (in *instance) releaseParkedWorkers() int {
+	if in == nil || in.db == nil {
+		return 0
+	}
+	var bots []Bot
+	if err := in.db.Where("archived_at IS NULL AND topic_id <> 0 AND status <> ?", botRunning).Find(&bots).Error; err != nil {
+		return 0
+	}
+	n := 0
+	for i := range bots {
+		b := &bots[i]
+		if isGeneralBot(b) {
+			continue
+		}
+		var qs []Question
+		if err := in.db.Where("bot_id = ? AND answered_at IS NULL", b.ID).Order("id").Find(&qs).Error; err != nil {
+			continue
+		}
+		if len(qs) == 0 && b.Status != botWaiting {
+			continue
+		}
+		if _, err := ensureGeneralBotRow(in.db, in.config()); err != nil {
+			hookLog("parked handoff: %v", err)
+			return n
+		}
+		body := parkedWorkerHandoff(b, qs, lastTurnOutput(in.db, b.ID))
+		if _, _, err := queueOwnerRelay(in.db, b, body); err != nil {
+			hookLog("parked handoff %s: %v", b.Name, err)
+			continue
+		}
+		now := time.Now()
+		for j := range qs {
+			q := qs[j]
+			in.db.Model(&Question{}).Where("id = ? AND answered_at IS NULL", q.ID).
+				Updates(map[string]any{"answer": "handed to General", "answered_at": now})
+			in.noteQuestionHandedOff(&q)
+		}
+		if err := archiveBotRow(in.db, b.ID); err != nil {
+			hookLog("archive parked %s: %v", b.Name, err)
+			continue
+		}
+		n++
+	}
+	if n > 0 {
+		if r, ok := in.runner.(*Runner); ok {
+			r.deliverInbox(0)
+		}
+	}
+	return n
+}
+
+func (in *instance) noteQuestionHandedOff(q *Question) {
+	if in == nil || q == nil || q.AskedMessageID == 0 {
+		return
+	}
+	cfg := in.config()
+	chat, thread, ok := destForTopic(cfg, 0)
+	if !ok {
+		return
+	}
+	body := "❓ " + renderTelegramHTML(q.Question) + "\n<i>This session stopped waiting. General has it.</i>"
+	_ = editMessageHTML(cfg, chat, q.AskedMessageID, thread, body) // safe-ignore: the handoff already woke General
 }
 
 func (s *mcpServer) updateInstructions(_ context.Context, _ *mcp.CallToolRequest, _ updateInstructionsIn) (*mcp.CallToolResult, any, error) {
@@ -1021,6 +1178,7 @@ func (s *mcpServer) scheduleWakeup(_ context.Context, _ *mcp.CallToolRequest, in
 	default:
 		return toolErr("give in_seconds, at, or cron"), nil, nil
 	}
+	fireAt = fireAt.UTC()
 	if fireAt.After(now.Add(maxScheduleHorizon)) {
 		return toolErr("that is more than a year away"), nil, nil
 	}
@@ -1140,7 +1298,15 @@ func (s *mcpServer) getBackground(_ context.Context, _ *mcp.CallToolRequest, in 
 }
 
 func (s *mcpServer) cancelBackground(_ context.Context, _ *mcp.CallToolRequest, in backgroundIDIn) (*mcp.CallToolResult, any, error) {
-	msg, err := cancelBackgroundJob(s.db, s.botID, in.ID, killProcessGroup)
+	msg, err := cancelBackgroundJob(s.db, s.botID, in.ID, func(pid int) {
+		var j BackgroundJob
+		if err := s.db.Where("id = ? AND bot_id = ?", in.ID, s.botID).First(&j).Error; err != nil {
+			return
+		}
+		// ccc mcp is a different process from listen, so the PID in the row
+		// is only safe to signal when it is still the wrapper we started.
+		killOwnedJobPID(pid, j.StartedAt, backgroundJobDir(s.config, j.ID))
+	})
 	if err != nil {
 		return toolErr("%v", err), nil, nil
 	}

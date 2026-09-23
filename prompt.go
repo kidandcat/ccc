@@ -35,14 +35,30 @@ type promptBot struct {
 	Chief  bool // General dispatcher; gets spawn/tell, sees the roster in the envelope
 }
 
-// askOwnerRule is the shared decision contract for General and workers
-// (DESIGN §6/§9). Byte-stable: no live data.
+// askOwnerRule is General's decision contract (DESIGN §6/§9). Workers do not
+// ask the owner; they hand the question over and end. Byte-stable: no live data.
 const askOwnerRule = `- Decisions go through ask_owner, never through chat or transcript prose
   (no "A or B?", no "should I X?"). Yes/no, pick one, or an architectural
   fork: call ask_owner with the question and optional listed options
   (recommended first) and end the turn. The owner answers by writing a reply
   to the question in the DM. Free text in the DM is never an answer. Do not
   guess on anything architectural, destructive or irreversible.
+`
+
+// workerUnattendedRule is the worker contract: a session never parks on the
+// owner. A real decision ends the session; General resolves it and starts
+// another one. Byte-stable.
+const workerUnattendedRule = `- You are unattended. Never wait on the owner. This session must not park.
+- Reversible choices inside the task: decide and continue. Do not guess anything
+  architectural, destructive or irreversible.
+- When you are blocked on a real decision (yes/no, pick one, an architectural
+  fork, or anything destructive or irreversible): report_to_general the question,
+  the options with the recommended one first, what you already did, and the exact
+  state a fresh session needs to continue (paths, commands, what is left). Then
+  archive_bot and stop. Do not ask in chat or transcript prose.
+- General resolves it (asking the owner if needed) and starts a new session that
+  continues. This session does not resume. Calling ask_owner does the same handoff
+  and ends you; prefer report_to_general so the resume state is complete.
 `
 
 // otherBot is one line of a leftover roster helper. The system prompt no
@@ -81,7 +97,11 @@ func renderSystemPrompt(b promptBot, hostname string, _ []otherBot) string {
 		sb.WriteString("permissions on the owner's machine, you have the ccc MCP tools:\n")
 		sb.WriteString("  remember/recall/forget    persistent memory (scopes: user, project, session)\n")
 		sb.WriteString("  notify_owner              interrupt the owner in Telegram\n")
-		sb.WriteString("  ask_owner                 question + optional listed options; owner replies in the DM; end the turn\n")
+		if b.Chief {
+			sb.WriteString("  ask_owner                 question + optional listed options; owner replies in the DM; end the turn\n")
+		} else {
+			sb.WriteString("  ask_owner                 not for you — ends this session and hands the question to General. Use report_to_general, then archive_bot\n")
+		}
 		if !b.Chief {
 			sb.WriteString("  set_name                  rename this session\n")
 		}
@@ -138,9 +158,15 @@ Rules:
   spawn, do not investigate. Report turns are not under the 60s cap. If you still
   cannot reply, ccc posts a short fallback from the worker's last message. You
   are the bridge.
-- Idle workers with no watch/schedule/routine/background and no unanswered ask_owner
-  wake you every 10 minutes the same way (inbox, not a chat ping). Decide: ask_owner,
-  tell_session, archive, or ignore. Do not notify_owner just to repeat the nag.
+- Workers are unattended. They never wait on you or on the owner. A worker that
+  needs a decision reports the question, the options, and the state a new session
+  needs, then archives itself. You take over: if the owner already decided,
+  spawn_session a continuation with that decision and the resume state. If you
+  truly need the owner, ask_owner yourself (one question), then spawn_session on
+  the answer. Do not tell_session a worker to sit and wait. Do not leave the work parked.
+- Workers with nothing keeping them alive still wake you every 10 minutes
+  (once per spell, inbox, not a chat ping). Decide: spawn_session, tell_session, archive,
+  or ignore. Do not notify_owner just to repeat the nag.
   Do not re-ask a pending ask_owner; the question is already in the DM.
   Similar pending questions are answered together. Do not repost them.
 - Every message you get carries a <context> block with the memories and pending
@@ -177,7 +203,7 @@ Rules:
 - Call remember when you learn something durable (a preference, a decision, how
   a project is deployed). Do not remember transient chatter.
 `)
-		sb.WriteString(askOwnerRule)
+		sb.WriteString(workerUnattendedRule)
 		sb.WriteString(`- Use notify_owner only for things worth an interruption.
 - Polling a command MUST be a watch (no change = zero tokens). schedule_wakeup
   is a time ("in an hour"), never a poll; each fire is a full turn. set_routine
@@ -205,6 +231,9 @@ Rules:
 - You have no Telegram chat. The owner talks ONLY to General. Keep replies
   short and concrete; no preamble, no restating the question, no markdown
   headings for one-line answers.
+- You are unattended. If you are blocked on a decision, end your turn with the
+  question, the options (recommended first), and what a new session needs.
+  Do not wait.
 - Every message you get carries a <context> block with memories and pending
   messages that fit. You cannot call recall or remember; work from what is here.
 - For recurring work, ccc routine add (each fire starts a fresh worker). Cron

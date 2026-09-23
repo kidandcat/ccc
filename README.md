@@ -17,14 +17,15 @@ one (`tell_session`). Sessions live in the backend. It
 has a 60s cap on **your** messages — longer work must go to a session. Session
 reports are not under that cap: the orchestrator has to summarize them. If the
 cap fires and the orchestrator does not spawn, ccc starts the session itself
-(the owner is never asked to `/session`). Idle sessions waiting on
-you wake the orchestrator once per idle spell after 10 minutes (inbox, not a
-chat ping); it decides what to do. `/session <prompt>`
+(the owner is never asked to `/session`). Sessions are unattended: a worker
+that needs a decision reports it and ends. The orchestrator resolves it
+(asking you only when it cannot) and starts a new session that continues.
+Idle sessions with nothing keeping them alive wake the orchestrator once per
+idle spell after 10 minutes (inbox, not a chat ping). `/session <prompt>`
 still starts a worker without going through the orchestrator. Sessions report only
 to the orchestrator (`report_to_general`); the owner does not see the transcript.
 A live status card in the DM (one block per working session) is pinned
-while a worker is running or on a background job. A session parked on
-ask_owner is not on that card; `/sessions`
+while a worker is running or on a background job. `/sessions`
 is the full list. The orchestrator posts the owner-facing result in the DM (a structured
 digest stays readable; it is not crushed into one paragraph); if it cannot,
 listen posts a short fallback from the worker's last message (never only a

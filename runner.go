@@ -605,9 +605,10 @@ func (r *Runner) loop(botID int64, wake chan struct{}) {
 }
 
 // sessionSkipsTurns is the runNext gate: archived and disabled never run.
-// Workers parked on ask_owner stay parked until a reply-to. General
-// keeps taking DM turns while a question is pending — free text is never the
-// answer, so blocking the dispatcher would swallow the owner's next message.
+// A worker left waiting by a legacy ask_owner stays parked until a reply-to.
+// New worker decisions archive the session instead. General keeps taking DM
+// turns while a question is pending — free text is never the answer, so
+// blocking the dispatcher would swallow the owner's next message.
 func sessionSkipsTurns(b *Bot) bool {
 	if b == nil || b.ArchivedAt != nil {
 		return true
@@ -829,8 +830,19 @@ func (r *Runner) execute(b *Bot, t *Turn, input string, triggers []int64) {
 		r.db.Model(&Bot{}).Where("id = ?", b.ID).Update("session_id", "")
 	}
 
-	// A turn that asked the owner something leaves the bot waiting; otherwise
-	// it goes back to idle and the loop drains whatever queued meanwhile.
+	// A worker that handed a decision to General is already archived. Do not
+	// put it back to idle or waiting; just deliver the relay.
+	if after, err := botByID(r.db, b.ID); err == nil && after.ArchivedAt != nil {
+		if r.panel != nil {
+			r.panel.clearActivity(b.ID)
+		}
+		r.syncPanel(true)
+		r.deliverInbox(b.ID)
+		return
+	}
+
+	// A turn that asked the owner something leaves the bot waiting (General,
+	// or a legacy worker question). Otherwise it goes back to idle.
 	waiting := r.hasPendingQuestion(b.ID)
 	if waiting {
 		setBotStatus(r.db, b.ID, botWaiting)

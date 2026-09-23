@@ -110,9 +110,9 @@ does not see General↔session messages (prompts, reports, transcripts). A
 place: one block per working session (name, running/job, current
 tool line). It is **pinned** (`pinChatMessage`,
 `disable_notification`) while any worker is running or has a
-background job, and unpinned when that work ends. A session parked on
-`ask_owner` is not a card and is not pinned; the question message is the
-only copy. The same message is
+background job, and unpinned when that work ends. Workers do not park on `ask_owner` (they hand the question to General and
+archive). A legacy session still marked `waiting` is not a card and is not
+pinned. The card message is
 reused across turns (id in `settings.session_panel_msg_id`). `/sessions`
 stays the full list including idle sessions. The card is not a substitute
 for an answer. After a worker turn that reported (`report_to_general`) or
@@ -133,10 +133,12 @@ use the fallback.
 
 - Persist `turns` row: profile used, duration, cost/usage from `result`,
   `stop_reason`, session id.
-- If the turn ended with `ask_owner` pending, the session is marked `waiting`.
-  Workers stay parked until a reply-to that question (answers are inputs).
-  General keeps taking DM turns while a question is pending:
-  free text is never the answer, so blocking the dispatcher would swallow it.
+- If General's turn ended with `ask_owner` pending, General is marked `waiting`
+  but keeps taking DM turns: free text is never the answer, so blocking the
+  dispatcher would swallow it. A worker that calls `ask_owner` does not park.
+  ccc archives it and relays the question to General. General decides (asking
+  the owner itself if needed) and `spawn_session`s a continuation. At listen
+  boot, workers already stuck `waiting` are archived the same way.
 - If `set_name` changed the session name during the turn, rotate the
   conversation now that the turn has recorded its id (§14.14).
 - Leftover `inbox` rows (from the old inter-session `send_to_bot` path) are
@@ -306,7 +308,7 @@ home (Codex also gets per-turn `exec -c`). Identity is `--bot`/`--turn` or
 | `recall` | `query`, `scope?`, `limit?` | Full-text (SQLite FTS5) search over memories visible to this session: all `user`, all `project`, own session. Returns key+text+scope. |
 | `forget` | `scope`, `key`, `project_path?` | Delete one memory. |
 | `notify_owner` | `text`, `urgency` (normal\|urgent) | Post in General (the DM), labelled with the session name. Interruptions only — not a report dump. |
-| `ask_owner` | `question`, `options?` (≤4 strings) | Post the question in General as text, with listed options in the message body. Returns immediately with `{"status":"asked"}`; the session should end its turn. The owner answers by replying to that question in the DM. A content answer arrives as `Answer to "<question>": …`. Replying **Omitir** or **SKIP** skips without choosing and unblocks the worker (`The owner skipped the question "…" without choosing…`); similar pending asks are skipped too. Free text in the DM is never an answer (it is always General) and does not repost unanswered questions. Answering one also answers similar pending questions (same normalized text, answer maps onto their options) so General does not re-ask. Prompt contract: mandatory for every owner decision (yes/no, pick one, architectural fork); recommended option first; never ask in chat prose. |
+| `ask_owner` | `question`, `options?` (≤4 strings) | **General only.** Post the question in the DM as text, with listed options in the body. Returns `{"status":"asked"}`; end the turn. The owner answers by replying to that question. A content answer arrives as `Answer to "<question>": …`. Replying **Omitir** or **SKIP** skips without choosing. Free text in the DM is never an answer and does not repost unanswered questions. Answering one also answers similar pending questions. **Workers:** do not call it. A worker call archives the session and relays the question to General (no `questions` row, no park). The worker prompt says to `report_to_general` the question, options (recommended first) and resume state, then `archive_bot`. General asks the owner only when it cannot decide, then `spawn_session`s a new session that continues. |
 | `set_name` | `name` | Rename this session: validate (§8 `/name`), update `bots.name`. Rotates the conversation (§14.14). `/name` in the DM only hits General, which refuses. No topic icon. |
 | `watch` | `name`, `command`, `interval_s` (≥60) | Register a deterministic watch (§7). Polling tool: no change = zero tokens. Lasts `watch_ttl_s` (default 4h); re-upserting the name renews it. `unwatch(name)`, `list_watches()`. |
 | `schedule_wakeup` | `in_seconds` or `at` (RFC3339), `note`, `cron?` | Wake at a time (§7). Each fire is a full turn. Not for polling. `cancel_schedule(id)`. |
@@ -372,9 +374,9 @@ One goroutine in `ccc listen`:
   the same path as `report_to_general`. Nothing is posted to Telegram.
   `idle_reminded_at` latches until the worker leaves idle-waiting (run,
   keepalive, `ask_owner`, archive). A new spell after more work can remind
-  once more. General then decides: `ask_owner`, `tell_session`, archive, or
-  ignore. A parked `ask_owner` (`waiting`) is not reminded: the question is
-  already in the DM.
+  once more. General then decides: `spawn_session`, `tell_session`, archive, or
+  ignore. A legacy parked `ask_owner` (`waiting`) is not reminded. Listen boot
+  archives those workers and hands the question to General.
 - **Schedules**: unnamed `schedule_wakeup` enqueues a turn with
   `source=schedule` and the note on the owning bot when `fire_at` passes;
   recurring via cron expression. Polling a command is a watch, not a
@@ -584,15 +586,18 @@ You run on machine <hostname>, working dir <cwd>.
 Tools: you have the ccc MCP tools (memory, scheduling, watches,
 background jobs, secrets_list, run) plus the standard tools (Bash, Read, Edit, …) with full
 permissions. You cannot create other sessions. There is no secrets_get.
-Rules: … (owner escalation, when to remember, never print secrets, keep
-replies short for chat, always ask_owner for yes/no, pick-one, or an
-architectural fork — optional listed options, recommended first — never
-ask in chat/transcript prose; the owner answers by replying in the DM…)
+Rules: … (workers are unattended: a real decision is `report_to_general` plus
+`archive_bot`, never a parked `ask_owner`. General uses `ask_owner` for
+yes/no, pick-one, or an architectural fork — optional listed options,
+recommended first — never in chat prose; the owner answers by replying in
+the DM. General then `spawn_session`s a continuation.)
 ```
 
 General's prompt is a dispatcher variant: the owner's DM, `spawn_session` /
-`tell_session` / `list_sessions`, no `set_name` / `archive_bot`, and the 60s
-cap (§3.5). It is still byte-stable (no live roster in the prompt).
+`tell_session` / `list_sessions`, `ask_owner`, no `set_name` / `archive_bot`,
+and the 60s cap (§3.5). It is still byte-stable (no live roster in the prompt).
+When a worker stops for a decision, General resolves it and starts a new
+session. It does not tell the archived worker to wait.
 
 **Envelope** (prepended to every input, because system-prompt changes are
 ignored on resume until compaction):
@@ -726,9 +731,9 @@ does not repost pending questions (the old "Pending decision" digest is
 gone). Answering one fans the same answer out to similar pending
 questions (normalized text match; the label must exist on the sibling,
 except Omitir/SKIP which skips siblings even without that option).
-Workers stay parked; General keeps taking DM turns. Idle-remind skips
-`waiting`. Inline `ask_owner` buttons (`q:<id>:<idx>`) were removed;
-leftover taps are acked and ignored.
+Only General parks on a question, and it keeps taking DM turns. Workers
+are unattended (14.35). Idle-remind skips `waiting`. Inline `ask_owner`
+buttons (`q:<id>:<idx>`) were removed; leftover taps are acked and ignored.
 
 **14.4 `linkSharedProjects` only creates symlinks.** §4 was silent about an
 existing `projects/`. Replacing one would destroy real transcript history, so
@@ -1018,6 +1023,17 @@ routine fires run on a reused `routine-<name>` worker (fresh conversation),
 chooseProfile is 5h then 7d then load, spawn picks the engine with most
 headroom, auto-spawn is `source=user` only, watch TTL on General is silent.
 Not per-machine hygiene.
+
+**14.35 Workers are unattended.** A session that called `ask_owner` stayed
+`waiting` until the owner replied, including when the question did not
+need the owner (a KMS detail blocking an appointments export). Workers no
+longer have that wait. A real decision is `report_to_general` (question,
+options, resume state) and `archive_bot`. If the model calls `ask_owner`
+anyway, ccc archives the worker, relays the question to General, and does
+not write a `questions` row. General decides from what the owner already
+said, or `ask_owner`s once, then `spawn_session`s a new session that
+continues. Listen boot does the same for workers already stuck `waiting`.
+General's own `ask_owner` is unchanged.
 
 ## 15. Public hub (removed)
 
