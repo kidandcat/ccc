@@ -822,16 +822,23 @@ func (s *scheduler) runDoctor(now time.Time) {
 		case !loggedIn:
 			findings = append(findings, doctorFinding{accountDisplay(p), "not logged in"})
 			s.in.markNeedsLogin(p.Name)
-			if !s.doctor.reported[p.Name] {
+			// First observation notifies and starts the backoff. Later doctor
+			// ticks while the backoff holds must not ping again, and must not
+			// put the profile back into spawn.
+			if armAuthBackoff(p.Name, now) {
 				s.doctor.reported[p.Name] = true
 				s.in.notifyNeedsLogin(p, "it is not logged in")
 			}
 		default:
-			// Back in business: clear the flag a failed turn may have set.
-			if s.doctor.reported[p.Name] {
-				delete(s.doctor.reported, p.Name)
+			// auth status can still say logged-in after a turn proved the
+			// OAuth session is dead. Leave that episode alone until a login
+			// or a successful turn clears it.
+			if !authEpisodeOpen(p.Name) {
+				if s.doctor.reported[p.Name] {
+					delete(s.doctor.reported, p.Name)
+				}
+				s.in.clearNeedsLogin(p.Name)
 			}
-			s.in.clearNeedsLogin(p.Name)
 			// The doctor run is where a profile learns (or confirms) which
 			// account it holds: that is the name it is shown and addressed by
 			// everywhere in Telegram (DESIGN §8).

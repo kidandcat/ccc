@@ -1,12 +1,19 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -406,6 +413,333 @@ func TestCodexAPIKeyHasNoQuota(t *testing.T) {
 
 func farExpiryMS() string {
 	return jsonNumber(time.Now().Add(8 * time.Hour).UnixMilli())
+}
+
+// credWriteProbe fails the test if usage telemetry refreshes or persists
+// credentials. securityAdd and writeFileAtomic are the two write hooks.
+type credWriteProbe struct {
+	adds   atomic.Int32
+	writes atomic.Int32
+	hits   atomic.Int32
+}
+
+func (p *credWriteProbe) install(t *testing.T) *httptest.Server {
+	t.Helper()
+	usageMemClear()
+	prevAdd := securityAdd
+	prevWrite := writeFileAtomic
+	prevHTTP := usageHTTP
+	prevUsage := oauthUsageURL
+	prevGrok := grokBillingURL
+	prevCodex := codexUsageURL
+	prevReader := oauthKeychainReader
+	prevSec := securityOutput
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p.hits.Add(1)
+		http.Error(w, "usage telemetry must not call the network for a stale token", http.StatusInternalServerError)
+	}))
+	securityAdd = func(service, account string, secret []byte) error {
+		p.adds.Add(1)
+		return fmt.Errorf("securityAdd %s/%s", service, account)
+	}
+	writeFileAtomic = func(path string, data []byte, perm os.FileMode) error {
+		p.writes.Add(1)
+		return fmt.Errorf("writeFileAtomic %s", path)
+	}
+	usageHTTP = srv.Client()
+	oauthUsageURL = srv.URL + "/api/oauth/usage"
+	grokBillingURL = srv.URL + "/v1/billing"
+	codexUsageURL = srv.URL + "/backend-api/wham/usage"
+	securityOutput = func(args ...string) ([]byte, error) { return nil, os.ErrNotExist }
+	oauthKeychainReader = func(Profile) (oauthBlob, bool) { return oauthBlob{}, false }
+	t.Cleanup(func() {
+		securityAdd = prevAdd
+		writeFileAtomic = prevWrite
+		usageHTTP = prevHTTP
+		oauthUsageURL = prevUsage
+		grokBillingURL = prevGrok
+		codexUsageURL = prevCodex
+		oauthKeychainReader = prevReader
+		securityOutput = prevSec
+		srv.Close()
+		usageMemClear()
+	})
+	return srv
+}
+
+func (p *credWriteProbe) assertQuiet(t *testing.T) {
+	t.Helper()
+	if n := p.adds.Load(); n != 0 {
+		t.Errorf("securityAdd called %d times", n)
+	}
+	if n := p.writes.Load(); n != 0 {
+		t.Errorf("writeFileAtomic called %d times", n)
+	}
+	if n := p.hits.Load(); n != 0 {
+		t.Errorf("usage HTTP called %d times", n)
+	}
+}
+
+func TestRefreshProfileUsageStaleClaudeFileDoesNotWrite(t *testing.T) {
+	var probe credWriteProbe
+	probe.install(t)
+	dir := t.TempDir()
+	creds := `{"claudeAiOauth":{"accessToken":"stale-access","refreshToken":"stale-refresh","expiresAt":1}}`
+	if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte(creds), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cache := `{"cachedUsageUtilization":{"utilization":{"five_hour":{"utilization":12},"seven_day":{"utilization":40}}}}`
+	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(cache), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := Profile{Name: "work", ConfigDir: dir}
+	t.Cleanup(func() {
+		cooldownMu.Lock()
+		delete(cooldowns, p.Name)
+		cooldownMu.Unlock()
+	})
+	u := refreshProfileUsage(p)
+	probe.assertQuiet(t)
+	if u.FiveHour != 12 || !u.FiveHourKnown || u.SevenDay != 40 || !u.SevenDayKnown {
+		t.Fatalf("stale token should degrade to the on-disk snapshot, got %+v", u)
+	}
+	noteProfileLimit(p, time.Now())
+	probe.assertQuiet(t)
+}
+
+func TestRefreshProfileUsageStaleKeychainDoesNotWrite(t *testing.T) {
+	var probe credWriteProbe
+	probe.install(t)
+	raw := []byte(`{"mcpOAuth":{"slack":true},"claudeAiOauth":{"accessToken":"stale-access","refreshToken":"stale-refresh","expiresAt":1}}`)
+	oauthKeychainReader = func(Profile) (oauthBlob, bool) {
+		return oauthBlob{
+			oauth:   oauthFromJSON(raw),
+			raw:     raw,
+			service: keychainService,
+			account: "tester",
+		}, true
+	}
+	p := Profile{Name: "work", ConfigDir: t.TempDir()}
+	u := refreshProfileUsage(p)
+	probe.assertQuiet(t)
+	if u.FiveHourKnown || u.SevenDayKnown {
+		t.Fatalf("stale keychain token should degrade to unknown, got %+v", u)
+	}
+	if got := profileUsageLine(engineClaude, u); got != "5h ? · 7d ?" {
+		t.Fatalf("line = %q", got)
+	}
+}
+
+func TestRefreshProfileUsageStaleGrokAndCodexDoNotWrite(t *testing.T) {
+	var probe credWriteProbe
+	probe.install(t)
+
+	t.Run("grok", func(t *testing.T) {
+		dir := t.TempDir()
+		auth := `{"https://auth.x.ai::test":{"key":"grok-token","auth_mode":"oidc","refresh_token":"rt","expires_at":"2000-01-01T00:00:00Z","oidc_client_id":"cid"}}`
+		if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(auth), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		u := refreshProfileUsage(Profile{Name: "grok", Engine: engineGrok, ConfigDir: dir})
+		if u.FiveHourKnown || len(u.Windows) > 0 {
+			t.Fatalf("stale grok token should degrade, got %+v", u)
+		}
+	})
+	t.Run("codex", func(t *testing.T) {
+		dir := t.TempDir()
+		tok := unsignedJWT(time.Now().Add(-time.Hour).Unix())
+		auth := `{"auth_mode":"chatgpt","tokens":{"access_token":"` + tok + `","refresh_token":"rt","account_id":"acct-1"}}`
+		if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(auth), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		u := refreshProfileUsage(Profile{Name: "codex", Engine: engineCodex, ConfigDir: dir})
+		if u.FiveHourKnown || len(u.Windows) > 0 {
+			t.Fatalf("stale codex token should degrade, got %+v", u)
+		}
+	})
+	probe.assertQuiet(t)
+}
+
+func TestRefreshProfileUsageConcurrentStaleToken(t *testing.T) {
+	var probe credWriteProbe
+	probe.install(t)
+	dir := t.TempDir()
+	creds := `{"claudeAiOauth":{"accessToken":"stale-access","refreshToken":"stale-refresh","expiresAt":1}}`
+	if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte(creds), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := Profile{Name: "work", ConfigDir: dir}
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = refreshProfileUsage(p)
+		}()
+	}
+	wg.Wait()
+	probe.assertQuiet(t)
+}
+
+func TestUsageMemConcurrent(t *testing.T) {
+	usageMemClear()
+	t.Cleanup(usageMemClear)
+	p := Profile{Name: "race", ConfigDir: t.TempDir()}
+	u := profileUsage{FiveHour: 3, FiveHourKnown: true}
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			usageMemPut(p, u)
+			if got, ok := usageMemGet(p); ok && got.FiveHour != 3 {
+				t.Errorf("usageMemGet = %+v", got)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestKeychainServiceName(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Fatal(err)
+	}
+	if got := keychainServiceName(implicitProfile()); got != keychainService {
+		t.Fatalf("implicit = %q", got)
+	}
+	bare := Profile{ConfigDir: filepath.Join(home, ".claude")}
+	if got := keychainServiceName(bare); got != keychainService {
+		t.Fatalf("default ~/.claude = %q", got)
+	}
+	isolated := Profile{ConfigDir: t.TempDir()}
+	got := keychainServiceName(isolated)
+	if got == keychainService || !strings.HasPrefix(got, keychainService+"-") || len(got) != len(keychainService)+1+8 {
+		t.Fatalf("isolated = %q", got)
+	}
+}
+
+func TestUsageCallSitesDoNotRefreshCredentials(t *testing.T) {
+	graph := funcCallGraph(t)
+	forbidden := []string{
+		"securityAdd", "saveClaudeOAuth", "refreshClaudeOAuth", "claudeAccessToken",
+		"saveGrokAuth", "refreshGrokAuth", "grokRefreshAndSave",
+		"saveCodexTokens", "refreshCodexAuth", "codexRefreshAndSave",
+	}
+	roots := []string{
+		"refreshProfileUsage", "fetchProfileUsage", "fetchClaudeUsage", "fetchGrokUsage", "fetchCodexUsage",
+		"claudeAccessTokenReadOnly", "pickSpawnEngine", "runDoctor", "noteProfileLimit",
+		"collectProfileRows", "collectAccountCards", "doctorProfiles",
+	}
+	for _, root := range roots {
+		if _, ok := graph.calls[root]; !ok {
+			t.Errorf("call graph is missing %s", root)
+			continue
+		}
+		for _, bad := range forbidden {
+			if path := graph.reachPath(root, bad); path != nil {
+				t.Errorf("%s can reach %s: %s", root, bad, strings.Join(path, " -> "))
+			}
+		}
+	}
+	noWrite := []string{
+		"refreshProfileUsage", "fetchProfileUsage", "fetchClaudeUsage", "fetchGrokUsage", "fetchCodexUsage",
+		"claudeAccessTokenReadOnly", "pickSpawnEngine", "noteProfileLimit",
+	}
+	for _, root := range noWrite {
+		if path := graph.reachPath(root, "writeFileAtomic"); path != nil {
+			t.Errorf("%s can reach writeFileAtomic: %s", root, strings.Join(path, " -> "))
+		}
+	}
+	if path := graph.reachPath("pickSpawnEngine", "refreshProfileUsage"); path != nil {
+		t.Errorf("pickSpawnEngine still refreshes usage: %s", strings.Join(path, " -> "))
+	}
+}
+
+// callGraph is a name-level call graph. Only package functions are followed.
+// Method calls are recorded, so a direct securityAdd/writeFileAtomic is seen,
+// but a selector named Run is not treated as scheduler.Run: that collision
+// walks from exec.Cmd.Run into the doctor and every turn spawn.
+type callGraph struct {
+	funcs map[string]bool
+	calls map[string]map[string]bool
+}
+
+func funcCallGraph(t *testing.T) callGraph {
+	t.Helper()
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(info os.FileInfo) bool {
+		name := info.Name()
+		return strings.HasSuffix(name, ".go") && !strings.HasSuffix(name, "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg := pkgs["main"]
+	if pkg == nil {
+		t.Fatal("package main not parsed")
+	}
+	g := callGraph{funcs: map[string]bool{}, calls: map[string]map[string]bool{}}
+	for _, file := range pkg.Files {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil || fn.Name == nil {
+				continue
+			}
+			name := fn.Name.Name
+			if fn.Recv == nil {
+				g.funcs[name] = true
+			}
+			set := g.calls[name]
+			if set == nil {
+				set = map[string]bool{}
+				g.calls[name] = set
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				switch fun := call.Fun.(type) {
+				case *ast.Ident:
+					set[fun.Name] = true
+				case *ast.SelectorExpr:
+					set[fun.Sel.Name] = true
+				}
+				return true
+			})
+		}
+	}
+	return g
+}
+
+func (g callGraph) reachPath(root, target string) []string {
+	seen := map[string]bool{}
+	var walk func(string) []string
+	walk = func(name string) []string {
+		if seen[name] {
+			return nil
+		}
+		seen[name] = true
+		for next := range g.calls[name] {
+			if next == target {
+				return []string{name, next}
+			}
+			if g.funcs[next] {
+				if path := walk(next); path != nil {
+					return append([]string{name}, path...)
+				}
+			}
+		}
+		return nil
+	}
+	return walk(root)
+}
+
+func unsignedJWT(exp int64) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, exp)))
+	return header + "." + payload + ".x"
 }
 
 func jsonNumber(n int64) string {

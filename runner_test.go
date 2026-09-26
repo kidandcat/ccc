@@ -84,6 +84,9 @@ func TestClassifyFailure(t *testing.T) {
 	}{
 		{staleTokenMsg, errAuthStale},
 		{"Error: Not logged in. Please run claude login", errAuthStale},
+		{"Not logged in · Please run /login", errAuthStale},
+		{"Please run /login", errAuthStale},
+		{"Failed to authenticate: OAuth session expired and could not be refreshed", errAuthStale},
 		{"Claude AI usage limit reached|1788000000", errRateLimited},
 		{"API Error: 429 rate_limit_error", errRateLimited},
 		{"No conversation found with session ID abc", errSessionLost},
@@ -516,9 +519,90 @@ func TestBotNameFromText(t *testing.T) {
 	}
 }
 
+func TestAuthBackoffSkipsTheDeadAccountAndNotifiesOnce(t *testing.T) {
+	resetAuthBackoffs()
+	t.Cleanup(resetAuthBackoffs)
+	dir := t.TempDir()
+	cfg := &Config{
+		DataDir: dir,
+		Profiles: map[string]*Profile{
+			"solo":  {ConfigDir: filepath.Join(dir, "solo")},
+			"other": {ConfigDir: filepath.Join(dir, "other")},
+		},
+	}
+	r := newRunner(nil, cfg, nil)
+	solo := Profile{Name: "solo", ConfigDir: cfg.Profiles["solo"].ConfigDir}
+	other := Profile{Name: "other", ConfigDir: cfg.Profiles["other"].ConfigDir}
+
+	now := time.Now()
+	if !armAuthBackoff(solo.Name, now) {
+		t.Fatal("the first auth failure must notify")
+	}
+	if armAuthBackoff(solo.Name, now.Add(time.Minute)) {
+		t.Fatal("a repeat inside the backoff must not notify again")
+	}
+	if !loginBlocked(solo.Name, now.Add(time.Minute)) {
+		t.Fatal("profile should be skipped during the backoff")
+	}
+	r.mu.Lock()
+	r.needsLogin[solo.Name] = true
+	r.mu.Unlock()
+	got, ok := r.pickAccount(engineClaude, nil)
+	if !ok || got.Name != "other" {
+		t.Fatalf("pick during backoff = %+v ok=%v, want the other account", got, ok)
+	}
+
+	r.markNeedsLogin(other)
+	if _, ok := r.pickAccount(engineClaude, nil); ok {
+		t.Fatal("both accounts are in auth backoff; selection must not retry them")
+	}
+	if _, ok := r.pickHealthyAccount(); ok {
+		t.Fatal("compaction must not run on a login-blocked account")
+	}
+
+	// A single account whose backoff has elapsed may be tried once.
+	resetAuthBackoffs()
+	one := &Config{
+		DataDir:  dir,
+		Profiles: map[string]*Profile{"solo": cfg.Profiles["solo"]},
+	}
+	alone := newRunner(nil, one, nil)
+	alone.markNeedsLogin(solo)
+	authBlockMu.Lock()
+	b := authBlocks[solo.Name]
+	b.until = time.Now().Add(-time.Second)
+	authBlocks[solo.Name] = b
+	authBlockMu.Unlock()
+	got, ok = alone.pickAccount(engineClaude, nil)
+	if !ok || got.Name != "solo" {
+		t.Fatalf("after backoff the only account may be tried, got %+v ok=%v", got, ok)
+	}
+
+	later := time.Now()
+	if armAuthBackoff(solo.Name, later) {
+		t.Fatal("the owner was already told about this episode")
+	}
+	if !loginBlocked(solo.Name, later.Add(time.Minute)) {
+		t.Fatal("the second failure should start a longer backoff")
+	}
+	if d := authBackoffFor(2); d != 4*time.Hour {
+		t.Fatalf("second backoff = %s, want 4h", d)
+	}
+	if d := authBackoffFor(4); d != authBackoffMax {
+		t.Fatalf("capped backoff = %s, want %s", d, authBackoffMax)
+	}
+
+	clearAuthBackoff(solo.Name)
+	if !armAuthBackoff(solo.Name, time.Now()) {
+		t.Fatal("a new episode after login should notify again")
+	}
+}
+
 // Failover (DESIGN §3.4) only works if the profile picker actually takes the
 // accounts a turn already burned out of the running.
 func TestPickProfileExcludingSkipsTriedAndLoggedOutAccounts(t *testing.T) {
+	resetAuthBackoffs()
+	t.Cleanup(resetAuthBackoffs)
 	dir := t.TempDir()
 	cfg := &Config{
 		DataDir: dir, // no ChatID: markNeedsLogin must not try to message anyone

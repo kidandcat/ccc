@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -19,10 +18,7 @@ import (
 // grok.com Settings → Usage shows. The xAI Management API prepaid-balance
 // route is API-key billing and does not apply to this login.
 
-var (
-	grokBillingURL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
-	grokTokenURL   = "https://auth.x.ai/oauth2/token"
-)
+var grokBillingURL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 
 type grokAuth struct {
 	Key          string `json:"key"`
@@ -67,12 +63,6 @@ func fetchGrokUsage(p Profile) (profileUsage, error) {
 		return unknownProfileUsage(), err
 	}
 	u, status, err := grokBillingOnce(tok)
-	if err == nil && (status == http.StatusUnauthorized || status == http.StatusForbidden) {
-		if fresh, rerr := grokRefreshAndSave(p); rerr == nil {
-			tok = fresh
-			u, status, err = grokBillingOnce(tok)
-		}
-	}
 	if err != nil {
 		return unknownProfileUsage(), err
 	}
@@ -159,49 +149,17 @@ func grokPeriodName(t string) string {
 	}
 }
 
+// grokAccessToken returns the stored access token only when it is still
+// valid. Usage telemetry does not refresh or rewrite auth.json.
 func grokAccessToken(p Profile) (string, error) {
-	key, auth, raw, err := loadGrokAuth(p)
+	_, auth, _, err := loadGrokAuth(p)
 	if err != nil {
 		return "", err
 	}
-	if !tokenExpired(grokExpiry(auth), time.Now()) {
-		return auth.Key, nil
+	if strings.TrimSpace(auth.Key) == "" || tokenExpired(grokExpiry(auth), time.Now()) {
+		return "", errUsageTokenStale
 	}
-	if auth.RefreshToken == "" {
-		if auth.Key != "" {
-			return auth.Key, nil
-		}
-		return "", fmt.Errorf("grok token expired and no refresh token")
-	}
-	fresh, err := refreshGrokAuth(auth)
-	if err != nil {
-		if auth.Key != "" {
-			return auth.Key, nil
-		}
-		return "", err
-	}
-	if err := saveGrokAuth(grokAuthJSON(p), raw, key, fresh); err != nil {
-		hookLog("could not persist refreshed grok token: %v", err)
-	}
-	return fresh.Key, nil
-}
-
-func grokRefreshAndSave(p Profile) (string, error) {
-	key, auth, raw, err := loadGrokAuth(p)
-	if err != nil {
-		return "", err
-	}
-	if auth.RefreshToken == "" {
-		return "", fmt.Errorf("grok: no refresh token")
-	}
-	fresh, err := refreshGrokAuth(auth)
-	if err != nil {
-		return "", err
-	}
-	if err := saveGrokAuth(grokAuthJSON(p), raw, key, fresh); err != nil {
-		hookLog("could not persist refreshed grok token: %v", err)
-	}
-	return fresh.Key, nil
+	return auth.Key, nil
 }
 
 func grokExpiry(a grokAuth) time.Time {
@@ -240,83 +198,4 @@ func loadGrokAuth(p Profile) (entryKey string, auth grokAuth, raw []byte, err er
 		return "", grokAuth{}, raw, fmt.Errorf("no grok oauth credentials for %s", accountDisplay(p))
 	}
 	return bestKey, best, raw, nil
-}
-
-func refreshGrokAuth(a grokAuth) (grokAuth, error) {
-	cid := strings.TrimSpace(a.OIDCClientID)
-	if cid == "" {
-		return grokAuth{}, fmt.Errorf("grok refresh: missing oidc_client_id")
-	}
-	form := url.Values{
-		"grant_type":    {"refresh_token"},
-		"refresh_token": {a.RefreshToken},
-		"client_id":     {cid},
-	}
-	raw, status, err := httpFormPost(grokTokenURL, form)
-	if err != nil {
-		return grokAuth{}, err
-	}
-	if status != http.StatusOK {
-		return grokAuth{}, fmt.Errorf("grok oauth refresh: HTTP %d", status)
-	}
-	var tok struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int64  `json:"expires_in"`
-	}
-	if err := json.Unmarshal(raw, &tok); err != nil {
-		return grokAuth{}, err
-	}
-	if tok.AccessToken == "" {
-		return grokAuth{}, fmt.Errorf("grok oauth refresh: empty access_token")
-	}
-	fresh := a
-	fresh.Key = tok.AccessToken
-	if tok.RefreshToken != "" {
-		fresh.RefreshToken = tok.RefreshToken
-	}
-	if tok.ExpiresIn > 0 {
-		fresh.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).UTC().Format(time.RFC3339Nano)
-	}
-	return fresh, nil
-}
-
-func saveGrokAuth(path string, raw []byte, entryKey string, auth grokAuth) error {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return err
-	}
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(m[entryKey], &obj); err != nil {
-		return err
-	}
-	keyJSON, err := json.Marshal(auth.Key)
-	if err != nil {
-		return err
-	}
-	obj["key"] = keyJSON
-	if auth.RefreshToken != "" {
-		rt, err := json.Marshal(auth.RefreshToken)
-		if err != nil {
-			return err
-		}
-		obj["refresh_token"] = rt
-	}
-	if auth.ExpiresAt != "" {
-		ex, err := json.Marshal(auth.ExpiresAt)
-		if err != nil {
-			return err
-		}
-		obj["expires_at"] = ex
-	}
-	patched, err := json.Marshal(obj)
-	if err != nil {
-		return err
-	}
-	m[entryKey] = patched
-	out, err := json.Marshal(m)
-	if err != nil {
-		return err
-	}
-	return writeFileAtomic(path, out, 0o600)
 }
