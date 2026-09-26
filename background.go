@@ -696,10 +696,14 @@ func (s *scheduler) watchBackgroundJob(j *BackgroundJob) {
 				if pid := s.bg.pidOf(j.ID); pid > 0 {
 					killProcessGroup(pid)
 				}
-			} else if pid := jobPID(j, dir); pid > 0 {
+			} else if pid := jobPID(j, dir); pid > 0 && processAlive(pid) {
 				if !killOwnedJobPID(pid, j.StartedAt, dir) {
 					// Not our wrapper. Do not signal. Finish the row so a
 					// reused PID cannot sit "running" until its deadline.
+					// A PID that has already exited is not that case: the
+					// next loop classifies it from exit.code (cancelled, if
+					// this stop was a cancel). Treating a reaped wrapper as
+					// a foreign PID raced under -race.
 					s.finishBackgroundJob(j, jobFailed, -1, "", "process is not the job wrapper")
 					return
 				}
