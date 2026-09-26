@@ -183,10 +183,12 @@ func TestWorkerTurnTimeoutKillsAndRelays(t *testing.T) {
 	if !strings.Contains(got.StopReason, "worker_turn_timeout_s") {
 		t.Errorf("reason missing knob: %s", got.StopReason)
 	}
-	live, _ := botByID(in.db, w.ID)
-	if live.Status != botIdle {
-		t.Errorf("bot status = %s, want idle", live.Status)
-	}
+	// The turn row is marked failed before the bot goes idle. Wait for that
+	// second write; reading it immediately races on a slow CI runner.
+	waitUntil(t, 5*time.Second, func() bool {
+		live, err := botByID(in.db, w.ID)
+		return err == nil && live.Status == botIdle
+	})
 	if r.Running(w.ID) {
 		t.Error("process still running after the cap")
 	}

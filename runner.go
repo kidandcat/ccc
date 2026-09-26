@@ -205,8 +205,10 @@ type Runner struct {
 	// the sleep between failover attempts, or the gap between Start and
 	// r.active. Without it the next attempt runs the turn to the end.
 	halt map[int64]bool
-	// needsLogin holds profiles a turn found logged out; they are skipped until
-	// the owner re-logs in (the doctor loop in Phase 2b clears them).
+	// needsLogin holds profiles a turn or the doctor found logged out. They
+	// stay out of selection until a login succeeds or, after the auth
+	// backoff, one proving turn. The backoff itself is authBlocks, which
+	// spawn can see without a Runner.
 	needsLogin map[string]bool
 	// panel is the live session card in the owner's DM. nil in tests that
 	// do not care; newRunner wires it from ui when ui can host one.
@@ -890,6 +892,9 @@ func (r *Runner) execute(b *Bot, t *Turn, input string, triggers []int64) {
 			break
 		}
 		if res.ok() {
+			// A turn that actually ran clears a stale needs-login episode.
+			// auth status alone must not: it can stay green while refresh is dead.
+			r.clearNeedsLogin(p.Name)
 			r.persistSession(b, sessionID, resume, res)
 			class = ""
 			break
@@ -1512,8 +1517,11 @@ func (r *Runner) spawn(p Profile, b *Bot, t *Turn, sessionID string, resume bool
 		at.stopped = true
 	}
 	r.active[b.ID] = at
+	// Copy under the lock. interruptActive writes at.stopped as soon as the
+	// pointer is published, and reading the field after Unlock races.
+	stopped := at.stopped
 	r.mu.Unlock()
-	if at.stopped {
+	if stopped {
 		killActiveTurn(at)
 	}
 
@@ -1794,6 +1802,7 @@ func classifyFailure(text string, exitCode int) string {
 	switch {
 	case isStaleTokenError(text) ||
 		strings.Contains(l, "not logged in") ||
+		strings.Contains(l, "please run /login") ||
 		strings.Contains(l, "please run `claude login`") ||
 		strings.Contains(l, "please run `grok login`") ||
 		strings.Contains(l, "please run `codex login`") ||
@@ -1801,6 +1810,8 @@ func classifyFailure(text string, exitCode int) string {
 		strings.Contains(l, "not authenticated") ||
 		strings.Contains(l, "invalid api key") ||
 		strings.Contains(l, "oauth token has expired") ||
+		strings.Contains(l, "oauth session expired") ||
+		strings.Contains(l, "could not be refreshed") ||
 		strings.Contains(l, "authentication_error"):
 		return errAuthStale
 	case strings.Contains(l, "usage limit") || strings.Contains(l, "rate limit") ||
@@ -1865,12 +1876,19 @@ func (r *Runner) renameNeedsLogin(oldName, newName string) {
 		r.needsLogin[newName] = true
 		delete(r.needsLogin, oldName)
 	}
+	renameAuthBackoff(oldName, newName)
 }
 
 func (r *Runner) markNeedsLogin(p Profile) {
 	r.mu.Lock()
 	r.needsLogin[p.Name] = true
 	r.mu.Unlock()
+	// Notify on the first failure of this episode. Repeating the turn every
+	// half hour must not ping the owner again, and must not keep spawning
+	// on the dead credential (armAuthBackoff).
+	if !armAuthBackoff(p.Name, time.Now()) {
+		return
+	}
 	cfg := r.config()
 	if cfg == nil || cfg.ChatID == 0 || cfg.BotToken == "" {
 		return
@@ -1914,17 +1932,18 @@ func (r *Runner) pickAccount(engine string, exclude map[string]bool) (Profile, b
 		if s.Engine != engine {
 			continue
 		}
-		if exclude[s.Name] || needs[s.Name] {
+		if exclude[s.Name] || needs[s.Name] || loginBlocked(s.Name, now) {
 			continue
 		}
 		open = append(open, s)
 	}
 	if len(open) == 0 {
-		// Everything of this engine is excluded. If the only problem is a
-		// stale needs_login flag and there is literally nothing else, try it
-		// anyway rather than dropping the turn.
+		// Every account of this engine was excluded. A needs-login flag whose
+		// backoff has already elapsed may be tried once, so a single account
+		// is not stuck forever. A backoff that is still running is not: that
+		// is what turned a dead OAuth session into a retry every half hour.
 		for _, s := range stats {
-			if s.Engine == engine && !exclude[s.Name] {
+			if s.Engine == engine && !exclude[s.Name] && !loginBlocked(s.Name, now) {
 				open = append(open, s)
 			}
 		}
@@ -1957,13 +1976,17 @@ func (r *Runner) pickHealthyAccount() (Profile, bool) {
 	stats := collectProfileStats(cfg, r.runningByProfile(), now)
 	var open []profileStat
 	for _, s := range stats {
-		if needs[s.Name] {
+		if needs[s.Name] || loginBlocked(s.Name, now) {
 			continue
 		}
 		open = append(open, s)
 	}
 	if len(open) == 0 {
-		open = stats
+		for _, s := range stats {
+			if !loginBlocked(s.Name, now) {
+				open = append(open, s)
+			}
+		}
 	}
 	if len(open) == 0 {
 		return Profile{}, false
@@ -2077,6 +2100,7 @@ func (r *Runner) clearNeedsLogin(name string) {
 	r.mu.Lock()
 	delete(r.needsLogin, name)
 	r.mu.Unlock()
+	clearAuthBackoff(name)
 }
 
 // markProfileNeedsLogin is markNeedsLogin without the notification, for the

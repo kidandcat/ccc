@@ -6,10 +6,10 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -32,14 +32,17 @@ import (
 const (
 	usageFetchTTL   = 5 * time.Minute
 	oauthUsageBeta  = "oauth-2025-04-20"
-	oauthClientID   = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	keychainService = "Claude Code-credentials"
 	tokenSkew       = 60 * time.Second
 )
 
+// errUsageTokenStale means the stored access token is missing or expired.
+// Usage telemetry must not refresh or persist credentials to replace it.
+// Callers degrade to the on-disk snapshot or an unknown reading.
+var errUsageTokenStale = errors.New("oauth access token is stale")
+
 var (
 	oauthUsageURL = "https://api.anthropic.com/api/oauth/usage"
-	oauthTokenURL = "https://platform.claude.com/v1/oauth/token"
 	usageHTTP     = &http.Client{Timeout: 5 * time.Second}
 
 	usageMemMu sync.Mutex
@@ -89,6 +92,12 @@ func usageMemClear() {
 // GET /api/oauth/usage; Grok hits cli-chat-proxy billing; Codex hits
 // ChatGPT GET /backend-api/wham/usage. Failures fall back to Claude's
 // on-disk cache (other engines have none) so a blip does not blank the card.
+//
+// This path never refreshes or writes OAuth credentials. A stale access
+// token degrades the cosmetic 5h/7d line. Refreshing here used to rotate
+// the refresh token and overwrite the keychain item Claude Code itself
+// uses; a CCC-only lock would not coordinate with that other process, so
+// the write is gone rather than wrapped.
 func refreshProfileUsage(p Profile) profileUsage {
 	if profileEngine(p) == engineAntigravity {
 		return naProfileUsage("no public usage endpoint")
@@ -118,7 +127,7 @@ func fetchProfileUsage(p Profile) (profileUsage, error) {
 }
 
 func fetchClaudeUsage(p Profile) (profileUsage, error) {
-	tok, err := claudeAccessToken(p)
+	tok, err := claudeAccessTokenReadOnly(p)
 	if err != nil {
 		return unknownProfileUsage(), err
 	}
@@ -179,26 +188,18 @@ func (o *claudeAiOauth) expired(now time.Time) bool {
 	return !now.Before(time.UnixMilli(o.ExpiresAt).Add(-tokenSkew))
 }
 
-func claudeAccessToken(p Profile) (string, error) {
+// claudeAccessTokenReadOnly returns an access token only when one is already
+// valid. It does not refresh and it does not write. It is the only token
+// path usage telemetry, the doctor, and spawn may use.
+func claudeAccessTokenReadOnly(p Profile) (string, error) {
 	blob, err := loadClaudeOAuth(p)
 	if err != nil {
 		return "", err
 	}
-	if !blob.oauth.expired(time.Now()) {
-		return blob.oauth.AccessToken, nil
+	if blob.oauth.expired(time.Now()) {
+		return "", errUsageTokenStale
 	}
-	if blob.oauth.RefreshToken == "" {
-		return "", fmt.Errorf("oauth token expired and no refresh token")
-	}
-	fresh, err := refreshClaudeOAuth(blob.oauth)
-	if err != nil {
-		return "", err
-	}
-	if err := saveClaudeOAuth(blob, fresh); err != nil {
-		// Still usable this call even if we could not persist the rotation.
-		hookLog("could not persist refreshed oauth token: %v", err)
-	}
-	return fresh.AccessToken, nil
+	return blob.oauth.AccessToken, nil
 }
 
 // oauthBlob is one credentials document plus enough to write it back without
@@ -218,10 +219,8 @@ func loadClaudeOAuth(p Profile) (oauthBlob, error) {
 	if b, ok := readClaudeOAuthFile(p); ok {
 		file = b
 	}
-	if runtime.GOOS == "darwin" {
-		if b, ok := readClaudeOAuthKeychain(p); ok {
-			keychain = b
-		}
+	if b, ok := oauthKeychainReader(p); ok {
+		keychain = b
 	}
 	if b, ok := pickOAuth(file, keychain, time.Now()); ok {
 		return b, nil
@@ -288,20 +287,6 @@ func oauthFromJSON(data []byte) *claudeAiOauth {
 	return creds.ClaudeAiOauth
 }
 
-func saveClaudeOAuth(blob oauthBlob, oauth *claudeAiOauth) error {
-	raw, err := patchOAuthJSON(blob.raw, oauth)
-	if err != nil {
-		return err
-	}
-	if blob.fromKeychain() {
-		return securityAdd(blob.service, blob.account, raw)
-	}
-	if blob.file == "" {
-		return fmt.Errorf("no credentials path to write")
-	}
-	return writeFileAtomic(blob.file, raw, 0o600)
-}
-
 func patchOAuthJSON(raw []byte, oauth *claudeAiOauth) ([]byte, error) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &m); err != nil {
@@ -313,65 +298,6 @@ func patchOAuthJSON(raw []byte, oauth *claudeAiOauth) ([]byte, error) {
 	}
 	m["claudeAiOauth"] = b
 	return json.Marshal(m)
-}
-
-func refreshClaudeOAuth(oauth *claudeAiOauth) (*claudeAiOauth, error) {
-	cid := strings.TrimSpace(oauth.ClientID)
-	if cid == "" {
-		cid = oauthClientID
-	}
-	body, err := json.Marshal(map[string]string{
-		"grant_type":    "refresh_token",
-		"refresh_token": oauth.RefreshToken,
-		"client_id":     cid,
-	})
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequest(http.MethodPost, oauthTokenURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("anthropic-beta", oauthUsageBeta)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "ccc")
-	resp, err := usageHTTP.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("oauth refresh: HTTP %d", resp.StatusCode)
-	}
-	var tok struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int64  `json:"expires_in"`
-		Scope        string `json:"scope"`
-	}
-	if err := json.Unmarshal(raw, &tok); err != nil {
-		return nil, err
-	}
-	if tok.AccessToken == "" {
-		return nil, fmt.Errorf("oauth refresh: empty access_token")
-	}
-	fresh := *oauth
-	fresh.AccessToken = tok.AccessToken
-	if tok.RefreshToken != "" {
-		fresh.RefreshToken = tok.RefreshToken
-	}
-	if tok.ExpiresIn > 0 {
-		fresh.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).UnixMilli()
-	}
-	if tok.Scope != "" {
-		fresh.Scopes = strings.Fields(tok.Scope)
-	}
-	return &fresh, nil
 }
 
 func keychainServiceName(p Profile) string {
@@ -400,6 +326,15 @@ func keychainAccount() string {
 	return ""
 }
 
+// oauthKeychainReader loads the macOS keychain item. Tests replace it; on
+// other operating systems the default reads nothing.
+var oauthKeychainReader = func(p Profile) (oauthBlob, bool) {
+	if runtime.GOOS != "darwin" {
+		return oauthBlob{}, false
+	}
+	return readClaudeOAuthKeychain(p)
+}
+
 // securityOutput runs `security find-generic-password … -w`. Overridable in tests.
 var securityOutput = func(args ...string) ([]byte, error) {
 	cmdArgs := append([]string{"find-generic-password"}, args...)
@@ -407,6 +342,9 @@ var securityOutput = func(args ...string) ([]byte, error) {
 	return exec.Command("security", cmdArgs...).Output()
 }
 
+// securityAdd writes a generic password to the macOS keychain. Nothing in
+// the usage, doctor, or spawn path may call it: refreshing a shared OAuth
+// item races Claude Code. Tests replace the var and fail if it runs.
 var securityAdd = func(service, account string, secret []byte) error {
 	// -w as the last flag reads the password from stdin (twice: enter and
 	// confirm). Putting the JSON on argv shows the refresh token in ps.
@@ -421,7 +359,8 @@ var securityAdd = func(service, account string, secret []byte) error {
 }
 
 // jwtExpiry reads exp from an unverified JWT payload. Signature checks belong
-// to the issuer; we only need to know whether to refresh before calling usage.
+// to the issuer; usage telemetry only needs to know whether the access token
+// is still usable. A stale token is not refreshed.
 func jwtExpiry(tok string) time.Time {
 	parts := strings.Split(tok, ".")
 	if len(parts) != 3 {
@@ -480,10 +419,4 @@ func httpJSON(method, rawURL, auth string, extra http.Header, body []byte) ([]by
 		return nil, resp.StatusCode, err
 	}
 	return raw, resp.StatusCode, nil
-}
-
-func httpFormPost(rawURL string, form url.Values) ([]byte, int, error) {
-	h := http.Header{}
-	h.Set("Content-Type", "application/x-www-form-urlencoded")
-	return httpJSON(http.MethodPost, rawURL, "", h, []byte(form.Encode()))
 }

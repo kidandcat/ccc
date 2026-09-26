@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -20,12 +19,7 @@ import (
 // call the HTTP route Claude-style so /status does not have to spawn
 // `codex app-server`. Verified against Codex CLI 0.154.0 and live Pro Lite.
 
-const codexOAuthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
-
-var (
-	codexUsageURL = "https://chatgpt.com/backend-api/wham/usage"
-	codexTokenURL = "https://auth.openai.com/oauth/token"
-)
+var codexUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 
 type codexAuthFile struct {
 	AuthMode     string       `json:"auth_mode"`
@@ -66,14 +60,14 @@ type codexCredits struct {
 }
 
 func fetchCodexUsage(p Profile) (profileUsage, error) {
-	auth, raw, err := loadCodexAuth(p)
+	auth, _, err := loadCodexAuth(p)
 	if err != nil {
 		return unknownProfileUsage(), err
 	}
 	if reason := codexUsageNA(auth); reason != "" {
 		return naProfileUsage(reason), nil
 	}
-	tok, err := codexAccessToken(p, auth, raw)
+	tok, err := codexAccessToken(p, auth)
 	if err != nil {
 		return unknownProfileUsage(), err
 	}
@@ -82,13 +76,6 @@ func fetchCodexUsage(p Profile) (profileUsage, error) {
 		acct = auth.Tokens.AccountID
 	}
 	u, status, err := codexUsageOnce(tok, acct)
-	if err == nil && (status == http.StatusUnauthorized || status == http.StatusForbidden) {
-		if fresh, rerr := codexRefreshAndSave(p); rerr == nil {
-			tok = fresh.AccessToken
-			acct = fresh.AccountID
-			u, status, err = codexUsageOnce(tok, acct)
-		}
-	}
 	if err != nil {
 		return unknownProfileUsage(), err
 	}
@@ -165,42 +152,16 @@ func applyCodexWindow(u *profileUsage, w *codexWindow) {
 	}
 }
 
-func codexAccessToken(p Profile, auth codexAuthFile, raw []byte) (string, error) {
-	if auth.Tokens == nil || auth.Tokens.AccessToken == "" {
+// codexAccessToken returns the stored ChatGPT access token only when it is
+// still valid. Usage telemetry does not refresh or rewrite auth.json.
+func codexAccessToken(p Profile, auth codexAuthFile) (string, error) {
+	if auth.Tokens == nil || strings.TrimSpace(auth.Tokens.AccessToken) == "" {
 		return "", fmt.Errorf("no codex chatgpt credentials for %s", accountDisplay(p))
 	}
-	if !tokenExpired(jwtExpiry(auth.Tokens.AccessToken), time.Now()) {
-		return auth.Tokens.AccessToken, nil
+	if tokenExpired(jwtExpiry(auth.Tokens.AccessToken), time.Now()) {
+		return "", errUsageTokenStale
 	}
-	if auth.Tokens.RefreshToken == "" {
-		return auth.Tokens.AccessToken, nil
-	}
-	fresh, err := refreshCodexAuth(*auth.Tokens)
-	if err != nil {
-		return auth.Tokens.AccessToken, nil
-	}
-	if err := saveCodexTokens(codexAuthJSON(p), raw, fresh); err != nil {
-		hookLog("could not persist refreshed codex token: %v", err)
-	}
-	return fresh.AccessToken, nil
-}
-
-func codexRefreshAndSave(p Profile) (codexTokens, error) {
-	auth, raw, err := loadCodexAuth(p)
-	if err != nil {
-		return codexTokens{}, err
-	}
-	if auth.Tokens == nil || auth.Tokens.RefreshToken == "" {
-		return codexTokens{}, fmt.Errorf("codex: no refresh token")
-	}
-	fresh, err := refreshCodexAuth(*auth.Tokens)
-	if err != nil {
-		return codexTokens{}, err
-	}
-	if err := saveCodexTokens(codexAuthJSON(p), raw, fresh); err != nil {
-		hookLog("could not persist refreshed codex token: %v", err)
-	}
-	return fresh, nil
+	return auth.Tokens.AccessToken, nil
 }
 
 func loadCodexAuth(p Profile) (codexAuthFile, []byte, error) {
@@ -213,60 +174,4 @@ func loadCodexAuth(p Profile) (codexAuthFile, []byte, error) {
 		return codexAuthFile{}, raw, fmt.Errorf("codex auth.json: %w", err)
 	}
 	return auth, raw, nil
-}
-
-func refreshCodexAuth(toks codexTokens) (codexTokens, error) {
-	form := url.Values{
-		"grant_type":    {"refresh_token"},
-		"refresh_token": {toks.RefreshToken},
-		"client_id":     {codexOAuthClientID},
-	}
-	raw, status, err := httpFormPost(codexTokenURL, form)
-	if err != nil {
-		return codexTokens{}, err
-	}
-	if status != http.StatusOK {
-		return codexTokens{}, fmt.Errorf("codex oauth refresh: HTTP %d", status)
-	}
-	var tok struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		IDToken      string `json:"id_token"`
-		ExpiresIn    int64  `json:"expires_in"`
-	}
-	if err := json.Unmarshal(raw, &tok); err != nil {
-		return codexTokens{}, err
-	}
-	if tok.AccessToken == "" {
-		return codexTokens{}, fmt.Errorf("codex oauth refresh: empty access_token")
-	}
-	fresh := toks
-	fresh.AccessToken = tok.AccessToken
-	if tok.RefreshToken != "" {
-		fresh.RefreshToken = tok.RefreshToken
-	}
-	if tok.IDToken != "" {
-		fresh.IDToken = tok.IDToken
-	}
-	return fresh, nil
-}
-
-func saveCodexTokens(path string, raw []byte, toks codexTokens) error {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return err
-	}
-	b, err := json.Marshal(toks)
-	if err != nil {
-		return err
-	}
-	m["tokens"] = b
-	if ts, err := json.Marshal(time.Now().UTC().Format(time.RFC3339Nano)); err == nil {
-		m["last_refresh"] = ts
-	}
-	out, err := json.Marshal(m)
-	if err != nil {
-		return err
-	}
-	return writeFileAtomic(path, out, 0o600)
 }

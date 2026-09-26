@@ -1087,15 +1087,13 @@ func betterProfile(a, b profileStat) bool {
 // Unknown usage ranks as fully used, behind any account with real numbers.
 // A running turn may still failover across engines when its pool is exhausted
 // (DESIGN §4).
+//
+// Usage is the cache or Claude's on-disk snapshot (readProfileUsage). A spawn
+// must not call refreshProfileUsage: that used to hit the network, and the
+// old Claude path refreshed OAuth, for every eligible profile on every spawn.
 func pickSpawnEngine(db *gorm.DB, cfg *Config) string {
 	def := defaultEngine(cfg)
 	now := time.Now()
-	for _, p := range listProfiles(cfg) {
-		if !profileSpawnEligible(p) {
-			continue
-		}
-		refreshProfileUsage(p)
-	}
 	var working map[string]int
 	if db != nil {
 		working = runningTurnsByProfileDB(db)
@@ -1140,6 +1138,12 @@ func profileCredentialsPresent(p Profile) bool {
 func eligibleSpawnStats(cfg *Config, working map[string]int, now time.Time) []profileStat {
 	var stats []profileStat
 	for _, s := range collectProfileStats(cfg, working, now) {
+		// A profile whose OAuth session just failed stays out of spawn
+		// until its auth backoff ends. Needs-login lives on the runner;
+		// the backoff is package state so this function can see it.
+		if loginBlocked(s.Name, now) {
+			continue
+		}
 		p, ok := profileByKey(cfg, s.Name)
 		if !ok || !profileSpawnEligible(p) {
 			continue
@@ -1209,7 +1213,8 @@ var (
 )
 
 // noteProfileLimit puts a profile on cooldown after a limit signal. The usage
-// snapshot is refreshed first. The cooldown runs until the latest reset among
+// snapshot is read first (a valid access token may hit the usage API; a stale
+// one degrades, and credentials are never written). The cooldown runs until the latest reset among
 // windows that are actually full: a weekly 100% must not come back when the
 // 5-hour window resets in 40 minutes. With no full window on record, the
 // fallback is defaultLimitCooldown.
@@ -1273,6 +1278,114 @@ func profileCooledUntil(name string, now time.Time) time.Time {
 		return time.Time{}
 	}
 	return until
+}
+
+// authBackoffInitial is how long a profile is kept out of spawn and failover
+// after the first authentication failure. A dead OAuth session does not heal
+// on a 30-minute retry; the 20–21 Sep 2026 incident retried that way for
+// twelve hours without telling the owner.
+const (
+	authBackoffInitial = 2 * time.Hour
+	authBackoffMax     = 12 * time.Hour
+)
+
+// authBlock is one profile's login backoff. notified stays set until a
+// successful login or a successful turn, so the owner hears about it once.
+type authBlock struct {
+	failures int
+	until    time.Time
+	notified bool
+}
+
+var (
+	authBlockMu sync.Mutex
+	authBlocks  = map[string]authBlock{}
+)
+
+// armAuthBackoff records an authentication failure. The first failure in an
+// episode returns true so the caller can notify the owner; later failures
+// only stretch the backoff. While the backoff holds, spawn and account
+// selection skip the profile.
+func armAuthBackoff(name string, now time.Time) (notify bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	authBlockMu.Lock()
+	defer authBlockMu.Unlock()
+	b := authBlocks[name]
+	if b.until.After(now) {
+		return false
+	}
+	b.failures++
+	b.until = now.Add(authBackoffFor(b.failures))
+	notify = !b.notified
+	b.notified = true
+	authBlocks[name] = b
+	return notify
+}
+
+func authBackoffFor(failures int) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	d := authBackoffInitial
+	for i := 1; i < failures; i++ {
+		if d > authBackoffMax/2 {
+			return authBackoffMax
+		}
+		d *= 2
+	}
+	if d > authBackoffMax {
+		return authBackoffMax
+	}
+	return d
+}
+
+// loginBlocked reports whether name must be skipped right now.
+func loginBlocked(name string, now time.Time) bool {
+	authBlockMu.Lock()
+	defer authBlockMu.Unlock()
+	b, ok := authBlocks[name]
+	return ok && b.until.After(now)
+}
+
+// authEpisodeOpen reports whether a login failure is still unresolved.
+// The doctor must not clear that just because `auth status` still says
+// logged-in: that probe can stay green while refresh is already dead.
+func authEpisodeOpen(name string) bool {
+	authBlockMu.Lock()
+	defer authBlockMu.Unlock()
+	_, ok := authBlocks[name]
+	return ok
+}
+
+func clearAuthBackoff(name string) {
+	authBlockMu.Lock()
+	delete(authBlocks, name)
+	authBlockMu.Unlock()
+}
+
+func renameAuthBackoff(oldName, newName string) {
+	if oldName == "" || newName == "" || oldName == newName {
+		return
+	}
+	authBlockMu.Lock()
+	defer authBlockMu.Unlock()
+	b, ok := authBlocks[oldName]
+	if !ok {
+		return
+	}
+	if cur, exists := authBlocks[newName]; !exists || b.until.After(cur.until) {
+		authBlocks[newName] = b
+	}
+	delete(authBlocks, oldName)
+}
+
+func resetAuthBackoffs() {
+	authBlockMu.Lock()
+	authBlocks = map[string]authBlock{}
+	authBlockMu.Unlock()
 }
 
 // collectProfileStats gathers the selection inputs for every profile. working
@@ -1391,8 +1504,9 @@ func acceptBypassDisclaimer(p Profile) error {
 }
 
 // writeFileAtomic writes data to a temp file in the same directory and renames
-// it over path, so a reader never observes a partial file.
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+// it over path, so a reader never observes a partial file. It is a var so
+// tests can fail the run if usage telemetry tries to persist credentials.
+var writeFileAtomic = func(path string, data []byte, perm os.FileMode) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
