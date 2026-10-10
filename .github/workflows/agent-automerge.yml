@@ -1,0 +1,51 @@
+name: agent-automerge
+
+# Safety net for autonomous agents: merges claude/* and cursor/* pull requests
+# into the default branch once CI is green on their head commit, so agent work
+# never sits in an open PR waiting for a human. Agents are still expected to
+# merge their own PRs; this only catches the ones that stop short.
+on:
+  workflow_run:
+    workflows: [Test]
+    types: [completed]
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, edited]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+concurrency:
+  group: agent-automerge-${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch }}
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'pull_request'
+        && (startsWith(github.event.pull_request.head.ref, 'claude/') || startsWith(github.event.pull_request.head.ref, 'cursor/')))
+      || (github.event_name == 'workflow_run'
+        && github.event.workflow_run.conclusion == 'success'
+        && (startsWith(github.event.workflow_run.head_branch, 'claude/') || startsWith(github.event.workflow_run.head_branch, 'cursor/')))
+    steps:
+      - name: Merge when CI is green
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # Name of the CI workflow that must pass; empty when the repo has no CI.
+          CI_WORKFLOW: "Test"
+        run: |
+          set -euo pipefail
+          pr=$(gh pr list --head "$BRANCH" --base "$DEFAULT_BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$pr" ]; then echo "No open PR from $BRANCH into $DEFAULT_BRANCH."; exit 0; fi
+          sha=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
+          if [ -n "$CI_WORKFLOW" ]; then
+            green=$(gh run list --workflow "$CI_WORKFLOW" --commit "$sha" --json conclusion --jq '[.[] | select(.conclusion == "success")] | length')
+            if [ "$green" -eq 0 ]; then echo "CI is not green yet on $sha; waiting for the next run."; exit 0; fi
+          fi
+          gh pr ready "$pr" || true
+          gh pr merge "$pr" --merge --match-head-commit "$sha"
+          gh api -X DELETE "repos/$GH_REPO/git/refs/heads/$BRANCH" || true
